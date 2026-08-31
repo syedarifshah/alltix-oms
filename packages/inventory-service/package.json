@@ -1,0 +1,17 @@
+{
+  "name": "@alltix/inventory-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "@alltix/db": "0.1.0",
+    "@alltix/shared": "0.1.0",
+    "pg": "^8.13.1"
+  }
+}
