@@ -338,6 +338,21 @@ from there.
 6. Skipping RLS/tenant isolation early — expensive to retrofit once real customer data
    is commingled.
 
+## 12. Known Follow-ups
+
+- **Clerk `createRouteMatcher` deprecation** — `packages/web/src/proxy.ts` uses
+  `createRouteMatcher` from `@clerk/nextjs/server`, which Clerk has marked deprecated
+  in favor of resource-based auth checks (auth checks moved into each page/layout/route
+  instead of centralized path matching in Proxy). Revisit before upgrading to Clerk's
+  next major version, since this will presumably be removed.
+- **Test process cleanup must stay PID-scoped** — when a test spawns a child process
+  (e.g. `next dev` for `packages/web/test/tenant-isolation.e2e.test.ts`), teardown must
+  kill only that specific PID (and its process tree, e.g. `taskkill /T` on Windows for
+  the `next-server` grandchild spawned under a shelled `npx`). Never use a broad
+  `taskkill /IM node.exe` or `pkill node` — it can kill unrelated Node processes on the
+  same machine (other dev servers, editor extensions, etc.), not just the one the test
+  started.
+
 ---
 
 *This document reflects standard, well-documented patterns for multichannel OMS/IMS
