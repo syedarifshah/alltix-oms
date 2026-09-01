@@ -84,10 +84,9 @@ export class OrderService {
    *
    * An order with zero order_lines is treated as vacuously allocatable
    * (nothing to reserve, nothing that can be insufficient) rather than an
-   * error -- today that's every order AmazonConnector.pullOrders() returns,
-   * since order-item fetching isn't implemented yet (see amazon-connector.ts);
-   * this keeps persistPulledOrders() able to drive orders forward instead of
-   * every allocation attempt failing until that lands.
+   * error. AmazonConnector.pullOrders() now fetches real line items, but a
+   * channel adapter with no items on an order (or a future channel that
+   * genuinely has none) shouldn't be unable to ever leave 'validated'.
    */
   private async allocateOrder(tenantId: string, orderId: string, expectedFromStatus: OrderStatus): Promise<OrderStatus> {
     return withTenant(this.pool, tenantId, async (client) => {
@@ -258,12 +257,10 @@ export class OrderService {
 
 /**
  * Resolves each line's product via channel_listings (channel + external_sku
- * -> product_id, CLAUDE.md §2.1) and inserts it. NormalizedOrder.lines is
- * always empty today -- AmazonConnector.pullOrders() only pulls order
- * headers, since line items need a separate SP-API call (CLAUDE.md §4.1,
- * amazon-connector.ts) that isn't implemented yet -- so this only runs once
- * that's wired up. Fails loudly (aborting the whole batch's transaction)
- * rather than silently dropping a line on an unresolved SKU.
+ * -> product_id, CLAUDE.md §2.1) and inserts it. Fails loudly (aborting the
+ * whole batch's transaction) rather than silently dropping a line on an
+ * unresolved SKU -- a real seller catalog must be synced into
+ * channel_listings before its orders can be persisted with lines intact.
  */
 async function insertOrderLines(
   client: PoolClient,

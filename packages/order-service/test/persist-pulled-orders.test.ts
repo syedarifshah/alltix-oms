@@ -6,6 +6,13 @@
 // Amazon sandbox credentials in .env, same as
 // scripts/amazon-pull-orders-smoke-test.ts.
 //
+// Also seeds a matching product catalog (seed-test-product-catalog.ts):
+// pullOrders() now fetches real order items, so persistPulledOrders() ->
+// insertOrderLines() needs a channel_listings match for the sandbox's SKU
+// to persist lines instead of throwing -- this test's job is dedupe, not
+// allocation outcome, so stock is generous and status isn't asserted here
+// (see persist-and-allocate.test.ts / pull-and-allocate-e2e.test.ts for that).
+//
 // Run with: npm run test --workspace=@alltix/order-service
 
 import { test, before, after } from "node:test";
@@ -21,6 +28,7 @@ import {
 } from "@alltix/channel-connectors";
 import { OrderService } from "../src/index.js";
 import { seedTestChannelConnection } from "../../../scripts/seed-test-channel-connection.js";
+import { seedTestProductCatalog } from "../../../scripts/seed-test-product-catalog.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..", "..", "..");
@@ -39,21 +47,30 @@ before(async () => {
 
   const seeded = await seedTestChannelConnection(pool);
   tenantId = seeded.tenantId;
+
+  await seedTestProductCatalog(pool, tenantId, 100);
 });
 
 after(async () => {
-  await withTenant(pool, tenantId, (client) =>
-    client.query("DELETE FROM channel_connections WHERE tenant_id = $1", [tenantId]),
-  );
-  // orders has no DELETE grant for app_user by design (see migrations/0007
-  // -- orders are transitioned/cancelled, never hard-deleted by the app), so
-  // clean those up via the schema-owning connection, same as
-  // packages/web/test/tenant-isolation.e2e.test.ts does for users/tenants.
+  // inventory_events/orders/inventory_levels have no DELETE grant for
+  // app_user by design (migrations 0005-0007) -- clean up via the
+  // schema-owning connection, same as the other order-service tests.
   const { Client } = await import("pg");
   const admin = new Client({ connectionString: process.env.DATABASE_URL });
   await admin.connect();
-  await admin.query("DELETE FROM orders WHERE tenant_id = $1", [tenantId]);
+  await admin.query("DELETE FROM inventory_events WHERE tenant_id = $1", [tenantId]);
+  await admin.query("DELETE FROM orders WHERE tenant_id = $1", [tenantId]); // cascades order_lines
+  await admin.query("DELETE FROM inventory_levels WHERE tenant_id = $1", [tenantId]);
   await admin.end();
+
+  await withTenant(pool, tenantId, (client) =>
+    client.query("DELETE FROM channel_listings WHERE tenant_id = $1", [tenantId]),
+  );
+  await withTenant(pool, tenantId, (client) => client.query("DELETE FROM locations WHERE tenant_id = $1", [tenantId]));
+  await withTenant(pool, tenantId, (client) => client.query("DELETE FROM products WHERE tenant_id = $1", [tenantId]));
+  await withTenant(pool, tenantId, (client) =>
+    client.query("DELETE FROM channel_connections WHERE tenant_id = $1", [tenantId]),
+  );
   await pool.end();
 });
 

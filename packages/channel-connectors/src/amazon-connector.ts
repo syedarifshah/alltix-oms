@@ -1,6 +1,7 @@
 import type { Pool } from "pg";
 import { withTenant, decryptChannelSecret } from "@alltix/db";
-import type { AuthToken, NormalizedOrder } from "./connector.js";
+import type { FulfillmentType } from "@alltix/shared";
+import type { AuthToken, NormalizedOrder, NormalizedOrderLine } from "./connector.js";
 
 // SP-API auth has been LWA-only since Oct 2023 -- no AWS IAM/SigV4 signing
 // required (CLAUDE.md §4.1). This is a smoke-test-only implementation:
@@ -22,6 +23,18 @@ export const SP_API_EU_SANDBOX_BASE_URL = "https://sandbox.sellingpartnerapi-eu.
 // This is Amazon's own official onboarding-guide example value. See
 // https://developer-docs.amazon.com/sp-api/docs/onboarding-step-5-make-your-first-call-to-the-sp-api-sandbox
 export const SP_API_SANDBOX_TEST_CASE_CREATED_AFTER = "TEST_CASE_200";
+
+// Unlike GetOrders (where a real MarketplaceIds + the CreatedAfter trigger
+// above returns real-looking orders with their own real AmazonOrderId
+// values), the sandbox's GetOrderItems has no scenario keyed to an order's
+// own id at all -- only this exact literal path segment returns 200; a real
+// AmazonOrderId (including ones GetOrders itself just returned) 400s with
+// the same "Could not match input arguments" error. Confirmed directly
+// against the live EU sandbox while building this connector. The canned
+// response always describes the same single item regardless of which
+// order you ask about, so every pulled order gets identical line data in
+// the sandbox -- a sandbox limitation, not a bug in this connector.
+export const SP_API_SANDBOX_TEST_CASE_ORDER_ID = "TEST_CASE_200";
 
 // GET /orders/v0/orders requires at least one MarketplaceIds value and,
 // unlike getMarketplaceParticipations, actually validates it against the
@@ -75,12 +88,32 @@ export interface AmazonOrder {
   PurchaseDate: string;
   OrderStatus: string;
   MarketplaceId?: string;
+  /** 'AFN' = Fulfilled by Amazon, 'MFN' = merchant/seller fulfilled. Lives on
+   *  the order header, not per line item -- see mapFulfillmentType(). */
+  FulfillmentChannel?: string;
   ShippingAddress?: Record<string, unknown>;
   BuyerInfo?: Record<string, unknown>;
 }
 
 interface GetOrdersResponse {
   payload?: { Orders: AmazonOrder[]; NextToken?: string };
+  errors?: Array<{ code: string; message: string; details?: string }>;
+}
+
+/** Raw shape of one item from GET /orders/v0/orders/{orderId}/orderItems --
+ *  only the fields this connector maps are declared; the sandbox's canned
+ *  response carries several more (ConditionId, IsGift, etc). */
+export interface AmazonOrderItem {
+  ASIN: string;
+  OrderItemId: string;
+  /** Present for a seller-fulfilled (MFN) item; may be absent for FBA (AFN). */
+  SellerSKU?: string;
+  QuantityOrdered: number;
+  ItemPrice?: { CurrencyCode: string; Amount: string };
+}
+
+interface GetOrderItemsResponse {
+  payload?: { AmazonOrderId: string; OrderItems: AmazonOrderItem[] };
   errors?: Array<{ code: string; message: string; details?: string }>;
 }
 
@@ -259,11 +292,44 @@ export class AmazonConnector {
     return data.payload ?? [];
   }
 
+  /** GET /orders/v0/orders/{orderId}/orderItems -- one order's line items. */
+  async getOrderItems(amazonOrderId: string): Promise<AmazonOrderItem[]> {
+    const { accessToken } = await this.authenticate();
+
+    const response = await fetch(
+      `${this.baseUrl}/orders/v0/orders/${encodeURIComponent(amazonOrderId)}/orderItems`,
+      {
+        method: "GET",
+        headers: {
+          "x-amz-access-token": accessToken,
+          "Content-Type": "application/json",
+        },
+      },
+    );
+
+    const data = (await response.json()) as GetOrderItemsResponse;
+
+    if (!response.ok) {
+      const message =
+        data.errors?.map((e) => `${e.code}: ${e.message}`).join("; ") ??
+        response.statusText;
+      throw new Error(`SP-API orderItems failed: ${response.status} ${message}`);
+    }
+
+    return data.payload?.OrderItems ?? [];
+  }
+
   /**
-   * GET /orders/v0/orders with CreatedAfter=since -- pulls order headers
-   * only and normalizes them. Order line items require a separate call
-   * (GET /orders/v0/orders/{orderId}/orderItems, CLAUDE.md §4.1) that isn't
-   * implemented yet, so every returned order's `lines` is empty for now.
+   * GET /orders/v0/orders with CreatedAfter=since -- pulls order headers,
+   * then calls {@link getOrderItems} once per order (CLAUDE.md §4.1: line
+   * items require a separate call) to populate `lines`.
+   *
+   * Deliberately sequential (not Promise.all/unbounded concurrency): one
+   * order-items request per order is real request volume against SP-API's
+   * per-tenant/per-endpoint rate limits (CLAUDE.md §4.4). Production should
+   * route this through the rate-limited job queue CLAUDE.md §4.4 describes,
+   * with order-status writes prioritized over it, once that queue exists;
+   * plain sequential is fine at today's sandbox scale (a handful of orders).
    *
    * `since` accepts a real Date (production: converted to ISO8601) or a raw
    * string (sandbox: one of Amazon's documented literal trigger values, e.g.
@@ -296,11 +362,38 @@ export class AmazonConnector {
     }
 
     const orders = data.payload?.Orders ?? [];
-    return orders.map(normalizeAmazonOrder);
+
+    // The sandbox has no scenario keyed to a real AmazonOrderId (see
+    // SP_API_SANDBOX_TEST_CASE_ORDER_ID) -- substitute its one documented
+    // trigger there. This branch goes away once this connector talks to a
+    // real (non-sandbox) base URL, where a real order's own id is correct.
+    const isSandbox = this.baseUrl === SP_API_EU_SANDBOX_BASE_URL;
+
+    const normalizedOrders: NormalizedOrder[] = [];
+    for (const order of orders) {
+      const items = await this.getOrderItems(isSandbox ? SP_API_SANDBOX_TEST_CASE_ORDER_ID : order.AmazonOrderId);
+      normalizedOrders.push(normalizeAmazonOrder(order, items));
+    }
+    return normalizedOrders;
   }
 }
 
-function normalizeAmazonOrder(order: AmazonOrder): NormalizedOrder {
+function mapFulfillmentType(fulfillmentChannel: string | undefined): FulfillmentType {
+  return fulfillmentChannel === "AFN" ? "fba" : "seller_fulfilled";
+}
+
+function normalizeAmazonOrderLine(item: AmazonOrderItem, fulfillmentType: FulfillmentType): NormalizedOrderLine {
+  return {
+    externalLineId: item.OrderItemId,
+    externalSku: item.SellerSKU ?? item.ASIN,
+    quantity: item.QuantityOrdered,
+    unitPrice: item.ItemPrice?.Amount ?? "0.00",
+    fulfillmentType,
+  };
+}
+
+function normalizeAmazonOrder(order: AmazonOrder, items: AmazonOrderItem[]): NormalizedOrder {
+  const fulfillmentType = mapFulfillmentType(order.FulfillmentChannel);
   return {
     externalOrderId: order.AmazonOrderId,
     channel: "amazon",
@@ -309,7 +402,7 @@ function normalizeAmazonOrder(order: AmazonOrder): NormalizedOrder {
     placedAt: order.PurchaseDate,
     customer: order.BuyerInfo ?? {},
     shippingAddress: order.ShippingAddress ?? {},
-    lines: [],
+    lines: items.map((item) => normalizeAmazonOrderLine(item, fulfillmentType)),
     rawPayload: order,
   };
 }

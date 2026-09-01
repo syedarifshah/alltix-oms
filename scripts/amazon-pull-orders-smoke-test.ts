@@ -54,6 +54,12 @@ async function main(): Promise<void> {
         `  - ${order.externalOrderId} status=${order.channelStatus} ` +
           `placedAt=${order.placedAt} marketplace=${order.channelMarketplace}`,
       );
+      for (const line of order.lines) {
+        console.log(
+          `      line ${line.externalLineId}: sku=${line.externalSku} qty=${line.quantity} ` +
+            `unitPrice=${line.unitPrice} fulfillmentType=${line.fulfillmentType}`,
+        );
+      }
     }
 
     console.log(
