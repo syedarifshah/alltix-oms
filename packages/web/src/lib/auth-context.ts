@@ -1,5 +1,4 @@
 import { auth } from "@clerk/nextjs/server";
-import type { NextRequest } from "next/server";
 
 export interface AuthContext {
   clerkUserId: string;
@@ -7,6 +6,14 @@ export interface AuthContext {
 
 /**
  * Resolves the authenticated caller's Clerk user id for this request.
+ * Takes a plain `Headers` (not `NextRequest`) so it works identically from
+ * a Route Handler (`req.headers`) and a Server Component (`await
+ * headers()` from `next/headers`) -- both satisfy the same `Headers`
+ * interface. This must be the only place that decides "which Clerk user is
+ * this" for the app; anything reading `auth()` directly instead (a page,
+ * say) silently loses the test bypass below and breaks under it -- `auth()`
+ * throws if clerkMiddleware never ran for the request, which is exactly
+ * what happens on the bypass path (see proxy.ts's isTestBypass).
  *
  * Test-only bypass: when both `NODE_ENV !== "production"` AND the explicit
  * opt-in `ALLTIX_TEST_AUTH_BYPASS=true` are set, a request may identify
@@ -20,9 +27,9 @@ export interface AuthContext {
  * mistake -- the test server must run via `next dev` instead. Never widen
  * this gate to also trust the header in production.
  */
-export async function getAuthContext(req: NextRequest): Promise<AuthContext | null> {
+export async function getAuthContext(requestHeaders: Headers): Promise<AuthContext | null> {
   if (process.env.NODE_ENV !== "production" && process.env.ALLTIX_TEST_AUTH_BYPASS === "true") {
-    const testUserId = req.headers.get("x-test-clerk-user-id");
+    const testUserId = requestHeaders.get("x-test-clerk-user-id");
     if (testUserId) {
       return { clerkUserId: testUserId };
     }

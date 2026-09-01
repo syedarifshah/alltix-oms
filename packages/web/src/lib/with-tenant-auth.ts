@@ -1,5 +1,5 @@
 import { withClerkUser, withTenant } from "@alltix/db";
-import type { PoolClient } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { NextResponse, type NextRequest } from "next/server";
 import { getAppPool } from "./db";
 import { getAuthContext } from "./auth-context";
@@ -11,6 +11,24 @@ export interface TenantRequestContext {
 }
 
 type Handler = (req: NextRequest, ctx: TenantRequestContext) => Promise<Response>;
+
+/**
+ * Looks up the tenant_id for an already-authenticated Clerk user (via
+ * withClerkUser, so the `users` self-lookup RLS policy applies). Exported
+ * so a Server Component page -- which has no NextRequest/Response to hand
+ * to {@link withTenantAuth} itself -- can still resolve tenant_id through
+ * the identical query/RLS path a Route Handler uses, instead of a second,
+ * parallel way of doing it.
+ */
+export async function resolveTenantId(pool: Pool, clerkUserId: string): Promise<string | null> {
+  return withClerkUser(pool, clerkUserId, async (client) => {
+    const result = await client.query<{ tenant_id: string }>(
+      "SELECT tenant_id FROM users WHERE clerk_user_id = $1",
+      [clerkUserId],
+    );
+    return result.rows[0]?.tenant_id ?? null;
+  });
+}
 
 /**
  * Wraps a Route Handler with the request-level tenant isolation contract:
@@ -42,19 +60,13 @@ type Handler = (req: NextRequest, ctx: TenantRequestContext) => Promise<Response
  */
 export function withTenantAuth(handler: Handler) {
   return async function wrapped(req: NextRequest): Promise<Response> {
-    const authContext = await getAuthContext(req);
+    const authContext = await getAuthContext(req.headers);
     if (!authContext) {
       return NextResponse.json({ error: "unauthenticated" }, { status: 401 });
     }
 
     const pool = getAppPool();
-    const tenantId = await withClerkUser(pool, authContext.clerkUserId, async (client) => {
-      const result = await client.query<{ tenant_id: string }>(
-        "SELECT tenant_id FROM users WHERE clerk_user_id = $1",
-        [authContext.clerkUserId],
-      );
-      return result.rows[0]?.tenant_id ?? null;
-    });
+    const tenantId = await resolveTenantId(pool, authContext.clerkUserId);
 
     if (!tenantId) {
       return NextResponse.json({ error: "no tenant associated with this user" }, { status: 403 });
