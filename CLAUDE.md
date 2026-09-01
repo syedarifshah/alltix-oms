@@ -189,8 +189,12 @@ received → validated → allocated → picking → packed → shipped → deli
 
 ### 4.1 Amazon SP-API (build this first — best documented, largest market)
 
-- **Auth**: OAuth + IAM role/policy per seller account, registered per marketplace
-  region (NA/EU/FE).
+- **Auth**: Login with Amazon (LWA) OAuth only — a Client ID, Client Secret, and
+  per-seller refresh token, registered per marketplace region (NA/EU/FE). Amazon
+  removed the AWS IAM/SigV4 signing requirement from SP-API in Oct 2023; no AWS
+  account is needed. Confirmed working end-to-end (sandbox LWA token exchange +
+  `marketplaceParticipations` call) in
+  `packages/channel-connectors/src/amazon-connector.ts`.
 - **Orders API**: pulls order headers; order line items require a separate call —
   budget rate limits accordingly.
 - **Reports API**: async, report-based — bulk FBA inventory reports, settlement data.

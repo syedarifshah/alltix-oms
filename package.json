@@ -9,10 +9,12 @@
     "build": "tsc -b",
     "clean": "tsc -b --clean",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "db:migrate": "tsx packages/db/src/migrate.ts"
+    "db:migrate": "tsx packages/db/src/migrate.ts",
+    "amazon:sandbox-smoke-test": "tsx scripts/amazon-sandbox-smoke-test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
+    "dotenv": "^16.4.5",
     "tsx": "^4.19.1",
     "typescript": "^5.6.3"
   }
