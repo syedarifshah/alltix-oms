@@ -7,11 +7,18 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -b",
-    "typecheck": "tsc --noEmit -p ."
+    "typecheck": "tsc --noEmit -p .",
+    "test": "node --import tsx --test test/persist-pulled-orders.test.ts"
   },
   "dependencies": {
+    "@alltix/channel-connectors": "0.1.0",
     "@alltix/db": "0.1.0",
     "@alltix/shared": "0.1.0",
+    "dotenv": "^16.4.5",
     "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.1"
   }
 }

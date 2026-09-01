@@ -5,5 +5,5 @@
     "rootDir": "src"
   },
   "include": ["src"],
-  "references": [{ "path": "../db" }, { "path": "../shared" }]
+  "references": [{ "path": "../channel-connectors" }, { "path": "../db" }, { "path": "../shared" }]
 }
