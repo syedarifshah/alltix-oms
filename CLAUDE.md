@@ -195,6 +195,47 @@ received → validated → allocated → picking → packed → shipped → deli
   account is needed. Confirmed working end-to-end (sandbox LWA token exchange +
   `marketplaceParticipations` call) in
   `packages/channel-connectors/src/amazon-connector.ts`.
+  - **Getting that per-seller refresh token — two mutually exclusive paths,
+    researched against Amazon's current docs**: a **Private** SP-API
+    application (what this repo's `AMAZON_SANDBOX_*` credentials are) is
+    authorized exclusively through **self-authorization** — a manual
+    "Authorize app" click in Seller Central / the Solution Provider Portal
+    that hands you a refresh token directly, no browser redirect or
+    callback involved at all (see `scripts/seed-test-channel-connection.ts`,
+    proven working repeatedly). A **Public** application instead uses the
+    redirect-based **Website Authorization Workflow**: redirect to
+    `https://sellercentral.amazon.com/apps/authorize/consent?application_id={id}&state={csrf-token}&version=beta`
+    (`version=beta` while the app is in Draft status), Amazon calls back
+    with `?state=...&selling_partner_id=...&spapi_oauth_code=...`, then
+    trade `spapi_oauth_code` for a refresh token via
+    `POST https://api.amazon.com/auth/o2/token`
+    (`grant_type=authorization_code`, `code`, `redirect_uri`, `client_id`,
+    `client_secret`; the code expires in 5 minutes, the whole round trip
+    should finish within 10). **This is not a sandbox-vs-production
+    distinction** — Public/Private is a property of the application's own
+    registration, identical in both environments — so a Private app can
+    never use the redirect flow, in sandbox or in production, until it's
+    published as Public with a registered redirect URI. Implemented (ready
+    for that day) in `packages/channel-connectors/src/amazon-oauth.ts`
+    (URL-building/token-exchange), `packages/web/src/lib/amazon-oauth-state.ts`
+    (signed/expiring/tenant-bound CSRF `state`), and the
+    `/api/channels/amazon/{connect,callback}` routes + `/settings/channels`
+    page. Verified live: navigating the exact authorize URL above (with a
+    placeholder `application_id`) gets a real 302 from
+    `sellercentral.amazon.com` into Amazon's own sign-in flow rather than an
+    outright rejection (Amazon defers `application_id` validation to the
+    post-login consent screen, unreachable without a Public app + real
+    seller session); the LWA token-exchange request shape is verified
+    against the real endpoint in
+    `scripts/amazon-oauth-token-exchange-isolation-test.ts` (rejected with a
+    structured OAuth error, not a malformed-request error); state
+    sign/verify is unit-tested in
+    `packages/web/test/amazon-oauth-state.test.ts`. The callback's DB
+    upsert (`INSERT ... ON CONFLICT (tenant_id, channel, marketplace,
+    external_account_id) DO UPDATE ...`) has been exercised directly against
+    real Postgres/RLS/pgcrypto. What has **not** been verified, and cannot
+    be until this app is Public: an actual browser round trip through a
+    real Amazon consent screen producing a real `spapi_oauth_code`.
 - **Orders API**: pulls order headers; order line items require a separate call —
   budget rate limits accordingly. Confirmed working end-to-end (sandbox
   `GetOrders` + `GetOrderItems`, real quantities/SKUs mapped into normalized
