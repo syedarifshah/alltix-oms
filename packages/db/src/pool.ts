@@ -2,12 +2,17 @@ import { Pool, type PoolClient } from "pg";
 
 export interface CreatePoolOptions {
   connectionString: string;
+  /** Max concurrent connections (pg default: 10). Raise this for callers that
+   *  intentionally hold many connections open at once -- e.g. a concurrency
+   *  test firing N simultaneous allocation attempts, each needing its own
+   *  connection for the duration of its transaction. */
+  max?: number;
 }
 
 /** Pool for the least-privilege `app_user` role. Every tenant-scoped query
  * must run through {@link withTenant} so the RLS session variable is set. */
 export function createAppPool(options: CreatePoolOptions): Pool {
-  return new Pool({ connectionString: options.connectionString });
+  return new Pool({ connectionString: options.connectionString, max: options.max });
 }
 
 /**
