@@ -1,7 +1,7 @@
 import type { Pool } from "pg";
 import { withTenant, decryptChannelSecret } from "@alltix/db";
 import type { FulfillmentType } from "@alltix/shared";
-import type { AuthToken, NormalizedOrder, NormalizedOrderLine } from "./connector.js";
+import type { AuthToken, NormalizedOrder, NormalizedOrderLine, SyncResult } from "./connector.js";
 
 // SP-API auth has been LWA-only since Oct 2023 -- no AWS IAM/SigV4 signing
 // required (CLAUDE.md §4.1). This is a smoke-test-only implementation:
@@ -14,6 +14,17 @@ const LWA_TOKEN_URL = "https://api.amazon.com/auth/o2/token";
 // EU sandbox host, for a UK/EU seller account (CLAUDE.md §4.1 marketplace
 // regions: NA/EU/FE each have their own SP-API host).
 export const SP_API_EU_SANDBOX_BASE_URL = "https://sandbox.sellingpartnerapi-eu.amazon.com";
+
+// NA sandbox host. Needed for pushInventory(): unlike every Orders-related
+// endpoint this connector calls (which accept the EU host + a US
+// marketplaceId without complaint in the sandbox), the Listings Items
+// API's patchListingsItem enforces that marketplaceIds actually belong to
+// the host's region -- calling the EU host with MarketplaceIds=ATVPDKIKX0DER
+// (US) 403s with "The marketplaces you provided are not valid for region",
+// confirmed live. Our sandbox account is US-only (per
+// getMarketplaceParticipations), so pushInventory needs a connector
+// constructed with this base URL, not the EU default used elsewhere.
+export const SP_API_NA_SANDBOX_BASE_URL = "https://sandbox.sellingpartnerapi-na.amazon.com";
 
 // The Orders API sandbox doesn't accept an arbitrary real CreatedAfter date
 // the way marketplaceParticipations accepts arbitrary input -- it pattern-
@@ -54,6 +65,11 @@ export interface AmazonSandboxCredentials {
   clientId: string;
   clientSecret: string;
   refreshToken: string;
+  /** The seller's own Amazon Merchant/Seller ID -- required as a path
+   *  segment by the Listings Items API (pushInventory). Stored in
+   *  channel_connections.external_account_id (CLAUDE.md §2.3 migration
+   *  0012's "seller id / merchant id, channel-specific"). */
+  sellerId: string;
 }
 
 interface CachedToken {
@@ -117,6 +133,15 @@ interface GetOrderItemsResponse {
   errors?: Array<{ code: string; message: string; details?: string }>;
 }
 
+/** Response shape of PATCH /listings/2021-08-01/items/{sellerId}/{sku}. */
+interface ListingsPatchResponse {
+  sku: string;
+  status: string; // 'ACCEPTED' (normal request) | 'VALID' | 'INVALID' (mode=VALIDATION_PREVIEW)
+  submissionId?: string;
+  issues?: Array<{ code: string; message: string; severity: string }>;
+  errors?: Array<{ code: string; message: string; details?: string }>;
+}
+
 function readRequiredEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -127,12 +152,13 @@ function readRequiredEnv(name: string): string {
   return value;
 }
 
-/** Reads the three AMAZON_SANDBOX_* keys from process.env, failing fast if any are missing. */
+/** Reads the four AMAZON_SANDBOX_* keys from process.env, failing fast if any are missing. */
 export function loadAmazonSandboxCredentialsFromEnv(): AmazonSandboxCredentials {
   return {
     clientId: readRequiredEnv("AMAZON_SANDBOX_CLIENT_ID"),
     clientSecret: readRequiredEnv("AMAZON_SANDBOX_CLIENT_SECRET"),
     refreshToken: readRequiredEnv("AMAZON_SANDBOX_REFRESH_TOKEN"),
+    sellerId: readRequiredEnv("AMAZON_SANDBOX_SELLER_ID"),
   };
 }
 
@@ -151,8 +177,9 @@ export async function loadAmazonCredentialsFromChannelConnection(
       lwa_client_id: string;
       encrypted_client_secret: Buffer;
       encrypted_refresh_token: Buffer;
+      external_account_id: string;
     }>(
-      `SELECT lwa_client_id, encrypted_client_secret, encrypted_refresh_token
+      `SELECT lwa_client_id, encrypted_client_secret, encrypted_refresh_token, external_account_id
          FROM channel_connections
         WHERE channel = 'amazon' AND status = 'active'
         ORDER BY created_at DESC
@@ -171,7 +198,7 @@ export async function loadAmazonCredentialsFromChannelConnection(
       decryptChannelSecret(client, row.encrypted_refresh_token),
     ]);
 
-    return { clientId: row.lwa_client_id, clientSecret, refreshToken };
+    return { clientId: row.lwa_client_id, clientSecret, refreshToken, sellerId: row.external_account_id };
   });
 }
 
@@ -188,9 +215,9 @@ export async function createAmazonConnectorFromChannelConnection(
 
 /**
  * Amazon SP-API connector -- implements authenticate(), the
- * getMarketplaceParticipations sandbox smoke-test call, and pullOrders().
- * Does NOT implement the full ChannelConnector interface yet; pushInventory
- * / pushListing are separate, later work.
+ * getMarketplaceParticipations sandbox smoke-test call, pullOrders(), and
+ * pushInventory(). Does NOT implement the full ChannelConnector interface
+ * yet; pushListing is separate, later work.
  *
  * Credentials come either from process.env (the default, via
  * {@link loadAmazonSandboxCredentialsFromEnv}, used by
@@ -211,6 +238,10 @@ export class AmazonConnector {
     this.credentials = credentials;
     this.baseUrl = baseUrl;
     this.marketplaceIds = marketplaceIds;
+  }
+
+  private get sellerId(): string {
+    return this.credentials.sellerId;
   }
 
   /**
@@ -375,6 +406,72 @@ export class AmazonConnector {
       normalizedOrders.push(normalizeAmazonOrder(order, items));
     }
     return normalizedOrders;
+  }
+
+  /**
+   * PATCH /listings/2021-08-01/items/{sellerId}/{sku} -- the current
+   * near-real-time path for updating one SKU's quantity. CLAUDE.md §4.1
+   * previously described only the (async, bulk, submission-based) Feeds
+   * API for this; that's still correct for bulk catalog/price/inventory
+   * writes, but the Listings Items API's patchListingsItem is the right
+   * fit here since ChannelConnector.pushInventory is single-item, and it
+   * responds synchronously rather than requiring a poll-for-completion
+   * feed job. See CLAUDE.md §4.1 (updated alongside this method) and
+   * https://developer-docs.amazon.com/sp-api/docs/listings-items-api-v2021-08-01-use-case-guide
+   *
+   * Only meaningful for merchant-fulfilled (MFN) stock -- fulfillment_
+   * channel_code 'DEFAULT' is the self-managed/seller-fulfilled supply
+   * source; FBA (AFN) inventory isn't updated through this call at all,
+   * Amazon manages it. Confirmed live: the sandbox accepts any sellerId/sku
+   * and returns `status: 'ACCEPTED'` for a normal (non-preview) request --
+   * it doesn't validate the SKU against a real catalog or actually persist
+   * anything queryable back, so this call round-trips the request shape and
+   * an HTTP-level success, not genuine state change; the sandbox's own
+   * response even substitutes a random unrelated `sku` in that scenario.
+   * `mode=VALIDATION_PREVIEW` with sku='VALIDATION_VALID'/'VALIDATION_INVALID'
+   * are also live-confirmed canned scenarios, unused here since they don't
+   * submit anything.
+   */
+  async pushInventory(sellerSku: string, quantity: number): Promise<SyncResult> {
+    const { accessToken } = await this.authenticate();
+
+    const response = await fetch(
+      `${this.baseUrl}/listings/2021-08-01/items/${encodeURIComponent(this.sellerId)}/${encodeURIComponent(sellerSku)}` +
+        `?marketplaceIds=${this.marketplaceIds.join(",")}`,
+      {
+        method: "PATCH",
+        headers: {
+          "x-amz-access-token": accessToken,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          productType: "PRODUCT",
+          patches: [
+            {
+              op: "replace",
+              path: "/attributes/fulfillment_availability",
+              value: [{ fulfillment_channel_code: "DEFAULT", quantity }],
+            },
+          ],
+        }),
+      },
+    );
+
+    const data = (await response.json()) as ListingsPatchResponse;
+
+    if (!response.ok) {
+      const message =
+        data.errors?.map((e) => `${e.code}: ${e.message}`).join("; ") ?? response.statusText;
+      return { success: false, error: `SP-API listings patch failed: ${response.status} ${message}` };
+    }
+
+    if (data.status !== "ACCEPTED" && data.status !== "VALID") {
+      const message =
+        data.issues?.map((i) => `${i.code}: ${i.message}`).join("; ") ?? `unexpected status '${data.status}'`;
+      return { success: false, externalId: data.sku, error: message };
+    }
+
+    return { success: true, externalId: data.sku };
   }
 }
 

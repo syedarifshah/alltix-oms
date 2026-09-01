@@ -196,9 +196,22 @@ received → validated → allocated → picking → packed → shipped → deli
   `marketplaceParticipations` call) in
   `packages/channel-connectors/src/amazon-connector.ts`.
 - **Orders API**: pulls order headers; order line items require a separate call —
-  budget rate limits accordingly.
+  budget rate limits accordingly. Confirmed working end-to-end (sandbox
+  `GetOrders` + `GetOrderItems`, real quantities/SKUs mapped into normalized
+  order lines) in `packages/channel-connectors/src/amazon-connector.ts`.
 - **Reports API**: async, report-based — bulk FBA inventory reports, settlement data.
 - **Feeds API**: async, submission-based — bulk listing/price/inventory writes.
+  Still correct for bulk catalog operations, but **not** the right tool for a
+  single SKU's quantity: that's the **Listings Items API**
+  (`PATCH /listings/2021-08-01/items/{sellerId}/{sku}`, a JSON Patch body
+  replacing `/attributes/fulfillment_availability`), which responds
+  synchronously instead of requiring a poll-for-completion feed job — a
+  better fit for `ChannelConnector.pushInventory`'s single-item signature.
+  Only applies to merchant-fulfilled (MFN) stock; FBA (AFN) inventory isn't
+  pushed this way. Confirmed working end-to-end against the sandbox (see
+  `AmazonConnector.pushInventory` in the same file) — note the sandbox only
+  round-trips the request shape and an HTTP success for this endpoint, it
+  doesn't persist anything queryable back, unlike Orders.
 - **Notifications API (event-driven, via SQS)**: subscribe to `ORDER_STATUS_CHANGE`,
   `FBA_OUTBOUND_SHIPMENT_STATUS`, `FEED_PROCESSING_FINISHED`, `ANY_OFFER_CHANGED` —
   react near-real-time instead of polling.
