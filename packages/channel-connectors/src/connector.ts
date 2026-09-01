@@ -26,6 +26,11 @@ export interface NormalizedOrder {
   channel: string;
   channelMarketplace: string;
   placedAt: string;
+  /** The channel's native order status string (e.g. Amazon's "Unshipped").
+   *  Deliberately not mapped to the internal `OrderStatus` state machine
+   *  here -- that mapping is Order Management Service's job (CLAUDE.md §3),
+   *  not the connector's; the connector only normalizes shape. */
+  channelStatus: string;
   customer: Record<string, unknown>;
   shippingAddress: Record<string, unknown>;
   lines: NormalizedOrderLine[];

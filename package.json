@@ -10,7 +10,9 @@
     "clean": "tsc -b --clean",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "db:migrate": "tsx packages/db/src/migrate.ts",
-    "amazon:sandbox-smoke-test": "tsx scripts/amazon-sandbox-smoke-test.ts"
+    "amazon:sandbox-smoke-test": "tsx scripts/amazon-sandbox-smoke-test.ts",
+    "amazon:seed-test-channel-connection": "tsx scripts/seed-test-channel-connection.ts",
+    "amazon:pull-orders-smoke-test": "tsx scripts/amazon-pull-orders-smoke-test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
