@@ -4,12 +4,15 @@ import { fileURLToPath } from "node:url";
 import type { Pool } from "pg";
 import { createAppPool, withTenant, encryptChannelSecret } from "../packages/db/src/index.js";
 
-// Inserts one channel_connections row for a brand-new test tenant, using the
-// AMAZON_SANDBOX_* credentials already in .env -- proves the encrypt-then-
-// store path (packages/db/src/encryption.ts) with real values instead of the
-// RLS test's throwaway fixture strings. A fresh tenant_id is generated every
-// run: (tenant_id, channel, marketplace, external_account_id) is UNIQUE, and
-// there's no reason to collide with previous runs' rows.
+// Inserts one channel_connections row using the AMAZON_SANDBOX_* credentials
+// already in .env -- proves the encrypt-then-store path
+// (packages/db/src/encryption.ts) with real values instead of the RLS
+// test's throwaway fixture strings. Defaults to a brand-new tenant_id (a
+// fresh one every run: (tenant_id, channel, marketplace,
+// external_account_id) is UNIQUE, and there's no reason to collide with
+// previous runs' rows), but accepts an existing tenantId to attach a
+// channel_connections row to a tenant that already exists for some other
+// reason (e.g. a real user who signed up via Clerk).
 //
 // Reused by scripts/amazon-pull-orders-smoke-test.ts via
 // seedTestChannelConnection() so that script doesn't duplicate this logic.
@@ -27,13 +30,17 @@ export interface SeededChannelConnection {
   connectionId: string;
 }
 
-/** Encrypts and inserts one 'amazon' channel_connections row for a fresh tenant. Never logs the decrypted values. */
-export async function seedTestChannelConnection(pool: Pool): Promise<SeededChannelConnection> {
+/**
+ * Encrypts and inserts one 'amazon' channel_connections row for `tenantId`
+ * (a fresh random one if not given). Never logs the decrypted values.
+ */
+export async function seedTestChannelConnection(
+  pool: Pool,
+  tenantId: string = randomUUID(),
+): Promise<SeededChannelConnection> {
   const clientId = readRequiredEnv("AMAZON_SANDBOX_CLIENT_ID");
   const clientSecret = readRequiredEnv("AMAZON_SANDBOX_CLIENT_SECRET");
   const refreshToken = readRequiredEnv("AMAZON_SANDBOX_REFRESH_TOKEN");
-
-  const tenantId = randomUUID();
 
   const connectionId = await withTenant(pool, tenantId, async (client) => {
     const encryptedClientSecret = await encryptChannelSecret(client, clientSecret);
