@@ -479,6 +479,32 @@ function mapFulfillmentType(fulfillmentChannel: string | undefined): Fulfillment
   return fulfillmentChannel === "AFN" ? "fba" : "seller_fulfilled";
 }
 
+// No third-party marketplace order predates Amazon opening it up in 2000, so
+// anything before that is definitionally not a real purchase timestamp.
+// Confirmed live (fetched straight from the sandbox host, bypassing this
+// connector entirely) that the SP-API *sandbox's own* canned TEST_CASE_200
+// response embeds PurchaseDate: "1970-01-19T03:58:30Z" on every order it
+// returns -- so this isn't something normalizeAmazonOrder, the INSERT into
+// orders.placed_at, or the /orders page's formatting corrupts; the raw
+// upstream value already *is* that string, unmodified end to end. That
+// string decodes to Unix epoch *seconds* 1569510000 (2019-09-26T15:00:00Z)
+// -- looks like Amazon's own fixture generator formatted a seconds-based
+// timestamp as if it were milliseconds. Can't fix it at the source, so
+// treat it like the other documented sandbox-only oddities in this file
+// (SP_API_SANDBOX_TEST_CASE_ORDER_ID): validate before trusting it, and
+// store null (orders.placed_at is nullable; /orders already renders "—")
+// rather than a nonsensical prehistoric date presented as a business fact.
+const EARLIEST_PLAUSIBLE_PURCHASE_DATE_MS = Date.parse("2000-01-01T00:00:00Z");
+
+export function parsePurchaseDate(raw: string): string | null {
+  const parsedMs = Date.parse(raw);
+  if (Number.isNaN(parsedMs) || parsedMs < EARLIEST_PLAUSIBLE_PURCHASE_DATE_MS) {
+    console.warn(`AmazonConnector: ignoring implausible PurchaseDate '${raw}' (not a real purchase timestamp)`);
+    return null;
+  }
+  return raw;
+}
+
 function normalizeAmazonOrderLine(item: AmazonOrderItem, fulfillmentType: FulfillmentType): NormalizedOrderLine {
   return {
     externalLineId: item.OrderItemId,
@@ -496,7 +522,7 @@ function normalizeAmazonOrder(order: AmazonOrder, items: AmazonOrderItem[]): Nor
     channel: "amazon",
     channelMarketplace: order.MarketplaceId ?? "",
     channelStatus: order.OrderStatus,
-    placedAt: order.PurchaseDate,
+    placedAt: parsePurchaseDate(order.PurchaseDate),
     customer: order.BuyerInfo ?? {},
     shippingAddress: order.ShippingAddress ?? {},
     lines: items.map((item) => normalizeAmazonOrderLine(item, fulfillmentType)),

@@ -103,6 +103,23 @@ test("a real sandbox pull persists with real lines and allocates real inventory"
 
   const totalQuantity = pulled.reduce((sum, order) => sum + order.lines.reduce((s, l) => s + l.quantity, 0), 0);
 
+  // Regression test for the /orders "Placed At" column showing
+  // 1970-01-19T03:58:30.000Z: the sandbox's own canned PurchaseDate really
+  // is that implausible value on every order (confirmed by fetching it raw,
+  // bypassing this connector) -- AmazonConnector.parsePurchaseDate() must
+  // turn that into null at ingestion rather than persisting/displaying it
+  // as if it were a real purchase timestamp.
+  const placedAtRows = await withTenant(pool, tenantId, (client) =>
+    client.query<{ placed_at: Date | null }>(`SELECT placed_at FROM orders WHERE tenant_id = $1`, [tenantId]),
+  );
+  assert.equal(placedAtRows.rows.length, pulled.length);
+  for (const row of placedAtRows.rows) {
+    assert.ok(
+      row.placed_at === null || row.placed_at.getFullYear() >= 2000,
+      `placed_at must be null or a real-looking date, not epoch-adjacent -- got ${row.placed_at?.toISOString()}`,
+    );
+  }
+
   const lines = await withTenant(pool, tenantId, (client) =>
     client.query<{ quantity: number; unit_price: string; fulfillment_type: string; product_id: string }>(
       `SELECT ol.quantity, ol.unit_price, ol.fulfillment_type, ol.product_id

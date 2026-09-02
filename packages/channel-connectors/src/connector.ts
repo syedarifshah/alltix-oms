@@ -25,7 +25,11 @@ export interface NormalizedOrder {
   externalOrderId: string;
   channel: string;
   channelMarketplace: string;
-  placedAt: string;
+  /** Null when the channel's own reported purchase date isn't usable (e.g.
+   *  Amazon's SP-API sandbox canned test data embeds an implausible
+   *  PurchaseDate -- see parsePurchaseDate() in amazon-connector.ts). The
+   *  `orders.placed_at` column is nullable for exactly this case. */
+  placedAt: string | null;
   /** The channel's native order status string (e.g. Amazon's "Unshipped").
    *  Deliberately not mapped to the internal `OrderStatus` state machine
    *  here -- that mapping is Order Management Service's job (CLAUDE.md §3),
