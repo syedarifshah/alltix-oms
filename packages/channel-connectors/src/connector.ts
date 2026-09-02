@@ -71,7 +71,20 @@ export interface ChannelConnector {
   authenticate(tenantCredentials: TenantCredentials): Promise<AuthToken>;
   pullOrders(since: Date): Promise<NormalizedOrder[]>;
   pushInventory(productId: string, quantity: number): Promise<SyncResult>;
-  pushListing(listing: NormalizedListing): Promise<SyncResult>;
+  /**
+   * Submits a listing write and returns only the channel's tracking
+   * handle for it -- confirmed split (not a guess) from building the
+   * Walmart connector, channel #2: Walmart's Offer-Setup-by-Match write is
+   * feed-submit-then-poll with no synchronous equivalent, and the old
+   * single `pushListing(): Promise<SyncResult>` had no way to represent
+   * "submitted, not yet known to have succeeded or failed" -- SyncResult
+   * is a terminal outcome, not a pending one. See {@link getFeedStatus}.
+   */
+  submitListing(listing: NormalizedListing): Promise<{ feedId: string }>;
+  /** Resolves a {@link submitListing} feedId to a terminal outcome. Callers
+   *  (the rate-limited job queue, CLAUDE.md §4.4) poll this rather than
+   *  blocking inside submitListing() itself. */
+  getFeedStatus(feedId: string): Promise<SyncResult>;
   confirmShipment(orderId: string, tracking: TrackingInfo): Promise<void>;
   /** No-op for poll-only channels (e.g. Walmart) — see CLAUDE.md §4.2/§4.3. */
   subscribeToEvents(handler: EventHandler): void;

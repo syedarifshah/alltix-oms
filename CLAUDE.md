@@ -280,7 +280,8 @@ interface ChannelConnector {
   authenticate(tenantCredentials): Promise<AuthToken>
   pullOrders(since: Timestamp): Promise<NormalizedOrder[]>
   pushInventory(productId: string, quantity: number): Promise<SyncResult>
-  pushListing(listing: NormalizedListing): Promise<SyncResult>
+  submitListing(listing: NormalizedListing): Promise<{ feedId: string }>
+  getFeedStatus(feedId: string): Promise<SyncResult>
   confirmShipment(orderId: string, tracking: TrackingInfo): Promise<void>
   subscribeToEvents(handler: EventHandler): void  // no-op for poll-only channels
 }
@@ -288,7 +289,12 @@ interface ChannelConnector {
 
 Don't trust this interface until channel #2 (Walmart) is live — fitting a second,
 structurally different API (feed/poll-heavy vs. event-driven) into the same shape is
-what forces you to find its real form.
+what forces you to find its real form. `submitListing`/`getFeedStatus` is exactly
+that: the original single `pushListing(): Promise<SyncResult>` is a confirmed
+casualty of building the Walmart connector, not a speculative change — Walmart's
+Offer-Setup-by-Match write is feed-submit-then-poll with no synchronous equivalent,
+and `SyncResult` has no way to represent "submitted, not yet known to have
+succeeded or failed."
 
 ### 4.4 Handling API rate limits (critical — causes most production incidents)
 
