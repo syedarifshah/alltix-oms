@@ -1,6 +1,15 @@
 import type { Pool, PoolClient } from "pg";
 import { withTenant } from "@alltix/db";
-import { isValidOrderTransition, type Order, type OrderStatus } from "@alltix/shared";
+import {
+  DomainEvent,
+  InProcessEventBus,
+  isValidOrderTransition,
+  type DomainEventName,
+  type EventBus,
+  type Order,
+  type OrderReceivedPayload,
+  type OrderStatus,
+} from "@alltix/shared";
 import type { NormalizedOrder } from "@alltix/channel-connectors";
 
 export interface PersistPulledOrdersResult {
@@ -8,13 +17,39 @@ export interface PersistPulledOrdersResult {
   skippedExternalOrderIds: string[];
 }
 
+/** The event each simpleTransition() `to` status publishes once its UPDATE
+ *  commits. 'allocated' isn't here -- allocateOrder() publishes its own
+ *  (either OrderAllocated or OrderBackordered) since it has two possible
+ *  outcomes and a richer payload than a plain status flip. */
+const SIMPLE_TRANSITION_EVENT: Partial<Record<OrderStatus, DomainEventName>> = {
+  validated: DomainEvent.OrderValidated,
+  picking: DomainEvent.OrderPicking,
+  packed: DomainEvent.OrderPacked,
+  shipped: DomainEvent.OrderShipped,
+};
+
 /**
  * Normalizes orders from every channel into one shape and owns the order
  * state machine (CLAUDE.md §1, §3). Skeleton only — no channel connector
  * writes into this yet, and method bodies are unimplemented.
+ *
+ * Publishes a DomainEvent (packages/shared/src/events.ts) after every
+ * successful status change, via the injected EventBus -- defaulted to a
+ * fresh InProcessEventBus so every existing call site keeps compiling
+ * unchanged, but a real caller (or a test asserting on rule execution)
+ * passes a shared bus so RulesEngine can subscribe to it. OrderService
+ * never imports or references RulesEngine -- publish-without-knowing-
+ * subscribers is the whole point (CLAUDE.md §1).
  */
 export class OrderService {
-  constructor(private readonly pool: Pool) {}
+  constructor(
+    private readonly pool: Pool,
+    private readonly eventBus: EventBus = new InProcessEventBus(),
+  ) {}
+
+  private async publish<T>(tenantId: string, name: DomainEventName, payload: T): Promise<void> {
+    await this.eventBus.publish({ name, tenantId, occurredAt: new Date().toISOString(), payload });
+  }
 
   async receiveOrder(tenantId: string, order: Omit<Order, "id" | "tenantId" | "status">): Promise<Order> {
     return withTenant(this.pool, tenantId, async () => {
@@ -69,7 +104,7 @@ export class OrderService {
     from: OrderStatus,
     to: OrderStatus,
   ): Promise<OrderStatus> {
-    return withTenant(this.pool, tenantId, async (client) => {
+    await withTenant(this.pool, tenantId, async (client) => {
       const result = await client.query(
         `UPDATE orders SET status = $1, updated_at = now() WHERE id = $2 AND tenant_id = $3 AND status = $4`,
         [to, orderId, tenantId, from],
@@ -79,8 +114,13 @@ export class OrderService {
           `Order ${orderId} is not in status '${from}' -- refusing transition to '${to}' (concurrent update?)`,
         );
       }
-      return to;
     });
+
+    const eventName = SIMPLE_TRANSITION_EVENT[to];
+    if (eventName) {
+      await this.publish(tenantId, eventName, { orderId });
+    }
+    return to;
   }
 
   /**
@@ -107,11 +147,21 @@ export class OrderService {
    * error. AmazonConnector.pullOrders() now fetches real line items, but a
    * channel adapter with no items on an order (or a future channel that
    * genuinely has none) shouldn't be unable to ever leave 'validated'.
+   *
+   * Location selection: if the rules engine set orders.preferred_location_id
+   * (a route_to_warehouse action, applied while the order was still
+   * 'received' -- see RulesEngine and events.ts's OrderReceivedPayload),
+   * that location is used instead of the default choice below, and must
+   * resolve to a real, tenant-owned, type='warehouse' location or this
+   * throws outright -- a routing decision that points at garbage should
+   * fail loudly, not be silently ignored in favor of the default. With no
+   * preferred_location_id, behavior is unchanged from before the rules
+   * engine existed: the tenant's oldest warehouse location.
    */
   private async allocateOrder(tenantId: string, orderId: string, expectedFromStatus: OrderStatus): Promise<OrderStatus> {
-    return withTenant(this.pool, tenantId, async (client) => {
-      const orderResult = await client.query<{ status: OrderStatus }>(
-        `SELECT status FROM orders WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+    const result = await withTenant(this.pool, tenantId, async (client) => {
+      const orderResult = await client.query<{ status: OrderStatus; preferred_location_id: string | null }>(
+        `SELECT status, preferred_location_id FROM orders WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
         [orderId, tenantId],
       );
       const orderRow = orderResult.rows[0];
@@ -134,18 +184,10 @@ export class OrderService {
           `UPDATE orders SET status = 'allocated', updated_at = now() WHERE id = $1 AND tenant_id = $2`,
           [orderId, tenantId],
         );
-        return "allocated";
+        return { status: "allocated" as const, locationId: null };
       }
 
-      const location = await client.query<{ id: string }>(
-        `SELECT id FROM locations WHERE tenant_id = $1 AND type = 'warehouse' ORDER BY created_at ASC LIMIT 1`,
-        [tenantId],
-      );
-      const locationRow = location.rows[0];
-      if (!locationRow) {
-        throw new Error(`Tenant ${tenantId} has no warehouse location to allocate against`);
-      }
-      const locationId = locationRow.id;
+      const locationId = await this.resolveAllocationLocation(client, tenantId, orderRow.preferred_location_id);
 
       // Sum requested quantity per product first (an order can have more
       // than one line for the same product) so each product's row is only
@@ -177,7 +219,7 @@ export class OrderService {
           `UPDATE orders SET status = 'backordered', updated_at = now() WHERE id = $1 AND tenant_id = $2`,
           [orderId, tenantId],
         );
-        return "backordered";
+        return { status: "backordered" as const, locationId };
       }
 
       for (const line of lines.rows) {
@@ -205,8 +247,51 @@ export class OrderService {
         `UPDATE orders SET status = 'allocated', updated_at = now() WHERE id = $1 AND tenant_id = $2`,
         [orderId, tenantId],
       );
-      return "allocated";
+      return { status: "allocated" as const, locationId };
     });
+
+    if (result.status === "allocated") {
+      await this.publish(tenantId, DomainEvent.OrderAllocated, { orderId, locationId: result.locationId });
+    } else {
+      await this.publish(tenantId, DomainEvent.OrderBackordered, { orderId });
+    }
+    return result.status;
+  }
+
+  /** Resolves which location allocateOrder() reserves against. `preferredLocationId`
+   *  (from orders.preferred_location_id) wins when present and must be a
+   *  real, tenant-owned, type='warehouse' location -- throws otherwise
+   *  rather than silently falling back. With none set, falls back to the
+   *  original default: the tenant's oldest warehouse location. */
+  private async resolveAllocationLocation(
+    client: PoolClient,
+    tenantId: string,
+    preferredLocationId: string | null,
+  ): Promise<string> {
+    if (preferredLocationId) {
+      const preferred = await client.query<{ id: string }>(
+        `SELECT id FROM locations WHERE id = $1 AND tenant_id = $2 AND type = 'warehouse'`,
+        [preferredLocationId, tenantId],
+      );
+      const preferredRow = preferred.rows[0];
+      if (!preferredRow) {
+        throw new Error(
+          `Order's preferred_location_id ${preferredLocationId} does not resolve to a real ` +
+            `'warehouse' location for tenant ${tenantId} -- refusing to fall back silently`,
+        );
+      }
+      return preferredRow.id;
+    }
+
+    const location = await client.query<{ id: string }>(
+      `SELECT id FROM locations WHERE tenant_id = $1 AND type = 'warehouse' ORDER BY created_at ASC LIMIT 1`,
+      [tenantId],
+    );
+    const locationRow = location.rows[0];
+    if (!locationRow) {
+      throw new Error(`Tenant ${tenantId} has no warehouse location to allocate against`);
+    }
+    return locationRow.id;
   }
 
   /**
@@ -222,17 +307,22 @@ export class OrderService {
    * order's lines can't be persisted, none of the batch is.
    *
    * Once inserts are committed, every newly-inserted order (not skipped
-   * ones -- they already went through this before) is walked through
-   * received -> validated -> allocated so it doesn't sit at 'received'
-   * forever. That has to happen *after* the insert transaction commits, in
-   * its own transaction per order: allocateOrder() runs on a different
-   * connection (via its own withTenant), and until this transaction
-   * commits, that connection's MVCC snapshot can't see the row this one
-   * just inserted.
+   * ones -- they already went through this before) publishes 'order.received'
+   * and is walked through received -> validated -> allocated so it doesn't
+   * sit at 'received' forever. That has to happen *after* the insert
+   * transaction commits, in its own transaction per order: allocateOrder()
+   * runs on a different connection (via its own withTenant), and until this
+   * transaction commits, that connection's MVCC snapshot can't see the row
+   * this one just inserted.
+   *
+   * 'order.received' is published *before* the validated/allocated
+   * transitions specifically so a routing rule (RulesEngine, subscribed to
+   * OrderReceived) has a chance to set orders.preferred_location_id before
+   * allocateOrder() reads it -- see resolveAllocationLocation().
    */
   async persistPulledOrders(tenantId: string, orders: NormalizedOrder[]): Promise<PersistPulledOrdersResult> {
-    const { insertedOrderIds, skippedExternalOrderIds } = await withTenant(this.pool, tenantId, async (client) => {
-      const insertedOrderIds: string[] = [];
+    const { insertedOrders, skippedExternalOrderIds } = await withTenant(this.pool, tenantId, async (client) => {
+      const insertedOrders: Array<{ id: string; order: NormalizedOrder }> = [];
       const skippedExternalOrderIds: string[] = [];
 
       for (const order of orders) {
@@ -259,19 +349,28 @@ export class OrderService {
           continue;
         }
 
-        insertedOrderIds.push(orderRow.id);
+        insertedOrders.push({ id: orderRow.id, order });
         await insertOrderLines(client, tenantId, orderRow.id, order);
       }
 
-      return { insertedOrderIds, skippedExternalOrderIds };
+      return { insertedOrders, skippedExternalOrderIds };
     });
 
-    for (const orderId of insertedOrderIds) {
+    for (const { id: orderId, order } of insertedOrders) {
+      const payload: OrderReceivedPayload = {
+        orderId,
+        channel: order.channel,
+        channelMarketplace: order.channelMarketplace,
+        externalOrderId: order.externalOrderId,
+        shippingAddress: order.shippingAddress,
+      };
+      await this.publish(tenantId, DomainEvent.OrderReceived, payload);
+
       await this.transition(tenantId, orderId, "received", "validated");
       await this.transition(tenantId, orderId, "validated", "allocated");
     }
 
-    return { insertedOrderIds, skippedExternalOrderIds };
+    return { insertedOrderIds: insertedOrders.map((o) => o.id), skippedExternalOrderIds };
   }
 }
 

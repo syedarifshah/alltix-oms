@@ -98,6 +98,11 @@ export interface Order {
   customer: Record<string, unknown> | null;
   shippingAddress: Record<string, unknown> | null;
   placedAt: string | null;
+  /** Set by the rules engine's `route_to_warehouse` action (a decision made
+   *  while the order is 'received', before allocation) -- when present,
+   *  allocateOrder() allocates against this location instead of its default
+   *  choice. Null means no routing rule fired for this order. */
+  preferredLocationId: string | null;
   rawPayload: unknown;
 }
 
@@ -145,6 +150,35 @@ export interface Location {
   type: LocationType;
 }
 
+/** One row per rule whose *conditions matched* an event -- not just ones
+ *  whose action ultimately took effect (see `applied`) -- so "why did/didn't
+ *  order X route to WH-2" is answerable after the fact even when a
+ *  higher-priority rule's conflicting action won instead, or the current
+ *  automation_rules row has since been edited. Deliberately NOT one row per
+ *  enabled rule regardless of match: at real order volume (CLAUDE.md §0) a
+ *  tenant could have many enabled rules where only a couple ever match a
+ *  given trigger, and "why didn't rule Y fire at all" is answerable by
+ *  comparing rule Y's own `conditions` to the order directly -- it doesn't
+ *  need a log, unlike "why did a matching rule's action lose." See
+ *  RulesEngine.evaluate()/executeActions(). */
+export interface RuleExecution {
+  id: string;
+  tenantId: string;
+  automationRuleId: string;
+  orderId: string;
+  triggerEvent: string;
+  /** Always true for a persisted row (see above) -- kept as an explicit
+   *  column rather than implied so a future caller can't misread absence of
+   *  a row as "matched: false" without checking the rule's conditions too. */
+  matched: boolean;
+  /** This rule's action(s) actually took effect -- false when matched but a
+   *  higher-priority rule's conflicting action of the same type won instead. */
+  applied: boolean;
+  actions: AutomationRuleAction[];
+  error: string | null;
+  createdAt: string;
+}
+
 export interface AutomationRuleCondition {
   field: string;
   op: string;
@@ -163,6 +197,14 @@ export interface AutomationRule {
   triggerEvent: string;
   conditions: AutomationRuleCondition[];
   actions: AutomationRuleAction[];
+  /** Lower number = higher priority (RulesEngine's documented convention --
+   *  see evaluate()). Also the primary sort key when resolving conflicting
+   *  actions of the same type across multiple matched rules. */
   priority: number;
   enabled: boolean;
+  /** Tie-breaker when two matched rules share the same priority and both
+   *  specify a conflicting action of the same type: the earlier-created
+   *  rule wins ("the rule you made first" is an explicable story; an
+   *  arbitrary id comparison isn't). See RulesEngine.evaluate(). */
+  createdAt: string;
 }
