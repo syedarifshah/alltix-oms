@@ -11,6 +11,7 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "db:migrate": "tsx packages/db/src/migrate.ts",
     "amazon:sandbox-smoke-test": "tsx scripts/amazon-sandbox-smoke-test.ts",
+    "amazon:production-smoke-test": "tsx scripts/amazon-production-smoke-test.ts",
     "amazon:seed-test-channel-connection": "tsx scripts/seed-test-channel-connection.ts",
     "amazon:seed-test-product-catalog": "tsx scripts/seed-test-product-catalog.ts",
     "amazon:pull-orders-smoke-test": "tsx scripts/amazon-pull-orders-smoke-test.ts",

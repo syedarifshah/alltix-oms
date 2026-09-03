@@ -26,6 +26,21 @@ export const SP_API_EU_SANDBOX_BASE_URL = "https://sandbox.sellingpartnerapi-eu.
 // constructed with this base URL, not the EU default used elsewhere.
 export const SP_API_NA_SANDBOX_BASE_URL = "https://sandbox.sellingpartnerapi-na.amazon.com";
 
+// Production hosts -- confirmed live against
+// https://developer-docs.amazon.com/sp-api/docs/sp-api-endpoints, not
+// assumed to mirror the sandbox names: they do turn out to be the sandbox
+// hosts above with the "sandbox." prefix dropped, but that was verified,
+// not guessed. Region coverage per that same page: NA = Canada/US/Mexico/
+// Amazon Brazil; EU = Ireland/Spain/UK/France/Belgium/Netherlands/Germany/
+// Italy/Sweden/South Africa/Poland/Saudi Arabia/Egypt/Turkey/UAE/Amazon
+// India; FE = Singapore/Australia/Amazon Japan. Unused by anything in this
+// file yet -- see loadAmazonProductionCredentialsFromEnv() and
+// scripts/amazon-production-smoke-test.ts, both read-only, both requiring
+// Arif's own real Seller Central credentials to exercise at all.
+export const SP_API_NA_PRODUCTION_BASE_URL = "https://sellingpartnerapi-na.amazon.com";
+export const SP_API_EU_PRODUCTION_BASE_URL = "https://sellingpartnerapi-eu.amazon.com";
+export const SP_API_FE_PRODUCTION_BASE_URL = "https://sellingpartnerapi-fe.amazon.com";
+
 // The Orders API sandbox doesn't accept an arbitrary real CreatedAfter date
 // the way marketplaceParticipations accepts arbitrary input -- it pattern-
 // matches CreatedAfter against a fixed set of documented literal trigger
@@ -162,6 +177,28 @@ export function loadAmazonSandboxCredentialsFromEnv(): AmazonSandboxCredentials 
   };
 }
 
+/** Same shape as {@link AmazonSandboxCredentials} (LWA credentials are
+ *  structurally identical between environments) -- aliased under its own
+ *  name so a caller reading loadAmazonProductionCredentialsFromEnv()'s
+ *  signature isn't told it's returning "sandbox" credentials. */
+export type AmazonProductionCredentials = AmazonSandboxCredentials;
+
+/** Reads the four AMAZON_PRODUCTION_* keys from process.env, failing fast
+ *  if any are missing. Mirrors {@link loadAmazonSandboxCredentialsFromEnv}
+ *  exactly, with separate env var names so sandbox and production
+ *  credentials can be configured side by side in the same .env without
+ *  collision -- the sandbox loader and its env vars are untouched by this.
+ *  These are Arif's own real Seller Central credentials, not shared
+ *  sandbox-app credentials; see scripts/amazon-production-smoke-test.ts. */
+export function loadAmazonProductionCredentialsFromEnv(): AmazonProductionCredentials {
+  return {
+    clientId: readRequiredEnv("AMAZON_PRODUCTION_CLIENT_ID"),
+    clientSecret: readRequiredEnv("AMAZON_PRODUCTION_CLIENT_SECRET"),
+    refreshToken: readRequiredEnv("AMAZON_PRODUCTION_REFRESH_TOKEN"),
+    sellerId: readRequiredEnv("AMAZON_PRODUCTION_SELLER_ID"),
+  };
+}
+
 /**
  * Reads the most recent active 'amazon' channel_connections row for a
  * tenant and decrypts its client_secret/refresh_token, via {@link withTenant}
@@ -245,15 +282,21 @@ export class AmazonConnector {
     return this.credentials.sellerId;
   }
 
-  /** Whether this connector talks to the SP-API sandbox rather than
-   *  production -- public so a caller (e.g. the scheduled order-sync job,
-   *  packages/scheduler) can decide whether to pass a real computed date or
-   *  the sandbox's literal CreatedAfter trigger (see
+  /** Whether this connector talks to an SP-API sandbox host (EU or NA)
+   *  rather than production -- public so a caller (e.g. the scheduled
+   *  order-sync job, packages/scheduler) can decide whether to pass a real
+   *  computed date or the sandbox's literal CreatedAfter trigger (see
    *  SP_API_SANDBOX_TEST_CASE_CREATED_AFTER) into pullOrders(), the same
    *  substitution pullOrders()/confirmShipment() already make internally
-   *  for the sandbox's order-id quirk. */
+   *  for the sandbox's order-id quirk. Checking both sandbox hosts (not
+   *  just EU) matters now that a production host is a real possibility:
+   *  before that, only EU sandbox was ever used for anything this method
+   *  gates (NA sandbox was pushInventory-only, which never calls
+   *  isSandbox()), so missing the NA case was latent, not yet a live bug --
+   *  worth fixing now regardless, since a production host is by definition
+   *  neither of the two sandbox ones and must always resolve to false. */
   isSandbox(): boolean {
-    return this.baseUrl === SP_API_EU_SANDBOX_BASE_URL;
+    return this.baseUrl === SP_API_EU_SANDBOX_BASE_URL || this.baseUrl === SP_API_NA_SANDBOX_BASE_URL;
   }
 
   /**
