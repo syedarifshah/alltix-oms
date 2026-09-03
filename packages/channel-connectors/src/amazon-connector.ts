@@ -245,6 +245,17 @@ export class AmazonConnector {
     return this.credentials.sellerId;
   }
 
+  /** Whether this connector talks to the SP-API sandbox rather than
+   *  production -- public so a caller (e.g. the scheduled order-sync job,
+   *  packages/scheduler) can decide whether to pass a real computed date or
+   *  the sandbox's literal CreatedAfter trigger (see
+   *  SP_API_SANDBOX_TEST_CASE_CREATED_AFTER) into pullOrders(), the same
+   *  substitution pullOrders()/confirmShipment() already make internally
+   *  for the sandbox's order-id quirk. */
+  isSandbox(): boolean {
+    return this.baseUrl === SP_API_EU_SANDBOX_BASE_URL;
+  }
+
   /**
    * Exchanges the refresh token for an LWA access token, caching it in
    * memory and transparently refreshing near expiry. The access token is
@@ -399,7 +410,7 @@ export class AmazonConnector {
     // SP_API_SANDBOX_TEST_CASE_ORDER_ID) -- substitute its one documented
     // trigger there. This branch goes away once this connector talks to a
     // real (non-sandbox) base URL, where a real order's own id is correct.
-    const isSandbox = this.baseUrl === SP_API_EU_SANDBOX_BASE_URL;
+    const isSandbox = this.isSandbox();
 
     const normalizedOrders: NormalizedOrder[] = [];
     for (const order of orders) {
@@ -517,7 +528,7 @@ export class AmazonConnector {
   async confirmShipment(orderId: string, tracking: TrackingInfo): Promise<void> {
     const { accessToken } = await this.authenticate();
 
-    const isSandbox = this.baseUrl === SP_API_EU_SANDBOX_BASE_URL;
+    const isSandbox = this.isSandbox();
     const items = await this.getOrderItems(isSandbox ? SP_API_SANDBOX_TEST_CASE_ORDER_ID : orderId);
 
     const response = await fetch(

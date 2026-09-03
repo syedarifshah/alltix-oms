@@ -15,7 +15,8 @@
     "amazon:seed-test-product-catalog": "tsx scripts/seed-test-product-catalog.ts",
     "amazon:pull-orders-smoke-test": "tsx scripts/amazon-pull-orders-smoke-test.ts",
     "amazon:push-inventory-smoke-test": "tsx scripts/amazon-push-inventory-smoke-test.ts",
-    "amazon:oauth-token-exchange-isolation-test": "tsx scripts/amazon-oauth-token-exchange-isolation-test.ts"
+    "amazon:oauth-token-exchange-isolation-test": "tsx scripts/amazon-oauth-token-exchange-isolation-test.ts",
+    "amazon:order-sync-job": "tsx scripts/amazon-order-sync-job.ts"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",

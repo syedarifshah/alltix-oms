@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../channel-connectors" },
+    { "path": "../db" },
+    { "path": "../order-service" },
+    { "path": "../rules-engine" },
+    { "path": "../shared" }
+  ]
+}

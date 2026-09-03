@@ -7,6 +7,7 @@
     { "path": "packages/order-service" },
     { "path": "packages/warehouse-service" },
     { "path": "packages/rules-engine" },
-    { "path": "packages/channel-connectors" }
+    { "path": "packages/channel-connectors" },
+    { "path": "packages/scheduler" }
   ]
 }
