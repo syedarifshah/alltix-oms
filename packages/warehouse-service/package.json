@@ -7,11 +7,19 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -b",
-    "typecheck": "tsc --noEmit -p ."
+    "typecheck": "tsc --noEmit -p .",
+    "test": "node --import tsx --test test/generate-and-pick.test.ts test/assign-picklist-concurrency.test.ts test/confirm-shipment-e2e.test.ts"
   },
   "dependencies": {
+    "@alltix/channel-connectors": "0.1.0",
     "@alltix/db": "0.1.0",
+    "@alltix/order-service": "0.1.0",
     "@alltix/shared": "0.1.0",
     "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10",
+    "dotenv": "^16.4.5",
+    "tsx": "^4.19.1"
   }
 }

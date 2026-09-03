@@ -32,35 +32,55 @@ export class OrderService {
    * §3) rather than throwing, since that's an expected outcome of the
    * attempt, not a caller error.
    *
-   * 'validated' is a pass-through today -- only the state-machine edge is
-   * enforced, no real validation logic (address/payment/etc.) exists yet.
-   * No other `to` value is implemented.
+   * 'validated', 'picking', 'packed', and 'shipped' are plain guarded status
+   * flips (see {@link simpleTransition}) -- 'validated' is a pass-through
+   * today (only the state-machine edge is enforced, no real validation logic
+   * exists yet); 'picking'/'packed'/'shipped' are called by
+   * WarehouseService (CLAUDE.md §1) once it's done its own picklist/
+   * inventory-adjustment/channel-confirmation work, so the order state
+   * machine stays owned in exactly one place rather than WarehouseService
+   * writing to `orders.status` itself. No other `to` value is implemented.
    */
   async transition(tenantId: string, orderId: string, from: OrderStatus, to: OrderStatus): Promise<OrderStatus> {
     if (!isValidOrderTransition(from, to)) {
       throw new Error(`Invalid order transition: ${from} -> ${to}`);
     }
 
-    if (to === "validated") {
-      return withTenant(this.pool, tenantId, async (client) => {
-        const result = await client.query(
-          `UPDATE orders SET status = $1, updated_at = now() WHERE id = $2 AND tenant_id = $3 AND status = $4`,
-          [to, orderId, tenantId, from],
-        );
-        if (result.rowCount === 0) {
-          throw new Error(
-            `Order ${orderId} is not in status '${from}' -- refusing transition to '${to}' (concurrent update?)`,
-          );
-        }
-        return to;
-      });
-    }
-
     if (to === "allocated") {
       return this.allocateOrder(tenantId, orderId, from);
     }
 
+    if (to === "validated" || to === "picking" || to === "packed" || to === "shipped") {
+      return this.simpleTransition(tenantId, orderId, from, to);
+    }
+
     throw new Error(`OrderService.transition: '${from}' -> '${to}' is not implemented yet`);
+  }
+
+  /** A status flip with no side effects beyond the guarded UPDATE itself --
+   *  the `WHERE status = from` clause is the concurrency guard (a
+   *  concurrent transition away from `from` makes this a no-op, caught via
+   *  `rowCount === 0`), the same pattern {@link allocateOrder} uses via an
+   *  explicit row lock instead, appropriate here since there's no
+   *  multi-step read-then-decide logic to protect. */
+  private async simpleTransition(
+    tenantId: string,
+    orderId: string,
+    from: OrderStatus,
+    to: OrderStatus,
+  ): Promise<OrderStatus> {
+    return withTenant(this.pool, tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE orders SET status = $1, updated_at = now() WHERE id = $2 AND tenant_id = $3 AND status = $4`,
+        [to, orderId, tenantId, from],
+      );
+      if (result.rowCount === 0) {
+        throw new Error(
+          `Order ${orderId} is not in status '${from}' -- refusing transition to '${to}' (concurrent update?)`,
+        );
+      }
+      return to;
+    });
   }
 
   /**

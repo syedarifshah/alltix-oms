@@ -1,7 +1,7 @@
 import type { Pool } from "pg";
 import { withTenant, decryptChannelSecret } from "@alltix/db";
 import type { FulfillmentType } from "@alltix/shared";
-import type { AuthToken, NormalizedOrder, NormalizedOrderLine, SyncResult } from "./connector.js";
+import type { AuthToken, NormalizedOrder, NormalizedOrderLine, SyncResult, TrackingInfo } from "./connector.js";
 
 // SP-API auth has been LWA-only since Oct 2023 -- no AWS IAM/SigV4 signing
 // required (CLAUDE.md §4.1). This is a smoke-test-only implementation:
@@ -215,9 +215,10 @@ export async function createAmazonConnectorFromChannelConnection(
 
 /**
  * Amazon SP-API connector -- implements authenticate(), the
- * getMarketplaceParticipations sandbox smoke-test call, pullOrders(), and
- * pushInventory(). Does NOT implement the full ChannelConnector interface
- * yet; pushListing is separate, later work.
+ * getMarketplaceParticipations sandbox smoke-test call, pullOrders(),
+ * pushInventory(), and confirmShipment(). Does NOT implement the full
+ * ChannelConnector interface yet; submitListing()/getFeedStatus() are
+ * separate, later work.
  *
  * Credentials come either from process.env (the default, via
  * {@link loadAmazonSandboxCredentialsFromEnv}, used by
@@ -472,6 +473,83 @@ export class AmazonConnector {
     }
 
     return { success: true, externalId: data.sku };
+  }
+
+  /**
+   * POST /orders/v0/orders/{orderId}/shipmentConfirmation -- confirms
+   * shipment with tracking info back to Amazon, the call CLAUDE.md §4.1/
+   * §4.2 flagged as closing the loop from allocated through to a real
+   * confirmed-shipment API call. Researched live against
+   * https://developer-docs.amazon.com/sp-api/reference/confirmshipment
+   * (Orders API v0 -- still the version every other method in this file
+   * uses; Amazon's newer v2026-01-01 Orders API is the documented
+   * migration target but out of scope for matching this file's existing
+   * v0 usage).
+   *
+   * SP-API requires the full per-item quantity breakdown, not just an
+   * order-level tracking number, so this fetches real items via
+   * getOrderItems() first -- same sandbox order-id substitution as
+   * pullOrders (see SP_API_SANDBOX_TEST_CASE_ORDER_ID).
+   *
+   * Single-package assumption (documented, not fixed by this task): every
+   * item on the order ships in one package, packageReferenceId '1'.
+   * carrierCode is always 'Other' with tracking.carrier passed through as
+   * carrierName -- SP-API's carrierCode enum wasn't confirmed against a
+   * canonical list this session, and 'Other' + carrierName is documented
+   * as always a valid combination regardless of the actual carrier.
+   *
+   * SANDBOX LIMITATION (confirmed live, not assumed): every call this
+   * connector makes to this endpoint -- against TEST_CASE_200 and a real
+   * GetOrders-returned order id, with both this method's own request
+   * shape and Amazon's own documented example values from
+   * github.com/amzn/selling-partner-api-models issue #4329
+   * (orderItemId '60696125413094', packageReferenceId '123') -- gets the
+   * identical `400 InvalidInput: Could not match input arguments`. That's
+   * the SP-API static sandbox's generic "no canned scenario matched"
+   * response (the same shape pullOrders/getOrderItems get for an
+   * unrecognized trigger), not a malformed-request or auth error -- LWA
+   * auth and the request/response shape are confirmed correct against
+   * live infrastructure, but this operation has no matching sandbox
+   * scenario for this account, so a genuine success path can only be
+   * verified against a real order in production, the same category of
+   * gap CLAUDE.md §4.1 already documents for the OAuth "Connect" flow.
+   */
+  async confirmShipment(orderId: string, tracking: TrackingInfo): Promise<void> {
+    const { accessToken } = await this.authenticate();
+
+    const isSandbox = this.baseUrl === SP_API_EU_SANDBOX_BASE_URL;
+    const items = await this.getOrderItems(isSandbox ? SP_API_SANDBOX_TEST_CASE_ORDER_ID : orderId);
+
+    const response = await fetch(
+      `${this.baseUrl}/orders/v0/orders/${encodeURIComponent(orderId)}/shipmentConfirmation`,
+      {
+        method: "POST",
+        headers: {
+          "x-amz-access-token": accessToken,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          marketplaceId: this.marketplaceIds[0],
+          packageDetail: {
+            packageReferenceId: "1",
+            carrierCode: "Other",
+            carrierName: tracking.carrier,
+            shippingMethod: "Standard",
+            trackingNumber: tracking.trackingNumber,
+            shipDate: new Date(tracking.shippedAt).toISOString(),
+            orderItems: items.map((item) => ({ orderItemId: item.OrderItemId, quantity: item.QuantityOrdered })),
+          },
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      const data = (await response.json()) as { errors?: Array<{ code: string; message: string; details?: string }> };
+      const message =
+        data.errors?.map((e) => `${e.code}: ${e.message}${e.details ? ` (${e.details})` : ""}`).join("; ") ??
+        response.statusText;
+      throw new Error(`SP-API shipmentConfirmation failed: ${response.status} ${message}`);
+    }
   }
 }
 

@@ -267,6 +267,17 @@ received → validated → allocated → picking → packed → shipped → deli
   queue and re-publishes normalized events onto your own internal bus — don't let
   downstream services depend on Amazon's raw notification shape.
 
+**Unverified until production**: two pieces of Amazon integration are implemented and
+confirmed to reach live SP-API infrastructure with a correct request shape, but can't
+be proven to actually succeed until run against a real seller account, not sandbox
+data —
+
+- The OAuth "Connect Amazon" redirect flow (Website Authorization Workflow) — see the
+  detailed writeup above in this section.
+- `AmazonConnector.confirmShipment()` — the static sandbox has no matching test
+  scenario for this operation on this account; see its doc comment in
+  `packages/channel-connectors/src/amazon-connector.ts` for what was tried.
+
 ### 4.2 Walmart Marketplace API (build second — structurally different, feed/poll-heavy)
 
 - **Auth**: OAuth 2.0, token-based, refreshed per session.

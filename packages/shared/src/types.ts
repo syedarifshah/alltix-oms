@@ -113,6 +113,29 @@ export interface OrderLine {
   fulfillmentType: FulfillmentType;
 }
 
+export type PicklistStatus = "open" | "assigned" | "completed" | "cancelled";
+
+export interface Picklist {
+  id: string;
+  tenantId: string;
+  locationId: string;
+  status: PicklistStatus;
+  assignedTo: string | null;
+}
+
+export type PicklistLineStatus = "pending" | "picked" | "short" | "damaged";
+
+export interface PicklistLine {
+  id: string;
+  tenantId: string;
+  picklistId: string;
+  orderLineId: string;
+  productId: string;
+  quantityRequested: number;
+  quantityPicked: number;
+  status: PicklistLineStatus;
+}
+
 export type LocationType = "warehouse" | "3pl" | "fba" | "wfs";
 
 export interface Location {
