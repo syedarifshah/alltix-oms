@@ -13,6 +13,19 @@ interface ChannelConnectionRow {
   marketplace: string;
   status: string;
   created_at: string;
+  last_order_sync_at: string | null;
+  lwa_client_id: string;
+}
+
+/** Sandbox vs. production is never stored as its own column (see
+ *  packages/db/migrations/0012_channel_connections.sql) -- the connection's
+ *  own lwa_client_id is compared against this process's known sandbox/
+ *  production client ids to label it, entirely server-side. Only the label
+ *  is ever rendered; the client id itself never reaches the page. */
+function classifyEnvironment(lwaClientId: string): "Sandbox" | "Production" | "Unknown" {
+  if (lwaClientId === process.env.AMAZON_SANDBOX_CLIENT_ID) return "Sandbox";
+  if (lwaClientId === process.env.AMAZON_PRODUCTION_CLIENT_ID) return "Production";
+  return "Unknown";
 }
 
 interface ChannelsSettingsPageProps {
@@ -49,7 +62,7 @@ export default async function ChannelsSettingsPage({
 
   const connection = await withTenant(pool, tenantId, async (client) => {
     const result = await client.query<ChannelConnectionRow>(
-      `SELECT external_account_id, marketplace, status, created_at
+      `SELECT external_account_id, marketplace, status, created_at, last_order_sync_at, lwa_client_id
          FROM channel_connections
         WHERE channel = 'amazon'
         ORDER BY created_at DESC
@@ -59,25 +72,44 @@ export default async function ChannelsSettingsPage({
   });
 
   const isConnected = connection?.status === "active";
+  const environment = connection ? classifyEnvironment(connection.lwa_client_id) : null;
 
   return (
-    <main>
+    <main className="page">
       <h1>Channels</h1>
-      {connected === "amazon" && <p>Amazon connected.</p>}
-      {error && <p>Amazon connection failed ({error}).</p>}
+      <p className="subtitle">Amazon-only MVP — Walmart/Shopify/eBay connectors aren&apos;t built yet.</p>
+
+      {connected === "amazon" && <div className="alert alert-success">Amazon connected.</div>}
+      {error && <div className="alert alert-danger">Amazon connection failed ({error}).</div>}
 
       <h2>Amazon</h2>
-      {isConnected ? (
-        <p>
-          Connected — seller {connection.external_account_id} ({connection.marketplace}), since{" "}
-          {new Date(connection.created_at).toISOString()}
-        </p>
-      ) : (
-        <>
-          {connection && <p>Status: {connection.status}</p>}
+      <div className="card">
+        {connection ? (
+          <div className="stack">
+            <div className="row">
+              <span className={isConnected ? "badge badge-success" : "badge badge-danger"}>{connection.status}</span>
+              <span className="badge">{environment}</span>
+              <span className="muted">seller {connection.external_account_id}</span>
+              <span className="muted">marketplace {connection.marketplace}</span>
+            </div>
+            <div className="muted">Connected since {new Date(connection.created_at).toISOString()}</div>
+            <div className="muted">
+              Last order sync:{" "}
+              {connection.last_order_sync_at ? new Date(connection.last_order_sync_at).toISOString() : "never synced yet"}
+            </div>
+            {environment === "Production" && (
+              <div className="alert alert-info" style={{ marginTop: 8, marginBottom: 0 }}>
+                Production inventory/listing pushes are not enabled in this UI yet — pending Amazon&apos;s SP-API
+                production role-grant review (see the production smoke test&apos;s 403 on
+                marketplaceParticipations). Order pull and the pick/pack/ship workflow are unaffected.
+              </div>
+            )}
+            {!isConnected && <a href="/api/channels/amazon/connect">Reconnect Amazon</a>}
+          </div>
+        ) : (
           <a href="/api/channels/amazon/connect">Connect Amazon</a>
-        </>
-      )}
+        )}
+      </div>
     </main>
   );
 }

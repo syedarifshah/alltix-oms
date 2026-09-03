@@ -9,8 +9,9 @@ import type { ReactElement } from "react";
 // is updating this usage, not pinning an older Clerk.
 export default function HomePage(): ReactElement {
   return (
-    <main>
+    <main className="page">
       <h1>alltix-oms</h1>
+      <p className="subtitle">Amazon-only MVP: orders, inventory, picking/packing/shipping, and order-routing rules.</p>
       <Show when="signed-in">
         <UserButton />
       </Show>

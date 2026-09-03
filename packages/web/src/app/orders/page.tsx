@@ -5,6 +5,7 @@ import { withTenant } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { ALL_ORDER_STATUSES, orderStatusBadgeClass } from "@/lib/order-status";
 
 export const dynamic = "force-dynamic";
 
@@ -64,11 +65,16 @@ function groupOrders(rows: OrderLineRow[]): OrderView[] {
   return [...byId.values()];
 }
 
+interface OrdersPageProps {
+  searchParams: Promise<{ status?: string }>;
+}
+
 /**
- * Read-only order list for the signed-in tenant. Resolves the caller via
- * getAuthContext (src/lib/auth-context.ts, passed `await headers()` since a
- * Server Component has no NextRequest -- getAuthContext takes a plain
- * Headers for exactly this reason) and their tenant_id via resolveTenantId
+ * Read-only order list for the signed-in tenant, filterable by any status in
+ * the CLAUDE.md §3 state machine. Resolves the caller via getAuthContext
+ * (src/lib/auth-context.ts, passed `await headers()` since a Server
+ * Component has no NextRequest -- getAuthContext takes a plain Headers for
+ * exactly this reason) and their tenant_id via resolveTenantId
  * (src/lib/with-tenant-auth.ts), the same two steps withTenantAuth performs
  * for API routes -- deliberately not calling Clerk's auth() directly here,
  * since that skips the test-auth-bypass check and throws outright whenever
@@ -83,7 +89,7 @@ function groupOrders(rows: OrderLineRow[]): OrderView[] {
  * redirect() call below is defense-in-depth (CLAUDE.md §6), not the
  * primary gate.
  */
-export default async function OrdersPage(): Promise<ReactElement> {
+export default async function OrdersPage({ searchParams }: OrdersPageProps): Promise<ReactElement> {
   const authContext = await getAuthContext(await headers());
   if (!authContext) {
     redirect("/sign-in");
@@ -93,12 +99,15 @@ export default async function OrdersPage(): Promise<ReactElement> {
   const tenantId = await resolveTenantId(pool, authContext.clerkUserId);
   if (!tenantId) {
     return (
-      <main>
+      <main className="page">
         <h1>Orders</h1>
         <p>No tenant is associated with this account yet.</p>
       </main>
     );
   }
+
+  const { status: statusFilter } = await searchParams;
+  const validFilter = statusFilter && (ALL_ORDER_STATUSES as string[]).includes(statusFilter) ? statusFilter : null;
 
   const orders = await withTenant(pool, tenantId, async (client) => {
     // No WHERE tenant_id = ... on any of the joined tables, on purpose --
@@ -124,52 +133,73 @@ export default async function OrdersPage(): Promise<ReactElement> {
        FROM orders o
        LEFT JOIN order_lines ol ON ol.order_id = o.id
        LEFT JOIN products p ON p.id = ol.product_id
+       WHERE ($1::text IS NULL OR o.status = $1)
        ORDER BY o.placed_at DESC NULLS LAST, o.id, ol.id`,
+      [validFilter],
     );
     return groupOrders(result.rows);
   });
 
   return (
-    <main>
+    <main className="page">
       <h1>Orders</h1>
+      <p className="subtitle">All orders pulled from connected channels (Amazon MVP), across the full order lifecycle.</p>
+
+      <div className="tabs">
+        <a href="/orders" className={`tab ${validFilter === null ? "active" : ""}`}>
+          All
+        </a>
+        {ALL_ORDER_STATUSES.map((status) => (
+          <a key={status} href={`/orders?status=${status}`} className={`tab ${validFilter === status ? "active" : ""}`}>
+            {status}
+          </a>
+        ))}
+      </div>
+
       {orders.length === 0 ? (
-        <p>No orders yet.</p>
+        <p className="empty">No orders{validFilter ? ` in status '${validFilter}'` : ""}.</p>
       ) : (
-        <table border={1} cellPadding={4}>
-          <thead>
-            <tr>
-              <th>Status</th>
-              <th>Channel</th>
-              <th>External Order ID</th>
-              <th>Placed At</th>
-              <th>Lines</th>
-            </tr>
-          </thead>
-          <tbody>
-            {orders.map((order) => (
-              <tr key={order.id}>
-                <td>{order.status}</td>
-                <td>{order.channel}</td>
-                <td>{order.externalOrderId}</td>
-                <td>{order.placedAt ? new Date(order.placedAt).toISOString() : "—"}</td>
-                <td>
-                  {order.lines.length === 0 ? (
-                    "—"
-                  ) : (
-                    <ul>
-                      {order.lines.map((line) => (
-                        <li key={line.id}>
-                          {line.internalSku ?? "(unresolved SKU)"} × {line.quantity}
-                          {order.status === "allocated" && (line.reserved ? " — reserved ✓" : " — NOT reserved ✗")}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </td>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Channel</th>
+                <th>External Order ID</th>
+                <th>Placed At</th>
+                <th>Lines</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {orders.map((order) => (
+                <tr key={order.id}>
+                  <td>
+                    <span className={orderStatusBadgeClass(order.status)}>{order.status}</span>
+                  </td>
+                  <td>{order.channel}</td>
+                  <td>
+                    <a href={`/orders/${order.id}`}>{order.externalOrderId}</a>
+                  </td>
+                  <td>{order.placedAt ? new Date(order.placedAt).toISOString() : "—"}</td>
+                  <td>
+                    {order.lines.length === 0 ? (
+                      "—"
+                    ) : (
+                      <ul>
+                        {order.lines.map((line) => (
+                          <li key={line.id}>
+                            {line.internalSku ?? "(unresolved SKU)"} × {line.quantity}
+                            {order.status === "allocated" && (line.reserved ? " — reserved ✓" : " — NOT reserved ✗")}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </main>
   );

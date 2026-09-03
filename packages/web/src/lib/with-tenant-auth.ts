@@ -30,6 +30,44 @@ export async function resolveTenantId(pool: Pool, clerkUserId: string): Promise<
   });
 }
 
+export interface CurrentUser {
+  id: string;
+  tenantId: string;
+}
+
+/** Like {@link resolveTenantId}, but also returns the caller's own `users.id`
+ *  -- needed anywhere a mutation records *who* did something (e.g.
+ *  picklists.assigned_to), not just which tenant they belong to. */
+export async function resolveCurrentUser(pool: Pool, clerkUserId: string): Promise<CurrentUser | null> {
+  return withClerkUser(pool, clerkUserId, async (client) => {
+    const result = await client.query<{ id: string; tenant_id: string }>(
+      "SELECT id, tenant_id FROM users WHERE clerk_user_id = $1",
+      [clerkUserId],
+    );
+    const row = result.rows[0];
+    return row ? { id: row.id, tenantId: row.tenant_id } : null;
+  });
+}
+
+/**
+ * Auth + tenant resolution only, with no transaction left open around the
+ * handler -- for a Route Handler that delegates its actual work to a
+ * service class (OrderService/WarehouseService/RulesEngine) that opens its
+ * own `withTenant` transaction(s) internally. Wrapping such a handler in
+ * {@link withTenantAuth} instead would hold an extra, otherwise-unused pool
+ * connection open for the duration of the call. Performs the identical two
+ * steps withTenantAuth itself does (see its doc comment) -- just without the
+ * third (opening a transaction) -- so RLS is never bypassed, only the
+ * redundant transaction is skipped.
+ */
+export async function requireCurrentUser(req: NextRequest, pool: Pool): Promise<CurrentUser | null> {
+  const authContext = await getAuthContext(req.headers);
+  if (!authContext) {
+    return null;
+  }
+  return resolveCurrentUser(pool, authContext.clerkUserId);
+}
+
 /**
  * Wraps a Route Handler with the request-level tenant isolation contract:
  *
