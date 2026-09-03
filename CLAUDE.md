@@ -6,7 +6,7 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
 
 ## 0. Locked Scope Decisions
 
-- **First customer**: small-to-mid multichannel sellers (Amazon/Walmart/eBay/Shopify), 50-5,000 orders/month.
+- **First customer**: small-to-mid multichannel sellers (Amazon/Walmart/eBay/Shopify), 500-50,000 orders/month.
 - **Wedge feature**: real-time inventory sync + rules-based order automation.
 - **Build type**: OMS/IMS-only (Linnworks model) for v1. NOT manufacturing/BOM (Cin7 model) — that roughly doubles data-model complexity and is a v2+ vertical.
 - **Deployment**: multi-tenant SaaS, cloud-hosted, single codebase.
@@ -118,6 +118,13 @@ inventory_levels (
 change — marketplace order, PO receipt, or manual count — goes through
 `inventory_events` first. This gives a full audit trail and makes oversell bugs
 debuggable instead of mysterious.
+
+**Retrofit risk at the top of the target range**: a tenant near 50,000 orders/month
+(§0) can generate 100k+ `inventory_events` rows/month on its own, before
+receipts/adjustments/transfers are counted. An unpartitioned, unarchived ledger table
+is the same "expensive to retrofit later" category as RLS (§11, item 6) — not
+implemented now, but a decision point to revisit before it becomes urgent. Monthly range
+partitioning on `created_at` is the likely approach when it's needed.
 
 ### 2.3 Orders
 
@@ -347,7 +354,7 @@ succeeded or failed."
 | Inventory ledger | Property-based/fuzz testing for concurrent allocation — simulate N simultaneous order-allocation requests against 1 unit of stock, assert exactly one succeeds |
 | Rules engine | Golden-file tests: fixed event input → expected action output, covering every condition/action combination |
 | Contract tests | Record real (sanitized) marketplace API responses as fixtures; replay in CI so a marketplace schema change breaks the build loudly, not silently in production |
-| Load testing | Simulate peak-season order bursts (Black Friday-scale) against the allocation path specifically — this is where systems fail first |
+| Load testing | Simulate a top-of-range tenant's (§0: 50,000 orders/month, ~1,700 orders/day average) peak-day burst at roughly 5-10x that average daily rate (~8,500-17,000 orders in a day), sustained for several hours, against the allocation path specifically — this is where systems fail first |
 
 ## 8. Build Roadmap & Phasing
 
@@ -362,6 +369,10 @@ succeeded or failed."
 - **Phase 4 — Operational maturity (Months 7-9)**: reporting/analytics on separate
   read store. Multi-warehouse/3PL support. Returns handling. Rate-limit hardening,
   circuit breakers, observability dashboards.
+  - Open question for Arif: given the widened volume ceiling (§0: up to 50,000
+    orders/month), whether the CDC-fed reporting store is worth moving earlier than
+    Phase 4 — not a change to the phase order itself, just worth deciding deliberately
+    rather than by default.
 - **Phase 5 — Scale features (Months 9-12+)**: eBay/TikTok Shop/additional channels.
   Stock forecasting. B2B portal (if pursuing Cin7-style ERP breadth). SOC 2 prep if
   targeting mid-market.
