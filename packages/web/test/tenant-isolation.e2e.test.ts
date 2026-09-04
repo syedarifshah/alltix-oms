@@ -117,6 +117,17 @@ before(async () => {
     },
     stdio: "pipe",
     shell: true,
+    // On POSIX, make serverProcess the leader of its own process group
+    // (rather than inheriting this test runner's group) so killServerTree()
+    // can signal the whole tree -- the shell spawn() launched *and* the
+    // next-server/Turbopack children it in turn spawns -- via a single
+    // negative-pid kill, without touching this test runner's own process.
+    // Without this, serverProcess.kill() below only reaches the shell
+    // (shell:true is required for npx.cmd on Windows -- see the Windows
+    // branch), leaving next-server running and holding PORT open, which is
+    // exactly why this test previously hung after every assertion passed
+    // (CLAUDE.md §12: "Test process cleanup must stay PID-scoped").
+    detached: process.platform !== "win32",
   });
   serverProcess.stderr.on("data", (chunk: Buffer) => {
     process.stderr.write(`[next dev] ${chunk.toString()}`);
@@ -134,7 +145,17 @@ function killServerTree(): void {
   if (process.platform === "win32") {
     spawnSync("taskkill", ["/pid", String(serverProcess.pid), "/T", "/F"]);
   } else {
-    serverProcess.kill();
+    // serverProcess.pid is the group leader (detached: true above), so a
+    // negative pid signals every process in that group at once -- SIGKILL
+    // rather than the default SIGTERM since this is test teardown after
+    // assertions have already run: there's nothing left to shut down
+    // gracefully, and Next dev/Turbopack can otherwise ignore SIGTERM and
+    // keep the group (and this test's own exit) hanging.
+    try {
+      process.kill(-serverProcess.pid, "SIGKILL");
+    } catch {
+      // Already exited -- nothing to clean up.
+    }
   }
 }
 
