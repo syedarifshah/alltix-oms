@@ -12,6 +12,7 @@
     "test:amazon-oauth-state": "node --import tsx --test test/amazon-oauth-state.test.ts"
   },
   "dependencies": {
+    "@alltix/billing-service": "0.1.0",
     "@alltix/channel-connectors": "0.1.0",
     "@alltix/db": "0.1.0",
     "@alltix/order-service": "0.1.0",

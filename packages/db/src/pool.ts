@@ -76,6 +76,38 @@ export async function withClerkUser<T>(
 }
 
 /**
+ * Runs `fn` inside a transaction with `app.stripe_customer_id` set (SET
+ * LOCAL semantics, same as {@link withClerkUser}) but `app.tenant_id` left
+ * unset. Mirrors withClerkUser's exact reasoning, for the exact same
+ * chicken-and-egg reason: a Stripe webhook event identifies a tenant only
+ * by `customer` id, and `tenant_id` isn't known until that's resolved. See
+ * the `stripe_customer_self_lookup_tenants` policy on `tenants` (migration
+ * 0016) -- only a self-lookup by stripe_customer_id is allowed under this,
+ * the same restriction `self_lookup_users` places on the clerk_user_id
+ * path. Switch to {@link withTenant} once tenant_id is resolved from this;
+ * don't keep using this for anything else in the request.
+ */
+export async function withStripeCustomer<T>(
+  pool: Pool,
+  stripeCustomerId: string,
+  fn: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT set_config('app.stripe_customer_id', $1, true)", [stripeCustomerId]);
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * Runs `fn` with both `app.tenant_id` and `app.clerk_user_id` set for the
  * transaction. Only for first-time provisioning: creating a brand new
  * tenant row and its owning user row in the same transaction, where the

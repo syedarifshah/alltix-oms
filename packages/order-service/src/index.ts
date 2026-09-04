@@ -351,6 +351,7 @@ export class OrderService {
 
         insertedOrders.push({ id: orderRow.id, order });
         await insertOrderLines(client, tenantId, orderRow.id, order);
+        await incrementOrdersProcessedUsage(client, tenantId);
       }
 
       return { insertedOrders, skippedExternalOrderIds };
@@ -372,6 +373,30 @@ export class OrderService {
 
     return { insertedOrderIds: insertedOrders.map((o) => o.id), skippedExternalOrderIds };
   }
+}
+
+/**
+ * Bumps this tenant's current-month order count (CLAUDE.md §1 Billing:
+ * "usage metering (orders processed, SKUs, users)" -- see migration
+ * 0016_billing.sql for why this is a real incremented counter rather than a
+ * derived COUNT(*), and why it lives here in the same transaction as the
+ * order insert instead of behind a decoupled event subscriber: an order
+ * that's inserted but not counted (or vice versa) is a billing-usage bug,
+ * not a "some optional side effect didn't run" -- the ledger and the
+ * counter must never be able to drift apart. One UPSERT, atomic with the
+ * INSERT into `orders` above.
+ */
+async function incrementOrdersProcessedUsage(client: PoolClient, tenantId: string): Promise<void> {
+  const month = new Date().toISOString().slice(0, 7); // 'YYYY-MM', UTC
+  await client.query(
+    `INSERT INTO tenant_usage (tenant_id, month, orders_processed)
+     VALUES ($1, $2, 1)
+     ON CONFLICT (tenant_id) DO UPDATE SET
+       orders_processed = CASE WHEN tenant_usage.month = EXCLUDED.month THEN tenant_usage.orders_processed + 1 ELSE 1 END,
+       month = EXCLUDED.month,
+       updated_at = now()`,
+    [tenantId, month],
+  );
 }
 
 /**

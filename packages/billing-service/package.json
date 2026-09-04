@@ -1,0 +1,23 @@
+{
+  "name": "@alltix/billing-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "@alltix/db": "0.1.0",
+    "@alltix/shared": "0.1.0",
+    "pg": "^8.13.1",
+    "stripe": "^22.6.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10",
+    "dotenv": "^16.4.5",
+    "tsx": "^4.19.1"
+  }
+}

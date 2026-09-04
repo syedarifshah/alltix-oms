@@ -33,6 +33,7 @@ export async function Nav(): Promise<ReactElement> {
       <a href="/inventory">Inventory</a>
       <a href="/picklists">Picklists</a>
       <a href="/rules">Rules</a>
+      <a href="/settings/billing">Billing</a>
       <a href="/settings/channels">Settings</a>
       <div className="nav-spacer" />
       {isTestBypass ? (

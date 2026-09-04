@@ -18,7 +18,8 @@
     "amazon:push-inventory-smoke-test": "tsx scripts/amazon-push-inventory-smoke-test.ts",
     "amazon:oauth-token-exchange-isolation-test": "tsx scripts/amazon-oauth-token-exchange-isolation-test.ts",
     "amazon:order-sync-job": "tsx scripts/amazon-order-sync-job.ts",
-    "amazon:order-sync-scheduler": "tsx scripts/amazon-order-sync-scheduler.ts"
+    "amazon:order-sync-scheduler": "tsx scripts/amazon-order-sync-scheduler.ts",
+    "stripe:setup-mvp-plan": "tsx scripts/stripe-setup-mvp-plan.ts"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
