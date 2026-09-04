@@ -16,6 +16,7 @@
     "@alltix/order-service": "0.1.0",
     "@alltix/rules-engine": "0.1.0",
     "@alltix/shared": "0.1.0",
+    "node-cron": "^4.6.0",
     "pg": "^8.13.1"
   },
   "devDependencies": {

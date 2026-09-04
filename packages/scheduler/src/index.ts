@@ -176,3 +176,12 @@ async function syncTenant(appPool: Pool, orderService: OrderService, tenantId: s
     return { tenantId, success: false, insertedOrderIds: [], skippedExternalOrderIds: [], error: message };
   }
 }
+
+// The recurring trigger this file's own header comment above flagged as
+// separate, later infrastructure work -- see cron-runner.ts for why
+// node-cron (not BullMQ) and what "later" means concretely.
+export {
+  startAmazonOrderSyncScheduler,
+  runOnceWithRetry,
+  type AmazonOrderSyncSchedulerOptions,
+} from "./cron-runner.js";
