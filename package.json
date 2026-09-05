@@ -7,9 +7,12 @@
   ],
   "scripts": {
     "build": "tsc -b",
+    "build:web": "npm run build --workspace=@alltix/web",
     "clean": "tsc -b --clean",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "db:migrate": "tsx packages/db/src/migrate.ts",
+    "test": "bash scripts/run-tests.sh",
+    "test:amazon-sandbox": "bash scripts/run-tests.sh --amazon-sandbox",
     "amazon:sandbox-smoke-test": "tsx scripts/amazon-sandbox-smoke-test.ts",
     "amazon:production-smoke-test": "tsx scripts/amazon-production-smoke-test.ts",
     "amazon:seed-test-channel-connection": "tsx scripts/seed-test-channel-connection.ts",

@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: alltix_admin
+          POSTGRES_PASSWORD: ci_admin_password
+          POSTGRES_DB: alltix_oms
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U alltix_admin -d alltix_oms"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # DATABASE_URL is the schema-owning role (migration 0001 creates
+      # app_user itself, see packages/db/src/migrate.ts) -- APP_DATABASE_URL
+      # is what every service/test actually connects as, RLS-enforced.
+      DATABASE_URL: postgres://alltix_admin:ci_admin_password@localhost:5432/alltix_oms
+      APP_USER_PASSWORD: ci_app_password
+      APP_DATABASE_URL: postgres://app_user:ci_app_password@localhost:5432/alltix_oms
+      # Generated fresh per run -- CI never needs to decrypt anything an
+      # earlier run encrypted, so there's no reason for this to be stable.
+      CHANNEL_CREDENTIALS_ENCRYPTION_KEY: ci-encryption-key-not-for-real-use-000000
+      # packages/web/test/tenant-isolation.e2e.test.ts's escape hatch (see
+      # src/lib/auth-context.ts) -- lets the e2e test boot a real `next dev`
+      # and drive it over real HTTP without live Clerk credentials.
+      # Structurally inert outside next dev (next build/start force
+      # NODE_ENV=production regardless), so safe to set repo-wide in CI.
+      ALLTIX_TEST_AUTH_BYPASS: "true"
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: pk_test_ZmFrZS10ZXN0LWFwcC5jbGVyay5hY2NvdW50cy5kZXYk
+      CLERK_SECRET_KEY: sk_test_replace_me
+      CLERK_WEBHOOK_SECRET: whsec_replace_me
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build workspace packages
+        run: npm run build
+
+      - name: Build web app (production build)
+        run: npm run build:web
+
+      - name: Run database migrations
+        run: npm run db:migrate
+
+      - name: Run test suite
+        run: npm test
