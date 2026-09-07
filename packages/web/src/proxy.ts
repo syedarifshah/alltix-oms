@@ -19,6 +19,13 @@ const isPublicRoute = createRouteMatcher([
   "/sign-up(.*)",
   "/api/webhooks(.*)",
   "/api/health",
+  // Legal pages must be reachable without signing in -- Google's OAuth
+  // consent screen links to these directly (Branding page requires a
+  // Privacy Policy / Terms of Service URL before the app can be published
+  // out of Testing mode), and a logged-out visitor should be able to read
+  // them before ever creating an account.
+  "/privacy",
+  "/terms",
 ]);
 
 // clerkGuard validates the publishable/secret key format on *every*
