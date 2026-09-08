@@ -1,4 +1,4 @@
-import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
+﻿import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
 import { NextResponse, type NextRequest } from "next/server";
 
 // This file uses Next's current "Proxy" file convention (the renamed,
@@ -14,11 +14,22 @@ import { NextResponse, type NextRequest } from "next/server";
 // src/lib/with-tenant-auth.ts, applied to every route under src/app/api.
 // Treat that wrapper as the real "auth + tenant middleware" for API
 // requests; this file is only the identity gate in front of it.
+
+// PAGE routes that must stay reachable without signing in. Critically, these
+// still go THROUGH clerkGuard below (unlike isClerkExemptRoute) -- every page
+// renders inside the root layout's <ClerkProvider>, which calls Clerk's own
+// auth() internally to resolve initial auth state for hydration, and auth()
+// throws "auth() was called but Clerk can't detect usage of clerkMiddleware()"
+// for ANY request that never went through clerkMiddleware(), even when the
+// page itself never calls auth(). That's exactly what broke the production
+// site after "/" was added here and given a hard bypass (NextResponse.next()
+// before clerkGuard ever ran) -- production logs showed a 500 on every GET /
+// with that precise Clerk error. The fix is Clerk's own recommended pattern:
+// run clerkMiddleware() for every page, and only call auth.protect()
+// conditionally (see clerkGuard below) instead of skipping the middleware.
 const isPublicRoute = createRouteMatcher([
   "/sign-in(.*)",
   "/sign-up(.*)",
-  "/api/webhooks(.*)",
-  "/api/health",
   // Legal pages must be reachable without signing in -- Google's OAuth
   // consent screen links to these directly (Branding page requires a
   // Privacy Policy / Terms of Service URL before the app can be published
@@ -29,26 +40,34 @@ const isPublicRoute = createRouteMatcher([
   // Public marketing site (src/app/(marketing)) -- Home, Why AlltixOMS,
   // Pricing, Book a Demo. "/" used to be gated (it fell through to
   // clerkGuard's auth.protect() like any other route), which is exactly why
-  // a signed-out visit to www.alltixoms.com landed straight on the Clerk
-  // sign-in wall instead of a real marketing page. The dashboard itself
-  // stays fully gated -- only these four public-facing routes are exempt.
+  // a signed-out visit to the site landed straight on the Clerk sign-in wall
+  // instead of a real marketing page. The dashboard itself stays fully
+  // gated -- only these routes are exempt from auth.protect().
   "/",
   "/why-alltixoms",
   "/pricing",
   "/book-a-demo",
+]);
+
+// Routes that must never even invoke clerkGuard -- clerkGuard validates the
+// publishable/secret key format on *every* invocation, unconditionally,
+// before it even runs the handler, so anything that (a) needs to work
+// without real Clerk keys (health check, this app's e2e test bypass covers
+// the rest) or (b) is a route handler with no page/ClerkProvider anywhere in
+// its response -- true of all three below -- belongs here instead of on
+// isPublicRoute, or it 500s whenever Clerk isn't configured with real keys.
+const isClerkExemptRoute = createRouteMatcher([
+  "/api/webhooks(.*)",
+  "/api/health",
   // "Book a Demo" lead-capture endpoint (src/app/api/leads/demo-request) --
   // submitted by anonymous prospects who don't have a Clerk session at all.
   "/api/leads(.*)",
 ]);
 
-// clerkGuard validates the publishable/secret key format on *every*
-// invocation, unconditionally, before it even looks at isPublicRoute -- so a
-// public route (health check, sign-in/up pages, the Clerk webhook) must
-// never be routed into it at all, not just exempted from auth.protect(),
-// or it 500s even for genuinely public requests whenever Clerk isn't
-// configured with real keys (e.g. this app's e2e test).
-const clerkGuard = clerkMiddleware(async (auth) => {
-  await auth.protect();
+const clerkGuard = clerkMiddleware(async (auth, req) => {
+  if (!isPublicRoute(req)) {
+    await auth.protect();
+  }
 });
 
 /**
@@ -72,7 +91,7 @@ function isTestBypass(req: NextRequest): boolean {
 
 export default function proxy(...args: Parameters<typeof clerkGuard>): ReturnType<typeof clerkGuard> {
   const [req] = args;
-  if (isPublicRoute(req) || isTestBypass(req)) {
+  if (isClerkExemptRoute(req) || isTestBypass(req)) {
     return NextResponse.next() as ReturnType<typeof clerkGuard>;
   }
   return clerkGuard(...args);
