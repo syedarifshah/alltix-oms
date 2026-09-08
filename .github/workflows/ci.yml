@@ -60,7 +60,22 @@ jobs:
         run: npm run build
 
       - name: Typecheck
+        # Must run after `build`, not before: every package's own typecheck
+        # script is a plain `tsc --noEmit -p .`, which resolves sibling
+        # workspace packages (e.g. `@alltix/db`) through their package.json
+        # `types` field (`dist/index.d.ts`) -- not through source via `tsc -b`
+        # project references. On a fresh checkout there is no `dist/` yet, so
+        # typecheck-before-build fails with "Cannot find module '@alltix/db'"
+        # on every downstream package. Verified: from a truly clean checkout
+        # (no dist/, no *.tsbuildinfo), typecheck-then-build reproduces
+        # exactly this failure; build-then-typecheck passes cleanly.
         run: npm run typecheck
 
       - name: Build web app (production build)
         run: npm run build:web
+
+      - name: Run database migrations
+        run: npm run db:migrate
+
+      - name: Run test suite
+        run: npm test

@@ -26,6 +26,19 @@ const isPublicRoute = createRouteMatcher([
   // them before ever creating an account.
   "/privacy",
   "/terms",
+  // Public marketing site (src/app/(marketing)) -- Home, Why AlltixOMS,
+  // Pricing, Book a Demo. "/" used to be gated (it fell through to
+  // clerkGuard's auth.protect() like any other route), which is exactly why
+  // a signed-out visit to www.alltixoms.com landed straight on the Clerk
+  // sign-in wall instead of a real marketing page. The dashboard itself
+  // stays fully gated -- only these four public-facing routes are exempt.
+  "/",
+  "/why-alltixoms",
+  "/pricing",
+  "/book-a-demo",
+  // "Book a Demo" lead-capture endpoint (src/app/api/leads/demo-request) --
+  // submitted by anonymous prospects who don't have a Clerk session at all.
+  "/api/leads(.*)",
 ]);
 
 // clerkGuard validates the publishable/secret key format on *every*

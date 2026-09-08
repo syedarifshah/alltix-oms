@@ -26,7 +26,12 @@ export async function Nav(): Promise<ReactElement> {
 
   return (
     <nav className="nav">
-      <a href="/" className="nav-brand">
+      {/* "/" is now the public marketing home (src/app/(marketing)), not
+          part of the authenticated app -- the brand link here goes to
+          /orders instead so it stays inside the dashboard a signed-in user
+          is already in, rather than bouncing them out to the marketing
+          site. */}
+      <a href="/orders" className="nav-brand">
         alltix-oms
       </a>
       <a href="/orders">Orders</a>
