@@ -40,8 +40,8 @@ export function MarketingFooter(): ReactElement {
           </div>
           <div>
             <h4>Company</h4>
-            <a href="#">About (placeholder)</a>
-            <a href="#">Careers (placeholder)</a>
+            <a href="#">About </a>
+            <a href="#">Careers </a>
             <Link href="/book-a-demo">Contact</Link>
           </div>
           <div>
@@ -52,7 +52,7 @@ export function MarketingFooter(): ReactElement {
         </div>
         <div className="footer-bottom">
           <div>Â© 2026 AlltixOMS. All rights reserved.</div>
-          <div>hello@alltixoms.com (placeholder)</div>
+          <div>info@alltixoms.com</div>
         </div>
       </div>
     </footer>
