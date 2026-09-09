@@ -38,7 +38,9 @@ export function MarketingHeader(): ReactElement {
     <header className="site-nav">
       <div className="nav-inner">
         <Link className="logo" href="/">
-          <span className="logo-mark">A</span>
+          {/* eslint-disable-next-line @next/next/no-img-element -- a small, fixed
+              brand mark; not worth the next/image config for a single static file */}
+          <img className="logo-mark" src="/logo-mark.png" alt="" width={36} height={39} />
           <span className="logo-text">
             AlltixOMS
             <span className="logo-sub">Order Management System</span>
@@ -69,7 +71,7 @@ export function MarketingHeader(): ReactElement {
             aria-expanded={mobileOpen}
             onClick={() => setMobileOpen((open) => !open)}
           >
-            ☰
+            â˜°
           </button>
         </div>
       </div>

@@ -17,7 +17,9 @@ export function MarketingFooter(): ReactElement {
         <div className="footer-grid">
           <div>
             <Link className="logo" href="/">
-              <span className="logo-mark">A</span>
+              {/* eslint-disable-next-line @next/next/no-img-element -- a small, fixed
+                  brand mark; not worth the next/image config for a single static file */}
+              <img className="logo-mark" src="/logo-mark.png" alt="" width={36} height={39} />
               <span className="logo-text">
                 AlltixOMS
                 <span className="logo-sub">Order Management System</span>
@@ -49,7 +51,7 @@ export function MarketingFooter(): ReactElement {
           </div>
         </div>
         <div className="footer-bottom">
-          <div>© 2026 AlltixOMS. All rights reserved.</div>
+          <div>Â© 2026 AlltixOMS. All rights reserved.</div>
           <div>hello@alltixoms.com (placeholder)</div>
         </div>
       </div>

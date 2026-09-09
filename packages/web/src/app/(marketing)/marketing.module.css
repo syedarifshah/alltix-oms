@@ -186,17 +186,10 @@
   color: var(--ink);
 }
 .mkt :global(.logo-mark) {
-  width: 32px;
-  height: 32px;
-  border-radius: 9px;
-  background: linear-gradient(135deg, var(--accent), #1e40af);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #0f1216;
-  font-weight: 900;
-  font-size: 15px;
+  width: 36px;
+  height: 39px;
   flex: none;
+  object-fit: contain;
 }
 .mkt :global(.logo-text) {
   display: flex;
