@@ -911,3 +911,150 @@
 .mkt :global(.form-note.error) {
   color: var(--amber);
 }
+
+/* ===================================================================
+ * ANIMATIONS
+ * Two additions, both progressive enhancement over the layout/colors
+ * above (nothing here changes size, position, or copy at rest):
+ *   1. Scroll reveal -- sections/cards fade + slide up the first time
+ *      they scroll into view (driven by ScrollReveal, see
+ *      components/marketing/scroll-reveal.tsx, which toggles
+ *      data-revealed="true").
+ *   2. Small hover lifts on cards, and an animated mobile-menu
+ *      open/close instead of the old instant display:none/flex toggle.
+ * Rule 1 is scoped entirely inside prefers-reduced-motion: no-preference
+ * -- see that block's own comment for why.
+ * =================================================================== */
+
+@media (prefers-reduced-motion: no-preference) {
+  .mkt :global(.hero),
+  .mkt :global(.trust-item),
+  .mkt :global(.section-head),
+  .mkt :global(.testi-card),
+  .mkt :global(.card),
+  .mkt :global(.compare-wrap),
+  .mkt :global(.step),
+  .mkt :global(.cta-band),
+  .mkt :global(.faq),
+  .mkt :global(.logo-row) {
+    opacity: 0;
+    transform: translateY(18px);
+    transition:
+      opacity 0.6s cubic-bezier(0.16, 1, 0.3, 1),
+      transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .mkt :global(.hero)[data-revealed="true"],
+  .mkt :global(.trust-item)[data-revealed="true"],
+  .mkt :global(.section-head)[data-revealed="true"],
+  .mkt :global(.testi-card)[data-revealed="true"],
+  .mkt :global(.card)[data-revealed="true"],
+  .mkt :global(.compare-wrap)[data-revealed="true"],
+  .mkt :global(.step)[data-revealed="true"],
+  .mkt :global(.cta-band)[data-revealed="true"],
+  .mkt :global(.faq)[data-revealed="true"],
+  .mkt :global(.logo-row)[data-revealed="true"] {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  /* .price-card fades only (no transform) -- .price-card.featured already
+     carries a permanent translateY(-8px) lift (see PRICING above); reusing
+     transform here would fight that instead of composing with it. */
+  .mkt :global(.price-card) {
+    opacity: 0;
+    transition: opacity 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .mkt :global(.price-card)[data-revealed="true"] {
+    opacity: 1;
+  }
+
+  /* Gentle stagger for elements that sit side-by-side in the same row/grid,
+     so they don't all pop in in perfect unison. */
+  .mkt :global(.grid-3) :global(.card):nth-child(2),
+  .mkt :global(.testi-grid) :global(.testi-card):nth-child(2),
+  .mkt :global(.steps) :global(.step):nth-child(2),
+  .mkt :global(.price-grid) :global(.price-card):nth-child(2),
+  .mkt :global(.trust-bar) :global(.trust-item):nth-child(2) {
+    transition-delay: 0.08s;
+  }
+  .mkt :global(.grid-3) :global(.card):nth-child(3),
+  .mkt :global(.testi-grid) :global(.testi-card):nth-child(3),
+  .mkt :global(.steps) :global(.step):nth-child(3),
+  .mkt :global(.price-grid) :global(.price-card):nth-child(3),
+  .mkt :global(.trust-bar) :global(.trust-item):nth-child(3) {
+    transition-delay: 0.16s;
+  }
+  .mkt :global(.grid-3) :global(.card):nth-child(4),
+  .mkt :global(.trust-bar) :global(.trust-item):nth-child(4) {
+    transition-delay: 0.24s;
+  }
+  .mkt :global(.grid-3) :global(.card):nth-child(5) {
+    transition-delay: 0.32s;
+  }
+  .mkt :global(.grid-3) :global(.card):nth-child(6) {
+    transition-delay: 0.4s;
+  }
+}
+
+/* Hover lift -- independent of the reveal system above, so it's active
+   immediately at rest (not gated behind data-revealed) and always uses a
+   quick, responsive duration regardless of the slower entrance timing. */
+.mkt :global(.card),
+.mkt :global(.step),
+.mkt :global(.testi-card) {
+  transition:
+    box-shadow 0.25s ease,
+    transform 0.25s ease;
+}
+.mkt :global(.card):hover,
+.mkt :global(.step):hover,
+.mkt :global(.testi-card):hover {
+  transform: translateY(-4px);
+  box-shadow: var(--shadow-lg);
+}
+.mkt :global(.price-card) {
+  transition:
+    box-shadow 0.25s ease,
+    transform 0.25s ease;
+}
+.mkt :global(.price-card):hover {
+  transform: translateY(-4px);
+  box-shadow: var(--shadow-lg);
+}
+.mkt :global(.price-card.featured):hover {
+  /* .featured already sits at translateY(-8px) at rest -- add to it rather
+     than replace it, so the hover lift reads the same as the other cards. */
+  transform: translateY(-12px);
+}
+
+/* Animated mobile menu -- was an instant display:none/flex toggle on the
+   same .open class MarketingHeader already applies; swapped for a
+   max-height/opacity collapse so it opens and closes instead of snapping.
+   The open/closed state itself (and its base layout) stays unconditional --
+   only the transition is gated behind prefers-reduced-motion, so a reduced-
+   motion visitor still gets a working menu, just without the animation. */
+.mkt :global(.mobile-nav) {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 24px;
+  border-top: 1px solid transparent;
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+}
+.mkt :global(.mobile-nav.open) {
+  max-height: 320px;
+  opacity: 1;
+  padding: 8px 24px 16px;
+  border-top-color: var(--line);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .mkt :global(.mobile-nav) {
+    transition:
+      max-height 0.3s ease,
+      opacity 0.2s ease,
+      padding 0.3s ease,
+      border-color 0.3s ease;
+  }
+}

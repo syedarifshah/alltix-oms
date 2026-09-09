@@ -1,6 +1,7 @@
 import type { ReactElement, ReactNode } from "react";
 import { MarketingHeader } from "@/components/marketing/marketing-header";
 import { MarketingFooter } from "@/components/marketing/marketing-footer";
+import { ScrollReveal } from "@/components/marketing/scroll-reveal";
 import styles from "./marketing.module.css";
 
 /**
@@ -19,6 +20,7 @@ import styles from "./marketing.module.css";
 export default function MarketingLayout({ children }: { children: ReactNode }): ReactElement {
   return (
     <div className={styles.mkt}>
+      <ScrollReveal />
       <MarketingHeader />
       {children}
       <MarketingFooter />
