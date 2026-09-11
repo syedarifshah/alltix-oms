@@ -8,13 +8,6 @@ import type { OrderStatus } from "./types.js";
 //                              |
 //                          cancelled
 //
-// The diagram doesn't show how on_hold/backordered resolve back into the
-// main flow (e.g. does a released hold return to `validated`, or move
-// straight to `allocated`?) — that's a product decision for order-service to
-// make explicitly, not something to infer here. Still undecided; no edges
-// out of on_hold/backordered other than the cancellation ones below exist
-// yet.
-//
 // CANCELLATION SCOPE -- decided explicitly, not inferred from the diagram
 // (which literally only draws backordered -> cancelled): a cancellable
 // order is any order that hasn't been physically packed yet --
@@ -28,12 +21,29 @@ import type { OrderStatus } from "./types.js";
 // the reservation" -- already implies allocated-order cancellation is
 // in-scope; this only makes that (and the picking case, which has the same
 // live-reservation shape) explicit alongside it.
+//
+// ON_HOLD / BACKORDERED RESOLUTION -- also decided explicitly (the diagram
+// doesn't show how either resolves back into the main flow):
+//  - a released hold returns to 'validated', not straight to 'allocated' --
+//    it re-enters the normal flow rather than skipping the allocation
+//    decision. See OrderService's `validated` manual-action doc comment for
+//    why a *manual* validated -> allocated action had to be added alongside
+//    this: outside of fresh channel-pull ingestion (which auto-chains
+//    validated -> allocated with no gap), nothing else advances a
+//    'validated' order on its own, so without that action a resumed order
+//    would dead-end at 'validated'.
+//  - backordered -> allocated is a manual retry (a person re-triggers it
+//    once they know stock is back), not automatic on inventory receipt --
+//    simpler for now, no new event-subscription infrastructure required.
+// Both re-run the exact same allocateOrder() sufficiency check an initial
+// allocation attempt does, so a retry that's still short on stock just
+// lands back on 'backordered' rather than erroring.
 export const ORDER_STATE_TRANSITIONS: Readonly<Record<OrderStatus, readonly OrderStatus[]>> = {
   received: ["validated", "cancelled"],
   validated: ["allocated", "on_hold", "cancelled"],
-  on_hold: ["cancelled"],
+  on_hold: ["validated", "cancelled"],
   allocated: ["picking", "backordered", "cancelled"],
-  backordered: ["cancelled"],
+  backordered: ["allocated", "cancelled"],
   picking: ["packed", "cancelled"],
   packed: ["shipped"],
   shipped: ["delivered", "returned", "refunded"],

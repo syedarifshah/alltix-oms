@@ -20,12 +20,22 @@ export interface PersistPulledOrdersResult {
 /** The event each simpleTransition() `to` status publishes once its UPDATE
  *  commits. 'allocated' isn't here -- allocateOrder() publishes its own
  *  (either OrderAllocated or OrderBackordered) since it has two possible
- *  outcomes and a richer payload than a plain status flip. */
+ *  outcomes and a richer payload than a plain status flip.
+ *
+ *  'validated' covers two distinct callers with the same event: a fresh
+ *  channel pull's received -> validated step, and a released hold's
+ *  on_hold -> validated step (see order-state-machine.ts's ON_HOLD /
+ *  BACKORDERED RESOLUTION comment) -- both are "this order is now in the
+ *  normal flow, pending allocation," so one event name is correct for
+ *  either origin. */
 const SIMPLE_TRANSITION_EVENT: Partial<Record<OrderStatus, DomainEventName>> = {
   validated: DomainEvent.OrderValidated,
   picking: DomainEvent.OrderPicking,
   packed: DomainEvent.OrderPacked,
   shipped: DomainEvent.OrderShipped,
+  delivered: DomainEvent.OrderDelivered,
+  returned: DomainEvent.OrderReturned,
+  refunded: DomainEvent.OrderRefunded,
 };
 
 /**
@@ -67,14 +77,28 @@ export class OrderService {
    * §3) rather than throwing, since that's an expected outcome of the
    * attempt, not a caller error.
    *
-   * 'validated', 'picking', 'packed', and 'shipped' are plain guarded status
-   * flips (see {@link simpleTransition}) -- 'validated' is a pass-through
-   * today (only the state-machine edge is enforced, no real validation logic
-   * exists yet); 'picking'/'packed'/'shipped' are called by
-   * WarehouseService (CLAUDE.md §1) once it's done its own picklist/
-   * inventory-adjustment/channel-confirmation work, so the order state
-   * machine stays owned in exactly one place rather than WarehouseService
-   * writing to `orders.status` itself. 'cancelled' goes through
+   * 'validated', 'picking', 'packed', 'shipped', 'delivered', 'returned',
+   * and 'refunded' are all plain guarded status flips (see
+   * {@link simpleTransition}) -- 'validated' is a pass-through today (only
+   * the state-machine edge is enforced, no real validation logic exists
+   * yet), reached either from 'received' (a fresh channel pull) or from
+   * 'on_hold' (a released hold, see order-state-machine.ts's ON_HOLD /
+   * BACKORDERED RESOLUTION comment); 'picking'/'packed'/'shipped' are
+   * called by WarehouseService (CLAUDE.md §1) once it's done its own
+   * picklist/inventory-adjustment/channel-confirmation work, so the order
+   * state machine stays owned in exactly one place rather than
+   * WarehouseService writing to `orders.status` itself; 'delivered' /
+   * 'returned' / 'refunded' are the three branches CLAUDE.md §3 draws off
+   * 'shipped' -- deliberately *not* wired to touch the inventory ledger
+   * (a decided product choice: a return may not be resellable as-is, so
+   * restocking is a separate, manual inventory adjustment once the
+   * returned item has actually been inspected, not an automatic
+   * consequence of the status flip). 'allocated' goes through
+   * {@link allocateOrder} instead since it has a real sufficiency check and
+   * two possible outcomes -- reachable from 'validated' (the normal path)
+   * or 'backordered' (a manual retry once stock may have arrived; same
+   * check either way, so a retry that's still short just lands back on
+   * 'backordered' rather than throwing). 'cancelled' goes through
    * {@link cancelOrder} instead, since (unlike the plain flips above) it
    * sometimes has to release a live reservation first -- see its own doc
    * comment. No other `to` value is implemented.
@@ -88,7 +112,15 @@ export class OrderService {
       return this.allocateOrder(tenantId, orderId, from);
     }
 
-    if (to === "validated" || to === "picking" || to === "packed" || to === "shipped") {
+    if (
+      to === "validated" ||
+      to === "picking" ||
+      to === "packed" ||
+      to === "shipped" ||
+      to === "delivered" ||
+      to === "returned" ||
+      to === "refunded"
+    ) {
       return this.simpleTransition(tenantId, orderId, from, to);
     }
 

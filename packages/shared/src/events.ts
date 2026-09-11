@@ -14,6 +14,7 @@ export const DomainEvent = {
   OrderDelivered: "order.delivered",
   OrderCancelled: "order.cancelled",
   OrderReturned: "order.returned",
+  OrderRefunded: "order.refunded",
   InventoryChanged: "inventory.changed",
 } as const;
 

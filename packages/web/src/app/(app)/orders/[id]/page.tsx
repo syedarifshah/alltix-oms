@@ -5,7 +5,7 @@ import { withTenant } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
-import { orderStatusBadgeClass, isOrderCancellable } from "@/lib/order-status";
+import { orderStatusBadgeClass, isOrderCancellable, manualOrderActions } from "@/lib/order-status";
 import type { OrderStatus } from "@alltix/shared";
 
 export const dynamic = "force-dynamic";
@@ -242,7 +242,22 @@ export default async function OrderDetailPage({ params, searchParams }: OrderDet
         {new Date(order.updated_at).toISOString()}
       </p>
 
-      {error && <div className="alert alert-danger">Couldn&apos;t cancel this order ({error}).</div>}
+      {error && <div className="alert alert-danger">Couldn&apos;t update this order ({error}).</div>}
+
+      {manualOrderActions(order.status as OrderStatus).map((action) => (
+        <form
+          key={action.to}
+          action={`/api/orders/${order.id}/transition`}
+          method="POST"
+          className="row"
+          style={{ marginBottom: 20 }}
+        >
+          <input type="hidden" name="from" value={order.status} />
+          <input type="hidden" name="to" value={action.to} />
+          <button type="submit">{action.label}</button>
+          {action.hint && <span className="muted">{action.hint}</span>}
+        </form>
+      ))}
 
       {isOrderCancellable(order.status as OrderStatus) && (
         <form action={`/api/orders/${order.id}/cancel`} method="POST" className="row" style={{ marginBottom: 20 }}>
