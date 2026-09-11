@@ -24,12 +24,16 @@ SAFE_TESTS=(
   "packages/warehouse-service/test/assign-picklist-concurrency.test.ts"
   "packages/inventory-service/test/record-inventory-event.test.ts"
   "packages/channel-connectors/test/amazon-connector.test.ts"
+  "packages/channel-connectors/test/shopify-connector.test.ts"
   "packages/db/test/channel-connections-rls.test.ts"
   "packages/rules-engine/test/evaluate-golden.test.ts"
   "packages/rules-engine/test/resolve-actions-priority.test.ts"
   "packages/rules-engine/test/order-received-integration.test.ts"
+  "packages/rules-engine/test/hold-order-integration.test.ts"
   "packages/order-service/test/persist-and-allocate.test.ts"
   "packages/order-service/test/allocation-concurrency.test.ts"
+  "packages/order-service/test/cancel-order.test.ts"
+  "packages/order-service/test/lifecycle-transitions.test.ts"
 )
 
 # Each needs AMAZON_SANDBOX_CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN/SELLER_ID
