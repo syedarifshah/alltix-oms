@@ -19,7 +19,22 @@
    same as marketing's own .btn-primary treatment). Radius/shadow values are
    also pulled up to marketing's rounder, softly-elevated card language
    (marketing: --radius 14px, --shadow on cards) instead of the previous
-   flat 5-8px chrome -- layout/structure is unchanged, this is chrome only. */
+   flat 5-8px chrome -- layout/structure is unchanged, this is chrome only.
+
+   Theme resolution order (see components/theme-toggle.tsx + the inline
+   pre-hydration script in app/layout.tsx for how [data-theme] gets set):
+     1. :root below -- light values, the unconditional fallback.
+     2. @media (prefers-color-scheme: dark), guarded by
+        :root:not([data-theme="light"]) -- OS-level dark applies
+        automatically UNLESS the user explicitly picked light in-app.
+     3. :root[data-theme="dark"] -- forces dark regardless of OS, once the
+        user explicitly picks it. An attribute selector on :root has higher
+        specificity than the plain :root the media query uses, so this
+        wins over (2) even though it comes first in the cascade -- no
+        !important needed. data-theme is only ever set to "light" or
+        "dark" by user action (see theme-toggle.tsx); an unset attribute
+        (nothing explicitly chosen yet) means "follow the OS," which (1)+(2)
+        already handle on their own. */
 
 :root {
   color-scheme: light dark;
@@ -46,7 +61,7 @@
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #14161a;
     --surface: #1d2026;
     --border: rgba(255, 255, 255, 0.09);
@@ -65,6 +80,26 @@
     --shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
     --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.45);
   }
+}
+
+:root[data-theme="dark"] {
+  --bg: #14161a;
+  --surface: #1d2026;
+  --border: rgba(255, 255, 255, 0.09);
+  --text: #f5f7fa;
+  --text-muted: #9fa9b6;
+  --accent: #22d3ee;
+  --accent-contrast: #0f1216;
+  --accent-glow: rgba(34, 211, 238, 0.3);
+  --danger: #ff6b64;
+  --danger-bg: #3a1715;
+  --warning: #f5a524;
+  --warning-bg: rgba(245, 165, 36, 0.14);
+  --success: #5fd379;
+  --success-bg: #123a1c;
+  --neutral-bg: #262a33;
+  --shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.45);
 }
 
 * {
@@ -133,6 +168,13 @@ h2 {
 
 .nav-brand img {
   display: block;
+}
+
+.theme-toggle {
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 600;
 }
 
 .nav-spacer {

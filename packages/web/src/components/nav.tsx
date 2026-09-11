@@ -1,6 +1,7 @@
 import { Show, UserButton } from "@clerk/nextjs";
 import { headers } from "next/headers";
 import type { ReactElement } from "react";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 /**
  * Static top nav across every page. Amazon-only MVP (CLAUDE.md §0): no
@@ -45,6 +46,7 @@ export async function Nav(): Promise<ReactElement> {
       <a href="/settings/billing">Billing</a>
       <a href="/settings/channels">Settings</a>
       <div className="nav-spacer" />
+      <ThemeToggle />
       {isTestBypass ? (
         <span className="muted">test session</span>
       ) : (
