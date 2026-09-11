@@ -62,6 +62,17 @@ const isClerkExemptRoute = createRouteMatcher([
   // "Book a Demo" lead-capture endpoint (src/app/api/leads/demo-request) --
   // submitted by anonymous prospects who don't have a Clerk session at all.
   "/api/leads(.*)",
+  // Vercel Cron invocation (src/app/api/cron/amazon-order-sync) -- carries
+  // no Clerk session at all (it's Vercel's own scheduler calling in, not a
+  // signed-in user), and has its own separate auth via the CRON_SECRET
+  // bearer token the route checks itself. Without this exemption,
+  // clerkGuard's auth.protect() 404s every invocation before the route
+  // handler ever runs -- Clerk's documented behavior for a failed
+  // auth.protect() on a non-page request is a 404, not a redirect, which is
+  // exactly the "Status: 404" Vercel's own cron logs showed here: this
+  // route was reachable and correctly deployed, clerkGuard just never let
+  // Vercel's cron caller reach it.
+  "/api/cron(.*)",
 ]);
 
 const clerkGuard = clerkMiddleware(async (auth, req) => {
