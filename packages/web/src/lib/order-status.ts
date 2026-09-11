@@ -49,6 +49,10 @@ export interface OrderManualAction {
  *    'validated' by resuming a hold (see 'on_hold' below) would have no way
  *    forward -- nothing outside ingestion advances 'validated' on its own.
  *  - 'on_hold' -> 'validated': releases the hold, back into the normal flow.
+ *    (An order reaches 'on_hold' in the first place via a 'hold_order'
+ *    automation rule -- packages/rules-engine/src/index.ts's
+ *    placeOrderOnHold -- not a manual button; there's still no
+ *    staff-initiated "place this order on hold" action on this page.)
  *  - 'backordered' -> 'allocated': manual retry once stock may have arrived.
  *  - 'shipped' -> 'delivered' / 'returned' / 'refunded': the three branches
  *    CLAUDE.md §3 draws off 'shipped'. 'returned' only flips status --

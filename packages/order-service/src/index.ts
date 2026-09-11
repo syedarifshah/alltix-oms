@@ -30,6 +30,7 @@ export interface PersistPulledOrdersResult {
  *  either origin. */
 const SIMPLE_TRANSITION_EVENT: Partial<Record<OrderStatus, DomainEventName>> = {
   validated: DomainEvent.OrderValidated,
+  on_hold: DomainEvent.OrderOnHold,
   picking: DomainEvent.OrderPicking,
   packed: DomainEvent.OrderPacked,
   shipped: DomainEvent.OrderShipped,
@@ -61,6 +62,23 @@ export class OrderService {
     await this.eventBus.publish({ name, tenantId, occurredAt: new Date().toISOString(), payload });
   }
 
+  /** One-row status lookup -- see persistPulledOrders()'s doc comment for
+   *  why it re-checks this after publish() rather than trusting the order
+   *  is still 'received'. */
+  private async currentStatus(tenantId: string, orderId: string): Promise<OrderStatus> {
+    return withTenant(this.pool, tenantId, async (client) => {
+      const result = await client.query<{ status: OrderStatus }>(
+        `SELECT status FROM orders WHERE id = $1 AND tenant_id = $2`,
+        [orderId, tenantId],
+      );
+      const status = result.rows[0]?.status;
+      if (!status) {
+        throw new Error(`Order ${orderId} not found for tenant ${tenantId}`);
+      }
+      return status;
+    });
+  }
+
   async receiveOrder(tenantId: string, order: Omit<Order, "id" | "tenantId" | "status">): Promise<Order> {
     return withTenant(this.pool, tenantId, async () => {
       void order;
@@ -77,13 +95,18 @@ export class OrderService {
    * §3) rather than throwing, since that's an expected outcome of the
    * attempt, not a caller error.
    *
-   * 'validated', 'picking', 'packed', 'shipped', 'delivered', 'returned',
-   * and 'refunded' are all plain guarded status flips (see
+   * 'validated', 'on_hold', 'picking', 'packed', 'shipped', 'delivered',
+   * 'returned', and 'refunded' are all plain guarded status flips (see
    * {@link simpleTransition}) -- 'validated' is a pass-through today (only
    * the state-machine edge is enforced, no real validation logic exists
    * yet), reached either from 'received' (a fresh channel pull) or from
    * 'on_hold' (a released hold, see order-state-machine.ts's ON_HOLD /
-   * BACKORDERED RESOLUTION comment); 'picking'/'packed'/'shipped' are
+   * BACKORDERED RESOLUTION comment); 'on_hold' itself is reachable here
+   * (from 'validated') for a caller that already has the order there and
+   * wants to place a hold directly -- note RulesEngine's own 'hold_order'
+   * automation action does NOT call this method to do it, see that class's
+   * doc comment for why (atomicity with its rule_executions bookkeeping
+   * write); 'picking'/'packed'/'shipped' are
    * called by WarehouseService (CLAUDE.md §1) once it's done its own
    * picklist/inventory-adjustment/channel-confirmation work, so the order
    * state machine stays owned in exactly one place rather than
@@ -114,6 +137,7 @@ export class OrderService {
 
     if (
       to === "validated" ||
+      to === "on_hold" ||
       to === "picking" ||
       to === "packed" ||
       to === "shipped" ||
@@ -467,7 +491,17 @@ export class OrderService {
    * 'order.received' is published *before* the validated/allocated
    * transitions specifically so a routing rule (RulesEngine, subscribed to
    * OrderReceived) has a chance to set orders.preferred_location_id before
-   * allocateOrder() reads it -- see resolveAllocationLocation().
+   * allocateOrder() reads it -- see resolveAllocationLocation(). A
+   * *different* kind of rule (RulesEngine's 'hold_order' action) can instead
+   * move the order all the way to 'on_hold' during that same publish() call
+   * (InProcessEventBus.publish() awaits every subscriber before returning,
+   * so this already happened by the time publish() resolves below) -- this
+   * loop re-checks the order's actual status before continuing its own
+   * chain and skips it if a subscriber already moved it off 'received',
+   * rather than blindly issuing 'received' -> 'validated' next: that guarded
+   * UPDATE would match zero rows and throw, and since nothing here catches
+   * per-order errors, an uncaught throw would abort the rest of this whole
+   * batch, not just this one order.
    */
   async persistPulledOrders(tenantId: string, orders: NormalizedOrder[]): Promise<PersistPulledOrdersResult> {
     const { insertedOrders, skippedExternalOrderIds } = await withTenant(this.pool, tenantId, async (client) => {
@@ -515,6 +549,11 @@ export class OrderService {
         shippingAddress: order.shippingAddress,
       };
       await this.publish(tenantId, DomainEvent.OrderReceived, payload);
+
+      const statusAfterPublish = await this.currentStatus(tenantId, orderId);
+      if (statusAfterPublish !== "received") {
+        continue;
+      }
 
       await this.transition(tenantId, orderId, "received", "validated");
       await this.transition(tenantId, orderId, "validated", "allocated");

@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc --noEmit -p .",
-    "test": "node --import tsx --test test/evaluate-golden.test.ts test/resolve-actions-priority.test.ts test/order-received-integration.test.ts"
+    "test": "node --import tsx --test test/evaluate-golden.test.ts test/resolve-actions-priority.test.ts test/order-received-integration.test.ts test/hold-order-integration.test.ts"
   },
   "dependencies": {
     "@alltix/channel-connectors": "0.1.0",

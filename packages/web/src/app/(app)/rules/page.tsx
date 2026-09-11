@@ -40,14 +40,15 @@ interface RulesPageProps {
 /**
  * View/manage automation_rules (CLAUDE.md §1 Rules/Automation Engine --
  * "build it early, not as a v2 feature"). Only trigger_event
- * 'order.received' and action type 'route_to_warehouse' are actually
- * implemented by RulesEngine today (see packages/rules-engine/src/index.ts)
- * -- the create form below doesn't hard-restrict those fields (a rule for an
- * unimplemented trigger/action is harmless to store, just inert), but the
- * defaults point at what actually works, and this page says so plainly
- * rather than implying more automation exists than does. Conditions/actions
- * are edited as raw JSON, per this pass's explicit scope call -- a visual
- * condition/action builder is future work.
+ * 'order.received' is implemented, with two action types --
+ * 'route_to_warehouse' and 'hold_order' (see
+ * packages/rules-engine/src/index.ts) -- the create form below doesn't
+ * hard-restrict those fields (a rule for an unimplemented trigger/action is
+ * harmless to store, just inert), but the defaults point at what actually
+ * works, and this page says so plainly rather than implying more automation
+ * exists than does. Conditions/actions are edited as raw JSON, per this
+ * pass's explicit scope call -- a visual condition/action builder is future
+ * work.
  */
 export default async function RulesPage({ searchParams }: RulesPageProps): Promise<ReactElement> {
   const authContext = await getAuthContext(await headers());
@@ -90,8 +91,9 @@ export default async function RulesPage({ searchParams }: RulesPageProps): Promi
     <main className="page">
       <h1>Rules</h1>
       <p className="subtitle">
-        Order-routing automation (order.received → route_to_warehouse). Lower priority number wins when two enabled
-        rules&apos; actions of the same type conflict.
+        Order automation on order.received: route_to_warehouse (sets a preferred warehouse) and hold_order (places
+        the order on_hold instead of letting it proceed toward allocation, for manual review). Lower priority number
+        wins when two enabled rules&apos; actions of the same type conflict.
       </p>
 
       {error && <div className="alert alert-danger">{decodeURIComponent(error)}</div>}
@@ -189,8 +191,8 @@ export default async function RulesPage({ searchParams }: RulesPageProps): Promi
         </div>
         <div className="form-row">
           <label htmlFor="actions">
-            Actions (JSON array — only &quot;route_to_warehouse&quot; is implemented, value = a warehouse location
-            name)
+            Actions (JSON array — &quot;route_to_warehouse&quot; (value = a warehouse location name) or
+            &quot;hold_order&quot; (value ignored) are implemented)
           </label>
           <textarea
             id="actions"

@@ -8,6 +8,12 @@ export const DomainEvent = {
   // allocateOrder()'s other real outcome (CLAUDE.md §3) -- added alongside
   // the rules engine so this path isn't silently invisible on the bus.
   OrderBackordered: "order.backordered",
+  // Published when an order reaches on_hold via OrderService.transition()
+  // directly (e.g. a future manual "place on hold" action, or a test).
+  // RulesEngine's own 'hold_order' automation action does NOT go through
+  // transition() -- see its own doc comment for why -- so a rule-driven
+  // hold does not publish this; it's picked up via rule_executions instead.
+  OrderOnHold: "order.on_hold",
   OrderPicking: "order.picking",
   OrderPacked: "order.packed",
   OrderShipped: "order.shipped",

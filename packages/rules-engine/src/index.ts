@@ -2,12 +2,14 @@ import type { Pool, PoolClient } from "pg";
 import { withTenant } from "@alltix/db";
 import {
   DomainEvent,
+  isValidOrderTransition,
   type AutomationRule,
   type AutomationRuleAction,
   type AutomationRuleCondition,
   type DomainEventEnvelope,
   type EventBus,
   type OrderReceivedPayload,
+  type OrderStatus,
 } from "@alltix/shared";
 
 /** One rule considered against an event, with its match outcome. Kept
@@ -72,12 +74,9 @@ function matchesConditions(conditions: AutomationRuleCondition[], payload: unkno
  * type is applied; a lower-priority rule's action of a type no
  * higher-priority rule specified still applies. Equal-priority ties break by
  * created_at ascending (the rule made first wins -- an explicable story,
- * unlike an arbitrary id comparison). With only one action type implemented
- * (route_to_warehouse) today, this mostly matters as "the highest-priority
- * rule that sets a preferred warehouse wins, others are recorded as
- * matched-but-not-applied" -- but the algorithm is action-type-general, not
- * hardcoded to routing, so it doesn't need reworking when a second action
- * type is added.
+ * unlike an arbitrary id comparison). The algorithm is action-type-general,
+ * not hardcoded to routing, so it didn't need reworking when a second
+ * action type ('hold_order', see {@link executeAction}) was added.
  */
 export class RulesEngine {
   constructor(private readonly pool: Pool) {}
@@ -144,11 +143,24 @@ export class RulesEngine {
    *  for the same reason as evaluate(). Rules are assumed pre-sorted by
    *  (priority ASC, createdAt ASC) (loadEnabledRulesWithClient's ORDER BY
    *  does this); resolveActions re-sorts defensively so it's correct
-   *  regardless of evaluate()'s input order too. */
+   *  regardless of evaluate()'s input order too.
+   *
+   *  Tie-break uses `new Date(...)`, not `.localeCompare` on the raw value:
+   *  AutomationRule.createdAt is typed `string`, but node-pg actually
+   *  returns a real `Date` object for a TIMESTAMPTZ column at runtime (the
+   *  same discrepancy already documented on the order detail page's own
+   *  timeline sort) -- `.localeCompare` would throw the moment two matched
+   *  rules actually need tie-breaking (equal priority, both matching the
+   *  same event), which no test exercised before hold-order-integration.test.ts's
+   *  two-rules-on-one-tenant scenario surfaced it. `new Date(x)` is a no-op
+   *  for an already-Date `x`, so this sorts correctly regardless of which
+   *  one a given rule's createdAt actually is. */
   static resolveActions(evaluations: RuleEvaluation[]): ResolvedAction[] {
     const matched = evaluations
       .filter((e) => e.matched)
-      .sort((a, b) => a.rule.priority - b.rule.priority || a.rule.createdAt.localeCompare(b.rule.createdAt));
+      .sort(
+        (a, b) => a.rule.priority - b.rule.priority || new Date(a.rule.createdAt).getTime() - new Date(b.rule.createdAt).getTime(),
+      );
 
     const wonActionTypes = new Set<string>();
     const resolved: ResolvedAction[] = [];
@@ -204,9 +216,11 @@ export class RulesEngine {
     });
   }
 
-  /** Dispatches one applied action. Only 'route_to_warehouse' is
-   *  implemented (CLAUDE.md §8 Phase 3: "order routing at minimum") --
-   *  other action types (notifications, tagging, etc.) are future work, not
+  /** Dispatches one applied action. Two action types are implemented today:
+   *  'route_to_warehouse' (CLAUDE.md §8 Phase 3: "order routing at
+   *  minimum") and 'hold_order' (places a matching order on_hold instead of
+   *  letting it proceed toward allocation -- see {@link placeOrderOnHold}).
+   *  Other action types (notifications, tagging, etc.) are future work, not
    *  built speculatively; an unrecognized type throws (caught by the caller
    *  and recorded as this row's error) rather than silently no-op-ing. */
   private async executeAction(
@@ -215,6 +229,10 @@ export class RulesEngine {
     orderId: string,
     action: AutomationRuleAction,
   ): Promise<void> {
+    if (action.type === "hold_order") {
+      return this.placeOrderOnHold(client, tenantId, orderId);
+    }
+
     if (action.type !== "route_to_warehouse") {
       throw new Error(`Unrecognized action type '${action.type}' -- not implemented`);
     }
@@ -237,5 +255,56 @@ export class RulesEngine {
       orderId,
       tenantId,
     ]);
+  }
+
+  /**
+   * hold_order's effect: chains 'received' -> 'validated' -> 'on_hold',
+   * both guarded UPDATEs issued directly on the same `client`/transaction
+   * this whole rule execution already runs in -- deliberately NOT via
+   * OrderService.transition() (@alltix/order-service), which would open its
+   * own separate connection/transaction. That would let the order's status
+   * change commit independently of, and out of sync with, this method's own
+   * rule_executions bookkeeping write in {@link handleOrderReceived} -- the
+   * same split-transaction risk allocateOrder/cancelOrder/simpleTransition
+   * in OrderService all avoid by staying inline within one transaction.
+   * Each step is still validated against isValidOrderTransition() --
+   * the exact function OrderService.transition() itself checks -- so this
+   * can never drift into an edge the state machine doesn't actually allow.
+   *
+   * Chains through 'validated' rather than adding a new 'received' ->
+   * 'on_hold' edge: CLAUDE.md §3's diagram only draws on_hold branching off
+   * 'validated', and changing that diagram is a separate scope decision
+   * this pass doesn't make. The order is still 'received' when
+   * order.received fires -- this handler runs *during*
+   * OrderService.persistPulledOrders()'s publish() call, before that
+   * method's own 'received' -> 'validated' -> 'allocated' auto-chain runs.
+   * That method re-checks the order's actual status after publish()
+   * returns and skips its own chain when a subscriber (this one) already
+   * moved the order off 'received' -- see its own doc comment.
+   *
+   * Lands the order somewhere a human can act on: OrderService's existing
+   * 'on_hold' -> 'validated' resume path (and the 'validated' -> 'allocated'
+   * manual action next to it on the order detail page) already let staff
+   * release a hold placed this way.
+   */
+  private async placeOrderOnHold(client: PoolClient, tenantId: string, orderId: string): Promise<void> {
+    const steps: ReadonlyArray<readonly [OrderStatus, OrderStatus]> = [
+      ["received", "validated"],
+      ["validated", "on_hold"],
+    ];
+
+    for (const [from, to] of steps) {
+      if (!isValidOrderTransition(from, to)) {
+        throw new Error(`hold_order: ${from} -> ${to} is not a valid order transition`);
+      }
+
+      const result = await client.query(
+        `UPDATE orders SET status = $1, updated_at = now() WHERE id = $2 AND tenant_id = $3 AND status = $4`,
+        [to, orderId, tenantId, from],
+      );
+      if (result.rowCount === 0) {
+        throw new Error(`hold_order: order ${orderId} is not in status '${from}' -- refusing to continue (concurrent update?)`);
+      }
+    }
   }
 }
