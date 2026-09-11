@@ -3,5 +3,11 @@
   "framework": "nextjs",
   "installCommand": "npm install",
   "buildCommand": "npm run build && npm run build:web",
-  "outputDirectory": "packages/web/.next"
+  "outputDirectory": "packages/web/.next",
+  "crons": [
+    {
+      "path": "/api/cron/amazon-order-sync",
+      "schedule": "0 4 * * *"
+    }
+  ]
 }

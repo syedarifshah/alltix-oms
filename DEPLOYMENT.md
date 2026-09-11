@@ -19,7 +19,7 @@ called out below rather than papered over.
 ## 2. Hosting: Vercel (recommended path)
 
 Vercel is the path of least setup for a Next.js app and is what this guide assumes.
-`Dockerfile` exists as the alternative (§7) if AWS Fargate is preferred instead, matching
+`Dockerfile` exists as the alternative (§8) if AWS Fargate is preferred instead, matching
 CLAUDE.md §5's original infra column — nothing here forces that choice, it's just not
 the default path documented step-by-step.
 
@@ -56,10 +56,11 @@ with a comment on where it comes from:
 |---|---|
 | `DATABASE_URL` | Managed Postgres, schema-owning role (§3) |
 | `APP_USER_PASSWORD`, `APP_DATABASE_URL` | Managed Postgres, least-privilege role (§3) |
-| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, `CLERK_WEBHOOK_SECRET` | Clerk dashboard, **production** instance (already decided — see §6) |
+| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, `CLERK_WEBHOOK_SECRET` | Clerk dashboard, **production** instance (already decided — see §7) |
 | `CHANNEL_CREDENTIALS_ENCRYPTION_KEY` | `openssl rand -base64 32` — generate fresh for production, never reuse a dev value |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_MVP_PRICE_ID` | Stripe dashboard — **test mode**, deliberately (§4) |
 | `AMAZON_PRODUCTION_*` | Still blocked (§5) — leave unset until resolved |
+| `CRON_SECRET` | A random 16+ character string — secures the scheduled sync job (§6) |
 | `ALLTIX_TEST_AUTH_BYPASS` | **Do not set this in Vercel at all.** It's a dev-only escape hatch; `next build`/`next start` force `NODE_ENV=production` regardless, so it's structurally inert even if set by mistake — but there's no reason to set it. |
 
 After the first successful deploy, run the migration step once against the production
@@ -107,7 +108,36 @@ need real values (obtained however that question gets resolved), and until then,
 stay unset in the production environment. The app deploys and runs correctly without
 them — Amazon just won't be connectable for a real seller until this is sorted.
 
-## 6. Clerk: production instance
+## 6. Scheduled Amazon order sync: Vercel Cron Jobs
+
+`GET /api/cron/amazon-order-sync` (`packages/web/src/app/api/cron/amazon-order-sync/route.ts`)
+is the recurring trigger for `runAmazonOrderSyncJob` — closing the gap
+`packages/scheduler/src/index.ts` and `scripts/amazon-order-sync-job.ts` flagged in their own
+header comments: the job logic was built and proven against sandbox + real Postgres, but
+nothing on this app's actual hosting (Vercel, serverless) was ever invoking it. `npm run
+amazon:order-sync-scheduler` (the `node-cron`-based long-running process) only ever ran
+locally; it is not part of this deploy and does not need to be.
+
+Two things must be set for this to actually run in production:
+
+1. **`CRON_SECRET`** in the Vercel project's environment variables (see `.env.example`) — a
+   random 16+ character string. Vercel automatically sends it back as
+   `Authorization: Bearer <value>` on every cron invocation, and the route 401s anything that
+   doesn't match, so this must be set for the cron job to do anything at all (missing secret
+   fails closed, not open).
+2. **The schedule in `vercel.json`'s `crons` entry**, which depends on the Vercel plan:
+   - **Hobby**: capped at once per day, with up to ±59 minutes of timing slop. `vercel.json`
+     ships with `"schedule": "0 4 * * *"` (once daily) for this reason — a more frequent
+     expression fails at deploy time on Hobby, not silently.
+   - **Pro or higher**: can run as often as once per minute. Once confirmed on Pro, change the
+     schedule to something like `"*/5 * * * *"` (every 5 minutes) to match the cadence the sync
+     job itself was originally designed and tested around, and redeploy.
+
+Confirm it's actually running via Vercel's dashboard (Project → Cron Jobs → View Logs), or by
+checking `channel_connections.last_order_sync_at` for a tenant with an active Amazon
+connection — it should be advancing roughly on the configured schedule.
+
+## 7. Clerk: production instance
 
 A production Clerk instance was confirmed to already exist (per this conversation).
 Wire its publishable/secret keys and webhook signing secret into the environment
@@ -117,7 +147,7 @@ someone signs up — see `packages/web/src/lib/provision-tenant.ts`) needs to be
 registered in the production Clerk instance's dashboard pointing at the production
 domain, separately from whatever was configured for local/test use.
 
-## 7. Alternative: container deployment (`Dockerfile`)
+## 8. Alternative: container deployment (`Dockerfile`)
 
 For AWS Fargate or any other container host instead of Vercel. `Dockerfile` builds a
 two-stage image: the builder stage runs the same `npm run build && npm run build:web`
@@ -142,7 +172,7 @@ Whichever host runs the container, all of §2's environment variables still appl
 the migration step in §3 is still a one-time manual step, not something the container's
 startup does automatically.
 
-## 8. CI (`.github/workflows/ci.yml`)
+## 9. CI (`.github/workflows/ci.yml`)
 
 Runs on every push/PR to `main`: typecheck, build every workspace package, production
 `next build`, apply migrations against a fresh Postgres service container, then run the
@@ -166,20 +196,25 @@ to be run locally, on a machine that can actually reach Amazon's endpoints — a
 standard hosted GitHub Actions runner's egress isn't guaranteed to reach them either,
 so this isn't only a secrets-hygiene call.
 
-## 9. Post-deploy smoke test
+## 10. Post-deploy smoke test
 
 After the first deploy, before calling it done:
 
 1. `GET /api/health` returns `200 {"status":"ok"}`.
 2. Sign up a real (throwaway) account through Clerk — confirms the production webhook
-   is wired correctly and a tenant actually gets provisioned (§6).
+   is wired correctly and a tenant actually gets provisioned (§7).
 3. Visit `/orders`, `/inventory`, `/picklists`, `/rules` signed in as that account —
    each should render empty-but-functional (no data yet, no errors).
 4. Visit `/settings/billing` — confirms `getOrCreateStripeCustomer` succeeds against
    the test-mode Stripe keys (§4).
 5. Visit `/settings/channels` — confirms it renders "Connect Amazon" without erroring,
    even though clicking it won't succeed yet (§5).
+6. Confirm the cron job is registered: Vercel dashboard → Project → Cron Jobs should list
+   `/api/cron/amazon-order-sync` (§6). It won't have anything to sync until a real
+   `channel_connections` row exists, but it should appear as scheduled, not missing.
 
-None of this was run against an actual production deployment as part of writing this
-guide — there is no production deployment yet. This is the checklist for when there is
-one.
+Items 1-5 were confirmed against the live alltixoms.com deployment in earlier sessions.
+Item 6 (§6) is new: it was written and typechecked here, but not yet run against
+production — that needs `CRON_SECRET` set in Vercel's dashboard first (§2/§6), which is
+a manual step outside this session's reach. Confirm it once that's set, using the check
+above.
