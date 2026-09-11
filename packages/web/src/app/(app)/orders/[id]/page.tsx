@@ -5,7 +5,8 @@ import { withTenant } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
-import { orderStatusBadgeClass } from "@/lib/order-status";
+import { orderStatusBadgeClass, isOrderCancellable } from "@/lib/order-status";
+import type { OrderStatus } from "@alltix/shared";
 
 export const dynamic = "force-dynamic";
 
@@ -124,6 +125,7 @@ function buildTimeline(
 
 interface OrderDetailPageProps {
   params: Promise<{ id: string }>;
+  searchParams: Promise<{ error?: string }>;
 }
 
 /**
@@ -139,13 +141,14 @@ interface OrderDetailPageProps {
  * own row; the order's current status badge is the source of truth for
  * "where it is now."
  */
-export default async function OrderDetailPage({ params }: OrderDetailPageProps): Promise<ReactElement> {
+export default async function OrderDetailPage({ params, searchParams }: OrderDetailPageProps): Promise<ReactElement> {
   const authContext = await getAuthContext(await headers());
   if (!authContext) {
     redirect("/sign-in");
   }
 
   const { id } = await params;
+  const { error } = await searchParams;
   const pool = getAppPool();
   const tenantId = await resolveTenantId(pool, authContext.clerkUserId);
   if (!tenantId) {
@@ -238,6 +241,20 @@ export default async function OrderDetailPage({ params }: OrderDetailPageProps):
         {order.channel} · placed {order.placed_at ? new Date(order.placed_at).toISOString() : "—"} · last updated{" "}
         {new Date(order.updated_at).toISOString()}
       </p>
+
+      {error && <div className="alert alert-danger">Couldn&apos;t cancel this order ({error}).</div>}
+
+      {isOrderCancellable(order.status as OrderStatus) && (
+        <form action={`/api/orders/${order.id}/cancel`} method="POST" className="row" style={{ marginBottom: 20 }}>
+          <input type="hidden" name="from" value={order.status} />
+          <button type="submit" className="danger">
+            Cancel order
+          </button>
+          {(order.status === "allocated" || order.status === "picking") && (
+            <span className="muted">Releases this order&apos;s reserved inventory back to available.</span>
+          )}
+        </form>
+      )}
 
       <h2>Line items</h2>
       <div className="table-wrap">

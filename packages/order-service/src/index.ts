@@ -74,7 +74,10 @@ export class OrderService {
    * WarehouseService (CLAUDE.md §1) once it's done its own picklist/
    * inventory-adjustment/channel-confirmation work, so the order state
    * machine stays owned in exactly one place rather than WarehouseService
-   * writing to `orders.status` itself. No other `to` value is implemented.
+   * writing to `orders.status` itself. 'cancelled' goes through
+   * {@link cancelOrder} instead, since (unlike the plain flips above) it
+   * sometimes has to release a live reservation first -- see its own doc
+   * comment. No other `to` value is implemented.
    */
   async transition(tenantId: string, orderId: string, from: OrderStatus, to: OrderStatus): Promise<OrderStatus> {
     if (!isValidOrderTransition(from, to)) {
@@ -89,7 +92,121 @@ export class OrderService {
       return this.simpleTransition(tenantId, orderId, from, to);
     }
 
+    if (to === "cancelled") {
+      return this.cancelOrder(tenantId, orderId, from);
+    }
+
     throw new Error(`OrderService.transition: '${from}' -> '${to}' is not implemented yet`);
+  }
+
+  /** States {@link cancelOrder} has already reserved inventory to release
+   *  for -- see its own doc comment. Every other cancellable state
+   *  (received/validated/on_hold/backordered) never got as far as
+   *  allocateOrder(), so there's nothing to release. */
+  private static readonly CANCEL_RELEASES_RESERVATION: ReadonlySet<OrderStatus> = new Set(["allocated", "picking"]);
+
+  /**
+   * Cancels an order from `from` (packages/shared/src/order-state-machine.ts
+   * decides which `from` values are even reachable here -- transition()
+   * already rejected anything else before this runs). CLAUDE.md §3:
+   * "Cancellation after allocation must emit a release inventory event, not
+   * just delete the reservation -- the ledger should show *why* stock came
+   * back."
+   *
+   * Everything happens in one transaction -- the guarded status flip and
+   * (when one exists) the reservation release -- same "an order is never
+   * left half-mutated" discipline {@link allocateOrder} uses, and for the
+   * same reason: releasing inventory for a cancellation that then turns out
+   * to lose a concurrent race (the `WHERE status = from` guard fails) would
+   * let a competing order allocate stock this one hadn't actually given up
+   * yet. Written inline rather than through InventoryService
+   * (@alltix/inventory-service) because that class always opens its own
+   * separate transaction -- composing it here would mean either two
+   * round-trips with a window between them, or not composing at all; this
+   * codebase's own precedent for this exact situation is
+   * {@link allocateOrder} staying inline for the same reason (see
+   * InventoryService's class doc comment).
+   *
+   * For 'allocated'/'picking' (the two states with a live reservation --
+   * see CANCEL_RELEASES_RESERVATION above), releases exactly what the
+   * ledger itself recorded as reserved for this order: reads every
+   * still-standing 'reservation' inventory_events row for
+   * (reference_type='order', reference_id=orderId) and emits one matching
+   * 'release' event per row -- the ledger's own record of what was reserved
+   * is the source of truth, not a fresh recomputation from order_lines that
+   * could drift from it. One release event per original reservation event
+   * (not aggregated by product) so the idempotency key can just reuse that
+   * event's own id -- naturally unique, no risk of colliding with itself if
+   * an order has two lines for the same product at the same location
+   * (allocateOrder inserts one reservation row per order_line, not per
+   * product -- see its own comment). Same idempotency-safe shape
+   * InventoryService.recordInventoryEvent uses: the inventory_levels UPDATE
+   * only runs if the INSERT actually inserted a new event row (RETURNING
+   * id), so retrying this method after a partial failure can never
+   * double-release.
+   *
+   * No reservation exists yet for the other cancellable states
+   * (received/validated/on_hold/backordered never reached allocateOrder()),
+   * so those are a plain guarded status flip with nothing to release.
+   *
+   * Why only up to 'picking', not 'packed': decided explicitly (see
+   * order-state-machine.ts's CANCELLATION SCOPE comment) -- past 'packed'
+   * the order is physically boxed, and undoing that needs a person to
+   * unpack it, not a button in this app. 'shipped' already has its own
+   * CLAUDE.md §3-drawn path to returned/refunded instead of cancellation.
+   */
+  private async cancelOrder(tenantId: string, orderId: string, from: OrderStatus): Promise<OrderStatus> {
+    await withTenant(this.pool, tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE orders SET status = 'cancelled', updated_at = now() WHERE id = $1 AND tenant_id = $2 AND status = $3`,
+        [orderId, tenantId, from],
+      );
+      if (result.rowCount === 0) {
+        throw new Error(
+          `Order ${orderId} is not in status '${from}' -- refusing cancellation (concurrent update?)`,
+        );
+      }
+
+      if (!OrderService.CANCEL_RELEASES_RESERVATION.has(from)) {
+        return;
+      }
+
+      const reservations = await client.query<{
+        id: string;
+        product_id: string;
+        location_id: string;
+        quantity_delta: number;
+      }>(
+        `SELECT id, product_id, location_id, quantity_delta FROM inventory_events
+          WHERE tenant_id = $1 AND reference_type = 'order' AND reference_id = $2 AND event_type = 'reservation'`,
+        [tenantId, orderId],
+      );
+
+      for (const row of reservations.rows) {
+        // Reservation rows store a negative quantity_delta (CLAUDE.md
+        // §2.2: "reserved -= delta"); releasing needs the positive
+        // magnitude being given back.
+        const releaseQuantity = -row.quantity_delta;
+        const inserted = await client.query<{ id: string }>(
+          `INSERT INTO inventory_events
+             (tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
+           VALUES ($1, $2, $3, 'release', $4, 'order', $5, $6)
+           ON CONFLICT (idempotency_key) DO NOTHING
+           RETURNING id`,
+          [tenantId, row.product_id, row.location_id, releaseQuantity, orderId, `order-cancellation:${orderId}:${row.id}`],
+        );
+        if (inserted.rows[0]) {
+          await client.query(
+            `UPDATE inventory_levels SET reserved = reserved - $1, updated_at = now()
+               WHERE product_id = $2 AND location_id = $3`,
+            [releaseQuantity, row.product_id, row.location_id],
+          );
+        }
+      }
+    });
+
+    await this.publish(tenantId, DomainEvent.OrderCancelled, { orderId });
+    return "cancelled";
   }
 
   /** A status flip with no side effects beyond the guarded UPDATE itself --
