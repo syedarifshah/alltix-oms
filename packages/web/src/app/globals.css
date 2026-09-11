@@ -4,43 +4,66 @@
    this fills the same "clean and functional over highly styled" role with
    zero new infra risk. Swap for Tailwind later without touching markup much,
    since class names below are already semantic (badge, card, nav) rather
-   than one-off utility soup. */
+   than one-off utility soup.
+
+   Palette: brought in line with the marketing site's brand (see
+   app/(marketing)/marketing.module.css) so /orders, /inventory, /settings
+   etc. read as the same product instead of a generic admin theme bolted on
+   next to a polished dark-cyan marketing site. Unlike marketing (which is
+   fixed-dark, no light variant), the dashboard keeps its automatic
+   light/dark behavior -- both palettes below use the same cyan accent
+   (#22d3ee family) and amber highlight as marketing, just tuned per-mode
+   for contrast (a light-mode surface needs a darker teal for readable
+   text/links than the bright cyan marketing uses on its dark background;
+   solid-fill elements like buttons/badges use the bright cyan directly,
+   same as marketing's own .btn-primary treatment). Radius/shadow values are
+   also pulled up to marketing's rounder, softly-elevated card language
+   (marketing: --radius 14px, --shadow on cards) instead of the previous
+   flat 5-8px chrome -- layout/structure is unchanged, this is chrome only. */
 
 :root {
   color-scheme: light dark;
-  --bg: #f7f7f8;
+  --bg: #f5f8fa;
   --surface: #ffffff;
-  --border: #e2e2e6;
-  --text: #1a1a1e;
-  --text-muted: #6b6b74;
-  --accent: #2f5fdb;
+  --border: #dde3e8;
+  --text: #12161c;
+  --text-muted: #5b6572;
+  --accent: #0e93ac;
   --accent-contrast: #ffffff;
+  --accent-glow: rgba(14, 147, 172, 0.22);
   --danger: #b3261e;
   --danger-bg: #fdecea;
-  --warning: #8a5a00;
-  --warning-bg: #fff4dc;
+  --warning: #92600c;
+  --warning-bg: #fdf1dc;
   --success: #1e7a34;
   --success-bg: #e8f6ea;
-  --neutral-bg: #eef0f4;
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --neutral-bg: #eef1f4;
+  --shadow: 0 1px 3px rgba(16, 24, 40, 0.08), 0 1px 2px rgba(16, 24, 40, 0.04);
+  --shadow-lg: 0 8px 24px rgba(16, 24, 40, 0.1);
+  --radius: 12px;
+  --radius-sm: 8px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #16161a;
-    --surface: #1e1e23;
-    --border: #33333a;
-    --text: #ececef;
-    --text-muted: #9a9aa2;
-    --accent: #6c8fff;
-    --accent-contrast: #0b0b0d;
+    --bg: #14161a;
+    --surface: #1d2026;
+    --border: rgba(255, 255, 255, 0.09);
+    --text: #f5f7fa;
+    --text-muted: #9fa9b6;
+    --accent: #22d3ee;
+    --accent-contrast: #0f1216;
+    --accent-glow: rgba(34, 211, 238, 0.3);
     --danger: #ff6b64;
     --danger-bg: #3a1715;
-    --warning: #e0a83e;
-    --warning-bg: #3a2c07;
+    --warning: #f5a524;
+    --warning-bg: rgba(245, 165, 36, 0.14);
     --success: #5fd379;
     --success-bg: #123a1c;
-    --neutral-bg: #26262d;
+    --neutral-bg: #262a33;
+    --shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+    --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.45);
   }
 }
 
@@ -101,8 +124,15 @@ h2 {
 }
 
 .nav-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   font-weight: 700;
   margin-right: 8px;
+}
+
+.nav-brand img {
+  display: block;
 }
 
 .nav-spacer {
@@ -113,9 +143,10 @@ h2 {
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   padding: 16px 18px;
   margin-bottom: 18px;
+  box-shadow: var(--shadow);
 }
 
 /* --- tabs (status filters) --- */
@@ -148,7 +179,7 @@ table {
   border-collapse: collapse;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   overflow: hidden;
 }
 
@@ -175,6 +206,8 @@ tbody tr:last-child td {
 
 .table-wrap {
   overflow-x: auto;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
 }
 
 /* --- badges --- */
@@ -212,7 +245,7 @@ tbody tr:last-child td {
 /* --- alerts --- */
 .alert {
   padding: 10px 14px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   margin-bottom: 16px;
   font-size: 0.9rem;
 }
@@ -236,25 +269,34 @@ tbody tr:last-child td {
 button,
 .btn {
   display: inline-block;
-  padding: 5px 12px;
-  border-radius: 6px;
+  padding: 6px 14px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--accent);
   background: var(--accent);
   color: var(--accent-contrast);
   font-size: 0.84rem;
-  font-weight: 600;
+  font-weight: 700;
   cursor: pointer;
+  box-shadow: 0 4px 14px var(--accent-glow);
+  transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+button:hover,
+.btn:hover {
+  transform: translateY(-1px);
 }
 
 button.secondary,
 .btn.secondary {
   background: transparent;
   color: var(--accent);
+  box-shadow: none;
 }
 
 button.danger {
   background: var(--danger);
   border-color: var(--danger);
+  box-shadow: none;
 }
 
 input,
@@ -262,11 +304,18 @@ textarea,
 select {
   font-family: inherit;
   font-size: 0.88rem;
-  padding: 5px 8px;
-  border-radius: 5px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background: var(--surface);
   color: var(--text);
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  outline: none;
+  border-color: var(--accent);
 }
 
 .form-row {
@@ -312,7 +361,7 @@ select {
 pre {
   background: var(--neutral-bg);
   padding: 10px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   overflow-x: auto;
   font-size: 0.8rem;
 }

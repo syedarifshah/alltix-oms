@@ -32,7 +32,11 @@ export async function Nav(): Promise<ReactElement> {
           is already in, rather than bouncing them out to the marketing
           site. */}
       <a href="/orders" className="nav-brand">
-        alltix-oms
+        {/* eslint-disable-next-line @next/next/no-img-element -- same small,
+            fixed brand mark as the marketing header/footer (see
+            marketing-header.tsx); not worth next/image config for one file. */}
+        <img src="/logo-mark.png" alt="" width={22} height={24} />
+        AlltixOMS
       </a>
       <a href="/orders">Orders</a>
       <a href="/inventory">Inventory</a>
