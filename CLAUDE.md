@@ -402,7 +402,11 @@ succeeded or failed."
   `scripts/shopify-order-sync-{job,scheduler}.ts` entrypoints — kept as parallel
   functions rather than a shared "any channel" abstraction since Amazon's sandbox
   lookback special-case doesn't apply to Shopify and two channels isn't enough to pay
-  for the abstraction yet. `WarehouseService.confirmShipment()` dispatches to
+  for the abstraction yet. The node-cron scripts are for a non-serverless host; what
+  actually triggers a sync on this app's Vercel deployment is
+  `GET /api/cron/shopify-order-sync` (mirrors `/api/cron/amazon-order-sync` exactly —
+  same `CRON_SECRET` Bearer-token gate, same idempotency contract) plus its `crons`
+  entry in `vercel.json`. `WarehouseService.confirmShipment()` dispatches to
   `createShopifyConnectorFromChannelConnection` on `order.channel === "shopify"`,
   alongside its existing Amazon branch.
 
