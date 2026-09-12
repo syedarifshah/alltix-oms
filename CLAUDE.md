@@ -325,6 +325,68 @@ succeeded or failed."
 - **Idempotency keys** on every write and every event handler — both Amazon and
   Walmart will redeliver; handlers must be safe to run twice.
 
+### 4.5 Shopify Admin API (build third — channel #3, GraphQL, verified live)
+
+- **Auth**: a custom app's static Admin API access token (`shpat_...`) — no OAuth
+  round trip, no client secret/refresh token, doesn't expire. Simplest of the three
+  connectors' auth models. A **legacy** custom app (Partner-owned store, created via
+  Settings → Apps → Develop apps → "Allow legacy custom app development" → "Create a
+  legacy custom app") is what actually works for this — Shopify's newer Dev
+  Dashboard app-creation flow is OAuth-based even with "legacy install flow" checked,
+  and can't complete without a real callback server this connector-class-only pass
+  doesn't build. Partners can still create true legacy custom apps on stores they own
+  that haven't been transferred to a merchant (Shopify's own UI says so).
+- **API shape**: GraphQL only (`POST /admin/api/{version}/graphql.json`), unlike
+  Amazon/Walmart's REST. Pin an explicit dated version (`2026-07` at the time this was
+  built) — never "latest."
+- **Orders API**: `orders(first, after, query, sortKey: CREATED_AT)`, Relay-style
+  cursor pagination, looped to completion (unlike AmazonConnector, which doesn't loop
+  SP-API's NextToken — an accepted gap there, not repeated here). Confirmed working
+  end-to-end in `packages/channel-connectors/src/shopify-connector.ts`.
+- **Protected Customer Data**: any PII-bearing field (`customer`, `shippingAddress`,
+  `billingAddress`, etc.) is gated behind a Partner-Dashboard-level approval separate
+  from Admin API scopes, and for a custom app also requires the store to be on the
+  Shopify/Advanced/Plus plan (not Basic) — the same shape of restriction as SP-API's
+  Restricted Data Token, just gating a different field set. A query that includes such
+  a field doesn't fail outright: Shopify returns the rest of the order normally and
+  nulls out just that field, reporting it as a GraphQL error alongside otherwise-good
+  data — treat that as a per-field warning, not a fatal failure. `customer { email }`
+  was dropped from the orders query entirely (the order-level `email` scalar isn't
+  similarly gated, and `normalizeShopifyOrder()` already fell back to it).
+- **Inventory writes**: `inventorySetQuantities` (absolute, matching this platform's
+  "system of truth" role per §1), not the relative `inventoryAdjustQuantities`. Several
+  non-obvious requirements only surfaced by running against a real dev store, not
+  documented clearly enough up front to get right on paper:
+  - `InventoryQuantityInput` requires `changeFromQuantity` (the quantity the caller
+    believes is currently persisted) — forces a read-before-write.
+  - The mutation requires `@idempotent(key: $idempotencyKey)` as a directive
+    *argument* in the query text itself — not a header, and not optional once a
+    mutation has opted into idempotency.
+  - **The actual bug that cost the most time**: a store with more than one Location
+    means `locations(first: 1)` (no explicit sort) is NOT reliably "the location this
+    SKU is stocked at." Two rounds of misdiagnosis (a propagation-lag theory, then an
+    unreliable-singular-field theory) preceded finding this — the fix is to resolve
+    the write location from the item's own existing `inventoryLevels`, falling back to
+    an arbitrary location only for a genuinely new/never-stocked item. See
+    `ShopifyConnector.pushInventory`'s doc comment for the full trace; worth reading
+    before touching this method again.
+- **Fulfillment**: `fulfillmentCreateV2` against open FulfillmentOrders needs one of
+  `write_assigned_fulfillment_orders` / `write_merchant_managed_fulfillment_orders` /
+  `write_third_party_fulfillment_orders` depending on who's assigned to fulfill the
+  order — NOT a scope literally named `write_fulfillments`. An order whose line item
+  is on a third-party-fulfilled product (e.g. Shopify's own demo "3p Fulfilled"
+  product) needs the third-party scope specifically; merchant-managed is the
+  default/simplest case and what a normal seller-fulfilled product needs.
+- **Not implemented** (deliberate, connector-class-only scope): `submitListing`/
+  `getFeedStatus` (NormalizedListing lacks fields Shopify's product-creation mutations
+  require) and `subscribeToEvents` (Shopify's webhooks need a public HTTP endpoint
+  with HMAC verification — application/web-layer infrastructure not built in this
+  pass; `verifyShopifyWebhookHmac()` is implemented and unit-tested standalone so a
+  future webhook route doesn't start from zero). No DB migration, scheduler wiring, or
+  Settings UI — single store via a directly-configured access token, same "prove the
+  connector before wiring per-tenant storage" order Amazon's own credentials went
+  through.
+
 ## 5. Technology Stack
 
 | Layer | Choice | Why |

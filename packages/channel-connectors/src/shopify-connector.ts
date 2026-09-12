@@ -107,9 +107,21 @@ interface GraphQLUserError {
   message: string;
 }
 
+// `message` alone was proven insufficient in practice: a variable-coercion
+// error against InventorySetQuantitiesInput came back as just "was provided
+// invalid value" with the offending field/path only present in `extensions`
+// (Shopify's GraphQL errors carry structured detail there, not always in the
+// message text) -- captured here now so formatGraphQLErrors() can surface it
+// instead of leaving a caller to guess.
+interface GraphQLError {
+  message: string;
+  path?: Array<string | number>;
+  extensions?: Record<string, unknown>;
+}
+
 interface GraphQLResponse<T> {
   data?: T;
-  errors?: Array<{ message: string }>;
+  errors?: GraphQLError[];
   extensions?: { cost?: { requestedQueryCost: number; actualQueryCost: number; throttleStatus: { currentlyAvailable: number; maximumAvailable: number; restoreRate: number } } };
 }
 
@@ -149,7 +161,17 @@ interface LocationsQueryResponse {
 }
 
 interface InventoryItemBySkuResponse {
-  productVariants: { edges: Array<{ node: { sku: string | null; inventoryItem: { id: string } } }> };
+  productVariants: {
+    edges: Array<{
+      node: {
+        sku: string | null;
+        inventoryItem: {
+          id: string;
+          inventoryLevels: { edges: Array<{ node: { location: { id: string }; quantities: Array<{ quantity: number }> } }> };
+        };
+      };
+    }>;
+  };
 }
 
 interface InventorySetQuantitiesResponse {
@@ -303,6 +325,18 @@ export class ShopifyConnector {
    * call site rather than collapsing into one generic error shape, since a
    * mutation's userErrors carry per-field detail worth preserving.
    * https://shopify.dev/docs/api/admin-graphql
+   *
+   * Idempotency, CONFIRMED against a real dev store (API version 2026-07):
+   * the original "header vs. input field" uncertainty this connector once
+   * flagged (see pushInventory's doc comment) resolves to neither -- it's a
+   * directive *argument*. A mutation Shopify has opted into idempotency for
+   * (inventorySetQuantities among them) first rejects a call missing the
+   * `@idempotent` directive entirely ("The @idempotent directive is
+   * required for this mutation but was not provided"), and, once tagged,
+   * rejects a bare `@idempotent` too ("Directive 'idempotent' is missing
+   * required arguments: key") -- it must be `@idempotent(key:
+   * $someVariable)` with that variable supplied like any other, no special
+   * HTTP header involved. See pushInventory for the working shape.
    */
   private async graphql<T>(query: string, variables: Record<string, unknown> = {}): Promise<GraphQLResponse<T>> {
     const { accessToken } = await this.authenticate();
@@ -327,8 +361,16 @@ export class ShopifyConnector {
     return (await response.json()) as GraphQLResponse<T>;
   }
 
-  private static formatGraphQLErrors(errors: Array<{ message: string }> | undefined, fallback: string): string {
-    return errors?.map((e) => e.message).join("; ") || fallback;
+  private static formatGraphQLErrors(errors: GraphQLError[] | undefined, fallback: string): string {
+    return (
+      errors
+        ?.map((e) => {
+          const path = e.path?.length ? ` [path: ${e.path.join(".")}]` : "";
+          const extensions = e.extensions && Object.keys(e.extensions).length ? ` ${JSON.stringify(e.extensions)}` : "";
+          return `${e.message}${path}${extensions}`;
+        })
+        .join("; ") || fallback
+    );
   }
 
   private static formatUserErrors(errors: GraphQLUserError[], fallback: string): string {
@@ -353,6 +395,24 @@ export class ShopifyConnector {
    * reports `extensions.cost.throttleStatus`, which a production caller
    * should watch, but budgeting against it is left to the rate-limited job
    * queue CLAUDE.md §4.4 describes, not built here.
+   *
+   * Protected Customer Data: Shopify gates any PII-bearing field (the
+   * `customer` object, `shippingAddress`, `billingAddress`, etc.) behind a
+   * Partner-Dashboard-level "Protected customer data access" approval that
+   * is separate from Admin API scopes, and -- for a custom/legacy app like
+   * this one -- also requires the store to be on the Shopify/Advanced/Plus
+   * plan tier (not Basic). This is the same shape of restriction as
+   * Amazon SP-API's Restricted Data Token for PII (CLAUDE.md §4.1), just
+   * gating a different field set. `customer { email }` was dropped from
+   * this query outright for that reason (normalizeShopifyOrder() falls
+   * back to the order-level `email` scalar, which is not similarly
+   * gated). `shippingAddress` is left in the query, because production
+   * fulfillment needs it and a real seller on Shopify/Advanced/Plus with
+   * approval will get it -- but on a store/app that lacks that approval
+   * (this dev store included: Basic plan), Shopify returns the rest of
+   * the order normally and nulls out just `shippingAddress`, reporting it
+   * as a GraphQL error alongside otherwise-successful data. Treat that as
+   * a per-field warning, not a fatal failure -- see below.
    */
   async pullOrders(since: Date): Promise<NormalizedOrder[]> {
     const searchQuery = `created_at:>=${since.toISOString()}`;
@@ -370,8 +430,20 @@ export class ShopifyConnector {
               createdAt
               displayFulfillmentStatus
               email
-              customer { email }
-              shippingAddress
+              shippingAddress {
+                firstName
+                lastName
+                company
+                address1
+                address2
+                city
+                province
+                provinceCode
+                zip
+                country
+                countryCodeV2
+                phone
+              }
               lineItems(first: 100) {
                 edges {
                   node {
@@ -392,12 +464,21 @@ export class ShopifyConnector {
     for (;;) {
       const response: GraphQLResponse<OrdersQueryResponse> = await this.graphql<OrdersQueryResponse>(query, { cursor, searchQuery });
 
-      if (response.errors) {
-        throw new Error(`Shopify orders query failed: ${ShopifyConnector.formatGraphQLErrors(response.errors, "unknown error")}`);
-      }
       const page: OrdersQueryResponse["orders"] | undefined = response.data?.orders;
       if (!page) {
-        throw new Error("Shopify orders query returned no data");
+        // No usable data at all -- e.g. auth failure, throttling, a malformed
+        // query -- unlike the partial-field case below, this is fatal.
+        throw new Error(`Shopify orders query failed: ${ShopifyConnector.formatGraphQLErrors(response.errors, "unknown error")}`);
+      }
+      if (response.errors?.length) {
+        // Data is present alongside the error(s): a per-field access
+        // restriction (see the Protected Customer Data note on this
+        // method's doc comment above) nulled out one or more fields rather
+        // than failing the whole query. Surface it so it's not silently
+        // invisible, but don't abort the pull over it.
+        console.warn(
+          `Shopify orders query returned partial data (field(s) unavailable, likely Protected Customer Data restrictions): ${ShopifyConnector.formatGraphQLErrors(response.errors, "unknown error")}`,
+        );
       }
 
       for (const edge of page.edges) {
@@ -412,16 +493,26 @@ export class ShopifyConnector {
   }
 
   /**
-   * Resolves and caches this store's first location -- Shopify's inventory
+   * Resolves and caches *a* location for this store -- Shopify's inventory
    * model is inherently per-location (InventoryLevel belongs to an
    * InventoryItem *and* a Location), unlike Amazon/Walmart's single global
-   * quantity. A dev store has exactly one location by default, so "the
-   * first one returned" is a reasonable simplification for this pass;
-   * proper multi-location allocation is Phase 4 work (CLAUDE.md §8) not
-   * built for any channel in this codebase yet. Cached for the life of
-   * this connector instance, same pattern as WalmartConnector's cached
-   * token -- a location doesn't change mid-process.
+   * quantity. Proper multi-location allocation is Phase 4 work (CLAUDE.md
+   * §8) not built for any channel in this codebase yet. Cached for the
+   * life of this connector instance, same pattern as WalmartConnector's
+   * cached token -- a location doesn't change mid-process.
    * https://shopify.dev/docs/api/admin-graphql/latest/queries/locations
+   *
+   * CORRECTED, against a real dev store: this was originally documented as
+   * "a dev store has exactly one location by default, so 'the first one
+   * returned' is a reasonable simplification" -- false in practice. This
+   * store has more than one Location, and `locations(first: 1)` (no
+   * explicit sort key) is not guaranteed to return the one any given item
+   * is actually stocked at; a real bug in pushInventory() traced back to
+   * exactly that (see its doc comment). This method is now ONLY the
+   * fallback for an item with no existing inventory level anywhere yet
+   * (a genuinely new/never-stocked item, where there's no better signal to
+   * pick a location from) -- callers that already know an item's existing
+   * location should use that instead of calling this at all.
    */
   private async primaryLocationId(): Promise<string> {
     if (this.cachedPrimaryLocationId) return this.cachedPrimaryLocationId;
@@ -459,60 +550,166 @@ export class ShopifyConnector {
    * internal product_id to channel_listings.external_sku for 'shopify'
    * first.
    *
-   * UNVERIFIED DETAIL: Shopify's docs describe an idempotency requirement
-   * for this mutation as of a recent API version but the fetched
-   * documentation didn't pin down the exact mechanism (a header vs. an
-   * input field) with full confidence -- `randomUUID()` is passed as
-   * `input.name`'s sibling via a generated reference, flagged here to
-   * confirm against a real response (or a GraphQL "unknown argument"
-   * error) once dev-store credentials exist, rather than asserted as
-   * correct.
+   * CONFIRMED against a real dev store (API version 2026-07):
+   * `ignoreCompareQuantityFailures` is NOT a field on this version's
+   * `InventorySetQuantitiesInput` -- the mutation rejects it outright at
+   * variable-coercion time ("Field is not defined on
+   * InventorySetQuantitiesInput"), before even reaching `userErrors`. That
+   * field only matters when a per-item `compareQuantity` is also set (an
+   * optimistic-concurrency check -- "only apply this if the quantity was
+   * still X"), which this method doesn't use: it's an unconditional
+   * absolute set, matching pushInventory's own "the new total" contract
+   * (see above), so there's no compare-quantity failure to ignore in the
+   * first place. `referenceDocumentUri` (a fresh `randomUUID()` per call)
+   * is kept as the request-level identifier Shopify's docs do call for.
+   *
+   * CONFIRMED (same dev store, same API version): `InventoryQuantityInput`
+   * (each entry in `quantities`) requires `changeFromQuantity` -- the
+   * quantity the caller believes is currently set, so Shopify can validate
+   * the write is against the state it expects (a mandatory version of what
+   * `compareQuantity`/`ignoreCompareQuantityFailures` used to make
+   * optional). That forces a read before this write: the variant lookup
+   * below also fetches the current `available` quantity at the target
+   * location (0 if the item has no inventory level there yet, e.g. it's
+   * never been stocked at this location before) and passes it back as
+   * `changeFromQuantity`.
+   *
+   * CONFIRMED against the real dev store, after two false leads worth
+   * recording so they aren't re-tried blind if this ever regresses: this
+   * `changeFromQuantity` read kept computing as 0 against a location that
+   * provably DID have a persisted non-zero quantity (inventorySetQuantities
+   * itself rejected 0 as stale). First theory: a propagation lag, "fixed"
+   * with a delayed retry -- didn't help, failed identically across four
+   * delayed attempts. Second theory: the singular
+   * `InventoryItem.inventoryLevel(locationId: ...)` field being unreliable
+   * -- switched to the plural `inventoryLevels` connection instead, which
+   * also didn't help. Diagnostic logging of every location this item
+   * actually has an inventoryLevel at (not just whether the *expected*
+   * location matched) revealed the real cause: this dev store has more
+   * than one Location, and `primaryLocationId()`'s `locations(first: 1)`
+   * (no explicit sort) was not reliably resolving to the location this SKU
+   * is actually stocked at -- every read against the *wrong* location was
+   * correctly finding no level there (hence 0), which then correctly
+   * failed to match the real level's quantity at the *right* location. Fix
+   * (below): resolve the location from the item's own existing
+   * `inventoryLevels` first, falling back to `primaryLocationId()` only
+   * for an item with no existing level anywhere (a genuinely new/
+   * never-stocked item) -- see the inline comment at that resolution.
+   *
+   * The delayed retry loop is left in place as defense-in-depth for a
+   * genuinely concurrent external writer changing this SKU's quantity
+   * between this read and the mutation (a real race, just not the one that
+   * caused the failures above) -- that class of problem is still what
+   * CLAUDE.md §4.4's per-tenant rate-limited job queue is meant to
+   * serialize away, not something a bounded in-process retry can guarantee
+   * against on its own.
+   *
+   * CONFIRMED (same dev store, same API version): `inventorySetQuantities`
+   * also requires `@idempotent(key: $idempotencyKey)` on the mutation
+   * field itself (see graphql()'s doc comment for the two-step rejection
+   * that pinned this down -- directive missing, then the directive's own
+   * `key` argument missing). A fresh `randomUUID()` is generated per
+   * attempt and used as both that key variable and (folded into a URN)
+   * the unrelated `referenceDocumentUri` input field, so a retried call
+   * with the same key would be deduped by Shopify rather than
+   * double-applied -- though each retry here is a genuinely new attempt
+   * (new changeFromQuantity), so it gets its own fresh key rather than
+   * reusing the previous attempt's.
    */
   async pushInventory(sku: string, quantity: number): Promise<SyncResult> {
-    const variantResponse = await this.graphql<InventoryItemBySkuResponse>(
-      `query ($skuQuery: String!) {
-        productVariants(first: 1, query: $skuQuery) {
-          edges { node { sku inventoryItem { id } } }
-        }
-      }`,
-      { skuQuery: `sku:${sku}` },
-    );
-    if (variantResponse.errors) {
-      return { success: false, error: `Shopify variant lookup failed: ${ShopifyConnector.formatGraphQLErrors(variantResponse.errors, "unknown error")}` };
-    }
-    const inventoryItemId = variantResponse.data?.productVariants.edges[0]?.node.inventoryItem.id;
-    if (!inventoryItemId) {
-      return { success: false, error: `Shopify: no product variant found with sku '${sku}'` };
-    }
+    const MAX_ATTEMPTS = 4;
+    const RETRY_DELAYS_MS = [300, 600, 1200];
+    let lastError = "unknown error";
 
-    const locationId = await this.primaryLocationId();
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      if (attempt > 1) {
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt - 2] ?? 1200));
+      }
+      const variantResponse = await this.graphql<InventoryItemBySkuResponse>(
+        `query ($skuQuery: String!) {
+          productVariants(first: 1, query: $skuQuery) {
+            edges {
+              node {
+                sku
+                inventoryItem {
+                  id
+                  inventoryLevels(first: 10) {
+                    edges { node { location { id } quantities(names: ["available"]) { quantity } } }
+                  }
+                }
+              }
+            }
+          }
+        }`,
+        { skuQuery: `sku:${sku}` },
+      );
+      if (variantResponse.errors) {
+        return { success: false, error: `Shopify variant lookup failed: ${ShopifyConnector.formatGraphQLErrors(variantResponse.errors, "unknown error")}` };
+      }
+      const variantNode = variantResponse.data?.productVariants.edges[0]?.node;
+      const inventoryItemId = variantNode?.inventoryItem.id;
+      if (!inventoryItemId) {
+        return { success: false, error: `Shopify: no product variant found with sku '${sku}'` };
+      }
 
-    const setResponse = await this.graphql<InventorySetQuantitiesResponse>(
-      `mutation ($input: InventorySetQuantitiesInput!) {
-        inventorySetQuantities(input: $input) {
-          inventoryAdjustmentGroup { id }
-          userErrors { field message }
-        }
-      }`,
-      {
-        input: {
-          name: "available",
-          reason: "correction",
-          ignoreCompareQuantityFailures: true,
-          referenceDocumentUri: `urn:alltix-oms:inventory-sync:${randomUUID()}`,
-          quantities: [{ inventoryItemId, locationId, quantity }],
+      // CONFIRMED against the real dev store, and the actual root cause
+      // (two misdiagnoses preceded this one -- see git history/prior
+      // comments on this method if resurrected): this store has more than
+      // one Location, and `primaryLocationId()`'s `locations(first: 1)`
+      // (no explicit sort) does NOT reliably return the location this SKU
+      // is actually stocked at -- diagnostic logging caught it returning a
+      // *different* location than the one holding this item's real
+      // inventory level. Every prior "stale changeFromQuantity" failure
+      // was really this: reading (correctly!) that the item has no level
+      // at the wrong location, then having that correct-for-the-wrong-
+      // location `0` rejected against the real level's actual quantity at
+      // the *right* location. Fix: target wherever this item's existing
+      // inventory level actually is (first entry in `inventoryLevels`,
+      // consistent with "a dev store has exactly one location per item"
+      // still being a fine simplification -- CLAUDE.md §8 Phase 4 is where
+      // real multi-location allocation belongs), falling back to
+      // primaryLocationId() only when the item has no existing level
+      // anywhere yet (a genuinely new/never-stocked item).
+      const existingLevels = variantNode.inventoryItem.inventoryLevels.edges;
+      const locationId = existingLevels[0]?.node.location.id ?? (await this.primaryLocationId());
+      const changeFromQuantity = existingLevels.find((edge) => edge.node.location.id === locationId)?.node.quantities[0]?.quantity ?? 0;
+
+      const idempotencyKey = randomUUID();
+      const setResponse = await this.graphql<InventorySetQuantitiesResponse>(
+        `mutation ($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
+          inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
+            inventoryAdjustmentGroup { id }
+            userErrors { field message }
+          }
+        }`,
+        {
+          input: {
+            name: "available",
+            reason: "correction",
+            referenceDocumentUri: `urn:alltix-oms:inventory-sync:${idempotencyKey}`,
+            quantities: [{ inventoryItemId, locationId, quantity, changeFromQuantity }],
+          },
+          idempotencyKey,
         },
-      },
-    );
-    if (setResponse.errors) {
-      return { success: false, error: `Shopify inventory set failed: ${ShopifyConnector.formatGraphQLErrors(setResponse.errors, "unknown error")}` };
-    }
-    const userErrors = setResponse.data?.inventorySetQuantities.userErrors ?? [];
-    if (userErrors.length > 0) {
-      return { success: false, error: ShopifyConnector.formatUserErrors(userErrors, "unknown error") };
+      );
+      if (setResponse.errors) {
+        return { success: false, error: `Shopify inventory set failed: ${ShopifyConnector.formatGraphQLErrors(setResponse.errors, "unknown error")}` };
+      }
+      const userErrors = setResponse.data?.inventorySetQuantities.userErrors ?? [];
+      if (userErrors.length === 0) {
+        return { success: true, externalId: inventoryItemId };
+      }
+
+      lastError = ShopifyConnector.formatUserErrors(userErrors, "unknown error");
+      const isStaleChangeFromQuantity = userErrors.some((e) => e.message.includes("no longer matches the persisted quantity"));
+      if (!isStaleChangeFromQuantity || attempt === MAX_ATTEMPTS) {
+        return { success: false, error: `${lastError} (after ${attempt} attempt${attempt === 1 ? "" : "s"})` };
+      }
+      // else: loop again, re-reading the (now presumably caught-up)
+      // current quantity before retrying the mutation.
     }
 
-    return { success: true, externalId: inventoryItemId };
+    return { success: false, error: `${lastError} (after ${MAX_ATTEMPTS} attempts)` };
   }
 
   /**
@@ -566,7 +763,21 @@ export class ShopifyConnector {
       .filter((f) => f.fulfillmentOrderLineItems.length > 0);
 
     if (lineItemsByFulfillmentOrder.length === 0) {
-      throw new Error(`Shopify order ${orderId} has no open fulfillment orders with remaining line items to ship`);
+      // Include what was actually found, not just the fact that nothing
+      // qualified -- this was previously a dead end to debug (e.g. an
+      // order whose sole line item is on a third-party-fulfilled product,
+      // like Shopify's own demo "3p Fulfilled" product, needs
+      // write_third_party_fulfillment_orders rather than the
+      // merchant-managed scope this connector is configured with by
+      // default; that shows up here as either zero fulfillmentOrders
+      // edges at all -- not visible to this app's scope -- or edges
+      // present with a status/remainingQuantity that doesn't qualify).
+      const observed = order.fulfillmentOrders.edges
+        .map((edge) => `${edge.node.id} status=${edge.node.status} remaining=${edge.node.lineItems.edges.map((l) => l.node.remainingQuantity).join(",") || "none"}`)
+        .join("; ");
+      throw new Error(
+        `Shopify order ${orderId} has no open fulfillment orders with remaining line items to ship (found ${order.fulfillmentOrders.edges.length}: ${observed || "none"})`,
+      );
     }
 
     const fulfillResponse = await this.graphql<FulfillmentCreateResponse>(
