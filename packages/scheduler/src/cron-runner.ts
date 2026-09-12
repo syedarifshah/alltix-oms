@@ -1,6 +1,6 @@
 import { schedule, type ScheduledTask } from "node-cron";
 import type { Pool } from "pg";
-import { runAmazonOrderSyncJob, type TenantSyncResult } from "./index.js";
+import { runAmazonOrderSyncJob, runShopifyOrderSyncJob, type TenantSyncResult } from "./index.js";
 
 // The "how it gets triggered" layer packages/scheduler/src/index.ts's own
 // header comment flagged as separate, later infrastructure work -- this is
@@ -156,6 +156,111 @@ export function startAmazonOrderSyncScheduler(options: AmazonOrderSyncSchedulerO
   console.log(
     JSON.stringify({
       event: "amazon_order_sync_scheduler_started",
+      cronExpression,
+      timezone: timezone ?? "system default",
+      at: new Date().toISOString(),
+    }),
+  );
+
+  return task;
+}
+
+// -- Shopify counterparts. Kept as parallel functions, not a generic
+// "startChannelOrderSyncScheduler(channel, runJob)" abstraction, for the
+// same reason index.ts's syncShopifyOrders doc comment gives: not enough
+// shared shape to justify it yet with only two channels wired this way,
+// and each channel's own event name (amazon_order_sync_run vs.
+// shopify_order_sync_run) needs to stay distinguishable in logs either way.
+
+const DEFAULT_SHOPIFY_CRON_EXPRESSION = "*/5 * * * *"; // every 5 minutes, same conservative default as Amazon's
+
+export interface ShopifyOrderSyncSchedulerOptions {
+  appPool: Pool;
+  adminPool: Pool;
+  cronExpression?: string;
+  timezone?: string;
+  maxRetries?: number;
+  retryDelayMs?: number;
+}
+
+/** Shopify counterpart to {@link runOnceWithRetry} -- see its doc comment
+ *  for the retry contract (systemic-failure-only; a single tenant's
+ *  failure is already caught and returned as a non-throwing result inside
+ *  runShopifyOrderSyncJob's own syncShopifyTenant). */
+export async function runShopifyOnceWithRetry(
+  appPool: Pool,
+  adminPool: Pool,
+  maxRetries: number = DEFAULT_MAX_RETRIES,
+  retryDelayMs: number = DEFAULT_RETRY_DELAY_MS,
+): Promise<void> {
+  const startedAt = Date.now();
+  const runId = new Date(startedAt).toISOString();
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      const results = await runShopifyOrderSyncJob(appPool, adminPool);
+      console.log(
+        JSON.stringify({
+          event: "shopify_order_sync_run",
+          runId,
+          attempt,
+          success: true,
+          durationMs: Date.now() - startedAt,
+          ...summarizeResults(results),
+        }),
+      );
+      return;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const willRetry = attempt <= maxRetries;
+      console.error(
+        JSON.stringify({
+          event: "shopify_order_sync_run",
+          runId,
+          attempt,
+          success: false,
+          durationMs: Date.now() - startedAt,
+          error: message,
+          willRetry,
+        }),
+      );
+      if (!willRetry) return;
+      await sleep(retryDelayMs * attempt);
+    }
+  }
+}
+
+/** Shopify counterpart to {@link startAmazonOrderSyncScheduler} -- same
+ *  noOverlap reasoning (two overlapping passes could race to write the
+ *  same tenant's channel_connections.last_order_sync_at row). A separate
+ *  node-cron task from Amazon's, so the two channels' polling cadences can
+ *  be tuned independently and one channel's scheduler can be started
+ *  without the other. */
+export function startShopifyOrderSyncScheduler(options: ShopifyOrderSyncSchedulerOptions): ScheduledTask {
+  const {
+    appPool,
+    adminPool,
+    cronExpression = DEFAULT_SHOPIFY_CRON_EXPRESSION,
+    timezone,
+    maxRetries = DEFAULT_MAX_RETRIES,
+    retryDelayMs = DEFAULT_RETRY_DELAY_MS,
+  } = options;
+
+  const task = schedule(cronExpression, () => runShopifyOnceWithRetry(appPool, adminPool, maxRetries, retryDelayMs), {
+    name: "shopify-order-sync",
+    noOverlap: true,
+    timezone,
+  });
+
+  task.on("execution:overlap", () => {
+    console.warn(
+      JSON.stringify({ event: "shopify_order_sync_skipped_overlap", at: new Date().toISOString() }),
+    );
+  });
+
+  console.log(
+    JSON.stringify({
+      event: "shopify_order_sync_scheduler_started",
       cronExpression,
       timezone: timezone ?? "system default",
       at: new Date().toISOString(),

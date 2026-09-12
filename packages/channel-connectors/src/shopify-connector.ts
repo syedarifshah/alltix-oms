@@ -1,4 +1,6 @@
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import type { Pool } from "pg";
+import { withTenant, decryptChannelSecret } from "@alltix/db";
 import type { FulfillmentType } from "@alltix/shared";
 import type { AuthToken, NormalizedOrder, NormalizedOrderLine, SyncResult, TrackingInfo } from "./connector.js";
 
@@ -100,6 +102,46 @@ export function loadShopifyCredentialsFromEnv(): ShopifyCredentials {
     shopDomain: readRequiredEnv("SHOPIFY_SANDBOX_SHOP_DOMAIN"),
     accessToken: readRequiredEnv("SHOPIFY_SANDBOX_ACCESS_TOKEN"),
   };
+}
+
+/**
+ * Reads the most recent active 'shopify' channel_connections row for a
+ * tenant and decrypts its access token, via {@link withTenant} so RLS
+ * scopes the lookup to `tenantId` (CLAUDE.md §2.4) -- mirrors
+ * AmazonConnector's loadAmazonCredentialsFromChannelConnection exactly,
+ * just against the one column a custom app's credential actually needs
+ * (see migrations/0019_channel_connections_shopify.sql for why
+ * lwa_client_id/encrypted_client_secret/encrypted_refresh_token, all
+ * Amazon-OAuth concepts, are irrelevant to a Shopify row). Never logs the
+ * decrypted token -- only returns it.
+ */
+export async function loadShopifyCredentialsFromChannelConnection(
+  pool: Pool,
+  tenantId: string,
+): Promise<ShopifyCredentials> {
+  return withTenant(pool, tenantId, async (client) => {
+    const result = await client.query<{ external_account_id: string; encrypted_access_token: Buffer | null }>(
+      `SELECT external_account_id, encrypted_access_token
+         FROM channel_connections
+        WHERE channel = 'shopify' AND status = 'active'
+        ORDER BY created_at DESC
+        LIMIT 1`,
+    );
+
+    const row = result.rows[0];
+    if (!row || !row.encrypted_access_token) {
+      throw new Error(`No active 'shopify' channel_connections row found for tenant ${tenantId}`);
+    }
+
+    const accessToken = await decryptChannelSecret(client, row.encrypted_access_token);
+    return { shopDomain: row.external_account_id, accessToken };
+  });
+}
+
+/** Builds a {@link ShopifyConnector} from a tenant's channel_connections row instead of process.env. */
+export async function createShopifyConnectorFromChannelConnection(pool: Pool, tenantId: string): Promise<ShopifyConnector> {
+  const credentials = await loadShopifyCredentialsFromChannelConnection(pool, tenantId);
+  return new ShopifyConnector(credentials);
 }
 
 interface GraphQLUserError {
@@ -314,6 +356,31 @@ export class ShopifyConnector {
    */
   async authenticate(): Promise<AuthToken> {
     return { accessToken: this.credentials.accessToken, expiresAt: "9999-12-31T23:59:59.000Z" };
+  }
+
+  /**
+   * A minimal real API call (`{ shop { name } }`) used only to prove a
+   * shop domain + access token pair is actually valid -- unlike
+   * authenticate() above, which never touches the network at all and so
+   * can't catch a wrong domain or a revoked/mistyped token. Used by the
+   * Settings UI's "Connect Shopify" form (see
+   * packages/web/src/app/api/channels/shopify/connect/route.ts) to reject
+   * bad input before it's ever persisted, and its return value doubles as
+   * a friendlier label than the raw *.myshopify.com domain for that same
+   * UI. Not used anywhere in the already-verified pullOrders/
+   * pushInventory/confirmShipment path -- those don't need an extra
+   * round trip to confirm what a failing call would show anyway.
+   */
+  async verifyConnection(): Promise<{ shopName: string }> {
+    const response = await this.graphql<{ shop: { name: string } }>(`query { shop { name } }`);
+    if (response.errors) {
+      throw new Error(`Shopify connection check failed: ${ShopifyConnector.formatGraphQLErrors(response.errors, "unknown error")}`);
+    }
+    const shopName = response.data?.shop.name;
+    if (!shopName) {
+      throw new Error("Shopify connection check failed: no shop data returned");
+    }
+    return { shopName };
   }
 
   /**

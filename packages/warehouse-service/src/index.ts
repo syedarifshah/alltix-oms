@@ -1,7 +1,11 @@
 import type { Pool } from "pg";
 import { withTenant } from "@alltix/db";
 import type { PicklistLineStatus, PicklistStatus } from "@alltix/shared";
-import { createAmazonConnectorFromChannelConnection, type TrackingInfo } from "@alltix/channel-connectors";
+import {
+  createAmazonConnectorFromChannelConnection,
+  createShopifyConnectorFromChannelConnection,
+  type TrackingInfo,
+} from "@alltix/channel-connectors";
 import type { OrderService } from "@alltix/order-service";
 
 export interface PicklistLine {
@@ -411,11 +415,13 @@ export class WarehouseService {
    * the order stays 'packed' and this throws -- there is no partial state
    * where an order is 'shipped' locally but the channel was never told.
    *
-   * Only 'amazon' is wired to a real connector today (AmazonConnector.
-   * confirmShipment(), verified live against the sandbox -- see its doc
-   * comment for the sandbox-has-no-matching-scenario caveat). Any other
-   * channel throws a clear "not implemented" error rather than silently
-   * skipping the channel call and transitioning anyway.
+   * 'amazon' (AmazonConnector.confirmShipment(), verified live against the
+   * sandbox -- see its doc comment for the sandbox-has-no-matching-scenario
+   * caveat) and 'shopify' (ShopifyConnector.confirmShipment(), verified
+   * live against a real dev store -- see CLAUDE.md §4.5) are wired to real
+   * connectors today. Any other channel throws a clear "not implemented"
+   * error rather than silently skipping the channel call and transitioning
+   * anyway.
    */
   async confirmShipment(tenantId: string, orderId: string, tracking: TrackingInfo): Promise<void> {
     const order = await withTenant(this.pool, tenantId, async (client) => {
@@ -436,6 +442,9 @@ export class WarehouseService {
 
     if (order.channel === "amazon") {
       const connector = await createAmazonConnectorFromChannelConnection(this.pool, tenantId);
+      await connector.confirmShipment(order.external_order_id, tracking);
+    } else if (order.channel === "shopify") {
+      const connector = await createShopifyConnectorFromChannelConnection(this.pool, tenantId);
       await connector.confirmShipment(order.external_order_id, tracking);
     } else {
       throw new Error(

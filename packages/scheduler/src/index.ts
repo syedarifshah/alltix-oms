@@ -4,6 +4,7 @@ import { InProcessEventBus, type EventBus } from "@alltix/shared";
 import {
   createAmazonConnectorFromChannelConnection,
   SP_API_SANDBOX_TEST_CASE_CREATED_AFTER,
+  createShopifyConnectorFromChannelConnection,
 } from "@alltix/channel-connectors";
 import { OrderService } from "@alltix/order-service";
 import { RulesEngine } from "@alltix/rules-engine";
@@ -177,11 +178,95 @@ async function syncTenant(appPool: Pool, orderService: OrderService, tenantId: s
   }
 }
 
+/**
+ * Shopify's channel #3 counterpart to {@link syncAmazonOrders} -- same
+ * shape (discover every tenant with an active connection of this channel,
+ * sync each sequentially, never let one tenant's failure stop the rest),
+ * kept as a parallel function rather than a generic
+ * "syncChannelOrders(channel)" abstraction: AmazonConnector's `isSandbox()`
+ * lookback special-case (see syncTenant below) has no Shopify equivalent
+ * (a Shopify dev store is a real store, not a separate sandbox environment
+ * -- see ShopifyCredentials's own doc comment), and forcing that through a
+ * shared function would need a channel-specific branch inside it anyway.
+ * Revisit this duplication if/when a fourth channel makes the shared shape
+ * actually pay for itself.
+ */
+export async function syncShopifyOrders(params: SyncAmazonOrdersParams): Promise<TenantSyncResult[]> {
+  const { appPool, adminPool, eventBus } = params;
+
+  const orderService = new OrderService(appPool, eventBus);
+  const rulesEngine = new RulesEngine(appPool);
+  rulesEngine.attach(eventBus);
+
+  const tenants = await adminPool.query<{ tenant_id: string }>(
+    `SELECT DISTINCT tenant_id FROM channel_connections WHERE channel = 'shopify' AND status = 'active'`,
+  );
+
+  const results: TenantSyncResult[] = [];
+  for (const { tenant_id: tenantId } of tenants.rows) {
+    results.push(await syncShopifyTenant(appPool, orderService, tenantId));
+  }
+  return results;
+}
+
+/** Shopify counterpart to {@link runAmazonOrderSyncJob} -- see its doc comment. */
+export async function runShopifyOrderSyncJob(appPool: Pool, adminPool: Pool): Promise<TenantSyncResult[]> {
+  return syncShopifyOrders({ appPool, adminPool, eventBus: new InProcessEventBus() });
+}
+
+/** Shopify counterpart to {@link syncTenant} -- identical error-isolation
+ *  contract (never throws; a bad token/connector error becomes a failed
+ *  result, not a stopped loop). No isSandbox()/canned-lookback branch here
+ *  -- ShopifyConnector has no sandbox concept to special-case (see
+ *  syncShopifyOrders's doc comment) -- `since` is always the real computed
+ *  value. */
+async function syncShopifyTenant(appPool: Pool, orderService: OrderService, tenantId: string): Promise<TenantSyncResult> {
+  const syncStartedAt = new Date();
+
+  try {
+    const lastSync = await withTenant(appPool, tenantId, (client) =>
+      client.query<{ last_order_sync_at: string | null }>(
+        `SELECT last_order_sync_at FROM channel_connections
+          WHERE tenant_id = $1 AND channel = 'shopify' AND status = 'active'
+          ORDER BY created_at DESC LIMIT 1`,
+        [tenantId],
+      ),
+    );
+    const lastOrderSyncAt = lastSync.rows[0]?.last_order_sync_at;
+    const since = lastOrderSyncAt ? new Date(lastOrderSyncAt) : new Date(syncStartedAt.getTime() - DEFAULT_LOOKBACK_MS);
+
+    const connector = await createShopifyConnectorFromChannelConnection(appPool, tenantId);
+    const pulled = await connector.pullOrders(since);
+    const persisted = await orderService.persistPulledOrders(tenantId, pulled);
+
+    // Same start-time-not-now reasoning as syncTenant() -- migration 0015's
+    // comment applies identically here.
+    await withTenant(appPool, tenantId, (client) =>
+      client.query(
+        `UPDATE channel_connections SET last_order_sync_at = $1, updated_at = now()
+          WHERE tenant_id = $2 AND channel = 'shopify' AND status = 'active'`,
+        [syncStartedAt.toISOString(), tenantId],
+      ),
+    );
+
+    return { tenantId, success: true, ...persisted, error: null };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`Shopify order sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
+    // Same documented gap as syncTenant() -- no cross-run failure tracking
+    // or alerting yet, see that function's comment.
+    return { tenantId, success: false, insertedOrderIds: [], skippedExternalOrderIds: [], error: message };
+  }
+}
+
 // The recurring trigger this file's own header comment above flagged as
 // separate, later infrastructure work -- see cron-runner.ts for why
 // node-cron (not BullMQ) and what "later" means concretely.
 export {
   startAmazonOrderSyncScheduler,
   runOnceWithRetry,
+  startShopifyOrderSyncScheduler,
+  runShopifyOnceWithRetry,
   type AmazonOrderSyncSchedulerOptions,
+  type ShopifyOrderSyncSchedulerOptions,
 } from "./cron-runner.js";

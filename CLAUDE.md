@@ -377,15 +377,34 @@ succeeded or failed."
   is on a third-party-fulfilled product (e.g. Shopify's own demo "3p Fulfilled"
   product) needs the third-party scope specifically; merchant-managed is the
   default/simplest case and what a normal seller-fulfilled product needs.
-- **Not implemented** (deliberate, connector-class-only scope): `submitListing`/
-  `getFeedStatus` (NormalizedListing lacks fields Shopify's product-creation mutations
-  require) and `subscribeToEvents` (Shopify's webhooks need a public HTTP endpoint
-  with HMAC verification — application/web-layer infrastructure not built in this
-  pass; `verifyShopifyWebhookHmac()` is implemented and unit-tested standalone so a
-  future webhook route doesn't start from zero). No DB migration, scheduler wiring, or
-  Settings UI — single store via a directly-configured access token, same "prove the
-  connector before wiring per-tenant storage" order Amazon's own credentials went
-  through.
+- **Not implemented**: `submitListing`/`getFeedStatus` (NormalizedListing lacks fields
+  Shopify's product-creation mutations require) and `subscribeToEvents` (Shopify's
+  webhooks need a public HTTP endpoint with HMAC verification — application/web-layer
+  infrastructure not built yet; `verifyShopifyWebhookHmac()` is implemented and
+  unit-tested standalone so a future webhook route doesn't start from zero).
+- **Wired into the app** (migration `0019_channel_connections_shopify.sql`): a
+  Shopify row in `channel_connections` reuses the same table Amazon's OAuth flow
+  populates, with `lwa_client_id`/`encrypted_client_secret`/`encrypted_refresh_token`
+  relaxed to nullable (Amazon-OAuth concepts a custom app's single static token has
+  nothing to put in) and a new `encrypted_access_token` column for the token itself —
+  long-lived and high-value like Amazon's refresh token, so it gets the same
+  pgcrypto-at-rest treatment, not left plaintext the way Amazon's short-lived
+  `access_token` is. `external_account_id` holds the `*.myshopify.com` domain;
+  `marketplace` is always `''` (one connected store is one connection, full stop).
+  Unlike Amazon, there is no OAuth redirect/consent screen at all: `/settings/channels`
+  has a plain "Connect Shopify" form (shop domain + Admin API access token) that POSTs
+  to `/api/channels/shopify/connect`, which calls `ShopifyConnector.verifyConnection()`
+  (a live `{ shop { name } }` call) to reject a bad domain/token pair before persisting
+  anything, then encrypts and upserts the row. The scheduler
+  (`packages/scheduler/src/{index,cron-runner}.ts`) runs a Shopify order-sync pass in
+  parallel to Amazon's own — `syncShopifyOrders`/`runShopifyOrderSyncJob`/
+  `startShopifyOrderSyncScheduler`, a separate node-cron task and separate
+  `scripts/shopify-order-sync-{job,scheduler}.ts` entrypoints — kept as parallel
+  functions rather than a shared "any channel" abstraction since Amazon's sandbox
+  lookback special-case doesn't apply to Shopify and two channels isn't enough to pay
+  for the abstraction yet. `WarehouseService.confirmShipment()` dispatches to
+  `createShopifyConnectorFromChannelConnection` on `order.channel === "shopify"`,
+  alongside its existing Amazon branch.
 
 ## 5. Technology Stack
 
