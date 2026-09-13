@@ -13,10 +13,12 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import {
   normalizeShopifyOrder,
+  normalizeShopifyOrderWebhookPayload,
   normalizeShopifyProductVariant,
   verifyShopifyWebhookHmac,
   type RawProductVariantNode,
   type ShopifyOrder,
+  type ShopifyOrderWebhookPayload,
 } from "../src/shopify-connector.js";
 
 function makeShopifyOrder(overrides: Partial<ShopifyOrder> = {}): ShopifyOrder {
@@ -168,6 +170,69 @@ test("normalizeShopifyProductVariant carries the SKU and inventoryItem gid throu
   );
   assert.equal(normalized?.externalSku, "SKU-XYZ");
   assert.equal(normalized?.inventoryItemId, "gid://shopify/InventoryItem/99");
+});
+
+function makeOrderWebhookPayload(overrides: Partial<ShopifyOrderWebhookPayload> = {}): ShopifyOrderWebhookPayload {
+  return {
+    id: 5678919990329,
+    admin_graphql_api_id: "gid://shopify/Order/5678919990329",
+    name: "#1001",
+    created_at: "2026-01-15T10:30:00Z",
+    fulfillment_status: null,
+    email: null,
+    customer: null,
+    shipping_address: null,
+    line_items: [{ id: 12345678901234, sku: "SKU-001", quantity: 2, price: "19.99" }],
+    ...overrides,
+  };
+}
+
+test("normalizeShopifyOrderWebhookPayload uses admin_graphql_api_id (not the numeric id) as externalOrderId, matching pullOrders'", () => {
+  const normalized = normalizeShopifyOrderWebhookPayload(makeOrderWebhookPayload());
+  assert.equal(normalized.externalOrderId, "gid://shopify/Order/5678919990329");
+});
+
+test("normalizeShopifyOrderWebhookPayload always sets channel='shopify' and channelMarketplace=''", () => {
+  const normalized = normalizeShopifyOrderWebhookPayload(makeOrderWebhookPayload());
+  assert.equal(normalized.channel, "shopify");
+  assert.equal(normalized.channelMarketplace, "");
+});
+
+test("normalizeShopifyOrderWebhookPayload prefers customer.email over the order-level email when both are present", () => {
+  const normalized = normalizeShopifyOrderWebhookPayload(
+    makeOrderWebhookPayload({ email: "order-level@example.com", customer: { email: "customer@example.com" } }),
+  );
+  assert.deepEqual(normalized.customer, { email: "customer@example.com" });
+});
+
+test("normalizeShopifyOrderWebhookPayload falls back to an empty customer object when neither email is present", () => {
+  const normalized = normalizeShopifyOrderWebhookPayload(makeOrderWebhookPayload({ email: null, customer: null }));
+  assert.deepEqual(normalized.customer, {});
+});
+
+test("normalizeShopifyOrderWebhookPayload maps flat line_items, defaulting fulfillmentType to seller_fulfilled", () => {
+  const normalized = normalizeShopifyOrderWebhookPayload(makeOrderWebhookPayload());
+  assert.equal(normalized.lines.length, 1);
+  assert.deepEqual(normalized.lines[0], {
+    externalLineId: "12345678901234",
+    externalSku: "SKU-001",
+    quantity: 2,
+    unitPrice: "19.99",
+    fulfillmentType: "seller_fulfilled",
+  });
+});
+
+test("normalizeShopifyOrderWebhookPayload falls back a line's externalSku to its own id when sku is null", () => {
+  const normalized = normalizeShopifyOrderWebhookPayload(
+    makeOrderWebhookPayload({ line_items: [{ id: 999, sku: null, quantity: 1, price: "5.00" }] }),
+  );
+  assert.equal(normalized.lines[0]?.externalSku, "999");
+});
+
+test("normalizeShopifyOrderWebhookPayload preserves the raw payload as rawPayload", () => {
+  const raw = makeOrderWebhookPayload();
+  const normalized = normalizeShopifyOrderWebhookPayload(raw);
+  assert.deepEqual(normalized.rawPayload, raw);
 });
 
 test("verifyShopifyWebhookHmac accepts a correctly-signed body", () => {

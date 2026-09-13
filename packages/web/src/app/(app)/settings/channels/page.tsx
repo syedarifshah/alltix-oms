@@ -19,12 +19,17 @@ interface ChannelConnectionRow {
 
 /** Shopify's row has no lwa_client_id/marketplace to show (see
  *  migrations/0019_channel_connections_shopify.sql) -- external_account_id
- *  is the connected shop's *.myshopify.com domain instead of a seller id. */
+ *  is the connected shop's *.myshopify.com domain instead of a seller id.
+ *  has_webhook_secret reflects whether encrypted_client_secret is set --
+ *  never the decrypted value itself, just whether real-time webhooks
+ *  (see /api/webhooks/shopify) can possibly be verified for this
+ *  connection or whether it's cron-only for now. */
 interface ShopifyConnectionRow {
   external_account_id: string;
   status: string;
   created_at: string;
   last_order_sync_at: string | null;
+  has_webhook_secret: boolean;
 }
 
 /** Sandbox vs. production is never stored as its own column (see
@@ -39,7 +44,7 @@ function classifyEnvironment(lwaClientId: string): "Sandbox" | "Production" | "U
 }
 
 interface ChannelsSettingsPageProps {
-  searchParams: Promise<{ connected?: string; error?: string }>;
+  searchParams: Promise<{ connected?: string; error?: string; webhooks?: string }>;
 }
 
 /**
@@ -59,7 +64,7 @@ export default async function ChannelsSettingsPage({
 
   const pool = getAppPool();
   const tenantId = await resolveTenantId(pool, authContext.clerkUserId);
-  const { connected, error } = await searchParams;
+  const { connected, error, webhooks } = await searchParams;
 
   if (!tenantId) {
     return (
@@ -79,7 +84,8 @@ export default async function ChannelsSettingsPage({
         LIMIT 1`,
     );
     const shopifyResult = await client.query<ShopifyConnectionRow>(
-      `SELECT external_account_id, status, created_at, last_order_sync_at
+      `SELECT external_account_id, status, created_at, last_order_sync_at,
+              (encrypted_client_secret IS NOT NULL) AS has_webhook_secret
          FROM channel_connections
         WHERE channel = 'shopify'
         ORDER BY created_at DESC
@@ -98,7 +104,18 @@ export default async function ChannelsSettingsPage({
       <p className="subtitle">Amazon and Shopify connectors — Walmart/eBay aren&apos;t built yet.</p>
 
       {connected === "amazon" && <div className="alert alert-success">Amazon connected.</div>}
-      {connected === "shopify" && <div className="alert alert-success">Shopify connected.</div>}
+      {connected === "shopify" && (
+        <div className="alert alert-success">
+          Shopify connected.
+          {webhooks === "not_configured" &&
+            " A webhook signing secret was entered, but this deployment has no SHOPIFY_WEBHOOK_CALLBACK_URL configured yet -- syncing via the daily cron only."}
+          {webhooks === "error" && " Webhook registration failed unexpectedly -- syncing via the daily cron only; check server logs."}
+          {webhooks && /^\d+\/\d+$/.test(webhooks) &&
+            (webhooks === "3/3"
+              ? " Real-time webhooks registered (orders/create, orders/cancelled, app/uninstalled)."
+              : ` Webhooks partially registered (${webhooks}) -- check server logs for which topic(s) failed.`)}
+        </div>
+      )}
       {error?.startsWith("shopify_") ? (
         <div className="alert alert-danger">Shopify connection failed ({error}).</div>
       ) : (
@@ -151,6 +168,11 @@ export default async function ChannelsSettingsPage({
                 ? new Date(shopifyConnection.last_order_sync_at).toISOString()
                 : "never synced yet"}
             </div>
+            <div className="muted">
+              {shopifyConnection.has_webhook_secret
+                ? "Real-time webhooks: signing secret on file (see /api/webhooks/shopify) -- orders/create, orders/cancelled, and app/uninstalled sync near-instantly; the daily cron still runs as a fallback."
+                : "Real-time webhooks: not enabled -- no signing secret on file yet, syncing via the daily cron only. Enter the custom app's API secret key below to enable them."}
+            </div>
             {/* No OAuth reconnect redirect for Shopify (see the connect
                 route's own doc comment) -- reconnecting means re-submitting
                 the form below with a fresh token, so it's always shown
@@ -174,6 +196,13 @@ export default async function ChannelsSettingsPage({
  * anything. No client-side JS, consistent with every other mutation form in
  * this app (e.g. /rules's "New rule" form) -- CLAUDE.md's Next.js
  * conventions call for plain <form action method="POST"> submissions.
+ *
+ * The webhook signing secret field is optional (see the connect route's own
+ * doc comment) -- left blank, the form still connects the store, it just
+ * doesn't enable real-time webhooks (cron-only sync). Left blank on a
+ * *reconnect*, an already-stored secret is preserved, not erased -- so a
+ * tenant re-pasting a rotated access token doesn't have to also re-enter a
+ * secret that hasn't changed.
  */
 function ShopifyConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElement {
   return (
@@ -185,6 +214,10 @@ function ShopifyConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElem
       <label>
         Admin API access token
         <input type="password" name="accessToken" placeholder="shpat_..." required />
+      </label>
+      <label>
+        Webhook signing secret (optional -- enables real-time sync)
+        <input type="password" name="clientSecret" placeholder="from the custom app's API credentials page" />
       </label>
       <button type="submit">{buttonLabel}</button>
     </form>

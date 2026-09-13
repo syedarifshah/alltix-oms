@@ -392,6 +392,106 @@ export function verifyShopifyWebhookHmac(rawBody: string, hmacHeader: string, cl
   return timingSafeEqual(computedBuffer, headerBuffer);
 }
 
+/** The three webhook topics {@link ShopifyConnector.registerWebhooks}
+ *  subscribes a store to -- chosen to close exactly the gaps flagged when
+ *  webhooks were scoped: `ORDERS_CREATE` replaces the up-to-24h-stale daily
+ *  cron (packages/scheduler's syncShopifyOrders) with near-real-time order
+ *  pull for the common case; `ORDERS_CANCELLED` lets a channel-side
+ *  cancellation release the ledger reservation without waiting for a human
+ *  to notice on their next visit to /orders; `APP_UNINSTALLED` flips the
+ *  connection to 'disconnected' the moment a merchant revokes access from
+ *  their own Shopify admin, instead of every subsequent call failing
+ *  silently against a dead token forever (the "no alerting" gap syncTenant's
+ *  own doc comment in packages/scheduler already flags for Amazon -- closed
+ *  for real here, for the one signal Shopify volunteers for free).
+ *  https://shopify.dev/docs/api/admin-graphql/latest/enums/WebhookSubscriptionTopic */
+export const SHOPIFY_WEBHOOK_TOPICS = ["ORDERS_CREATE", "ORDERS_CANCELLED", "APP_UNINSTALLED"] as const;
+export type ShopifyWebhookTopic = (typeof SHOPIFY_WEBHOOK_TOPICS)[number];
+
+export interface ShopifyWebhookRegistrationResult {
+  topic: ShopifyWebhookTopic;
+  success: boolean;
+  webhookSubscriptionId: string | null;
+  error: string | null;
+}
+
+interface WebhookSubscriptionCreateResponse {
+  webhookSubscriptionCreate: {
+    webhookSubscription: { id: string } | null;
+    userErrors: GraphQLUserError[];
+  };
+}
+
+/** Raw shape of the JSON body Shopify POSTs for `orders/create` and
+ *  `orders/cancelled` webhook deliveries -- Shopify's flat REST-style Order
+ *  resource, NOT the `edges`/`node` GraphQL shape {@link ShopifyOrder} above
+ *  uses. pullOrders() (via the GraphQL `orders` query) and the webhook route
+ *  (via a raw POST body) normalize two physically different payload shapes
+ *  into the same NormalizedOrder -- see
+ *  {@link normalizeShopifyOrderWebhookPayload}. Only the fields actually
+ *  mapped are declared, same "declare what's used, not the whole resource"
+ *  discipline as ShopifyOrder itself.
+ *  https://shopify.dev/docs/apps/build/webhooks/delivery-structure */
+export interface ShopifyOrderWebhookPayload {
+  id: number;
+  /** The same GID pullOrders()/normalizeShopifyOrder() use as
+   *  externalOrderId -- present on every Shopify REST resource for exactly
+   *  this cross-reference purpose. Using this (never the numeric `id`) is
+   *  what keeps an order created via cron pull and the same order arriving
+   *  again via webhook (or vice versa) deduping onto one
+   *  orders.external_order_id row instead of two different ids for the same
+   *  underlying Shopify order. */
+  admin_graphql_api_id: string;
+  name: string;
+  created_at: string;
+  fulfillment_status: string | null;
+  email?: string | null;
+  customer?: { email?: string | null } | null;
+  shipping_address?: Record<string, unknown> | null;
+  line_items: Array<{
+    id: number;
+    sku?: string | null;
+    quantity: number;
+    price: string;
+  }>;
+}
+
+/**
+ * Pure normalization (no network access, unit-testable without a live
+ * store) mirroring {@link normalizeShopifyOrder} field-for-field, but
+ * reading Shopify's flat webhook/REST payload shape instead of the GraphQL
+ * `edges`/`node` shape -- see {@link ShopifyOrderWebhookPayload}'s own doc
+ * comment for why these need to be two separate functions rather than one,
+ * and why `admin_graphql_api_id` (never the numeric `id`) is used as
+ * externalOrderId. Used by both the `orders/create` and `orders/cancelled`
+ * webhook handlers (packages/web's `/api/webhooks/shopify` route) -- an
+ * `orders/cancelled` delivery's body is the full current Order, the same
+ * shape `orders/create` sends, just with fulfillment/cancellation fields
+ * updated, so one normalizer covers both topics' payloads.
+ */
+export function normalizeShopifyOrderWebhookPayload(payload: ShopifyOrderWebhookPayload): NormalizedOrder {
+  return {
+    externalOrderId: payload.admin_graphql_api_id,
+    channel: "shopify",
+    channelMarketplace: "",
+    channelStatus: payload.fulfillment_status ?? "unfulfilled",
+    placedAt: payload.created_at,
+    customer: payload.customer?.email ? { email: payload.customer.email } : payload.email ? { email: payload.email } : {},
+    shippingAddress: payload.shipping_address ?? {},
+    lines: payload.line_items.map((line) => ({
+      externalLineId: String(line.id),
+      // Same "pass through, let downstream channel_listings resolution fail
+      // loudly on an unmapped SKU" fallback normalizeShopifyOrderLine uses
+      // for the GraphQL path.
+      externalSku: line.sku ?? String(line.id),
+      quantity: line.quantity,
+      unitPrice: line.price,
+      fulfillmentType: "seller_fulfilled" as FulfillmentType,
+    })),
+    rawPayload: payload,
+  };
+}
+
 /**
  * Shopify Admin API connector. Implements authenticate()/pullOrders()/
  * pushInventory()/confirmShipment() -- see this file's header comment for
@@ -455,6 +555,102 @@ export class ShopifyConnector {
       throw new Error("Shopify connection check failed: no shop data returned");
     }
     return { shopName };
+  }
+
+  /**
+   * Registers this store for near-real-time delivery of each topic in
+   * {@link SHOPIFY_WEBHOOK_TOPICS} via `webhookSubscriptionCreate`, POSTing
+   * to `callbackUrl` (packages/web's `/api/webhooks/shopify` route). Uses
+   * the same Admin API access token as every other call on this class --
+   * registering a subscription needs no client secret at all. The client
+   * secret is a *separate* credential, generated alongside a custom app's
+   * access token, used only to verify the HMAC signature on each *inbound*
+   * delivery (see {@link verifyShopifyWebhookHmac}) -- this method never
+   * touches it, and doesn't need to.
+   *
+   * `uri` (not the deprecated `callbackUrl` input field -- see
+   * https://shopify.dev/changelog/consolidate-webhook-graphql-surfaces,
+   * which folded callbackUrl into a single `uri` field across every
+   * delivery method as of API version 2025-10, before this connector's
+   * pinned 2026-07) is the endpoint Shopify POSTs each delivery to.
+   * `format: "JSON"` is passed explicitly rather than relying on whatever
+   * Shopify defaults to if the field is omitted.
+   *
+   * Never throws for a single topic's failure -- same per-item error
+   * isolation this file already applies elsewhere (pullOrders' per-page
+   * partial-data warning, pullProductCatalog's per-variant skip count): a
+   * tenant whose custom app is missing one scope shouldn't lose
+   * registration for the other two topics. Callers should still surface
+   * every non-success result to the tenant/logs; this only isolates one
+   * topic's failure from blocking the others.
+   *
+   * UNVERIFIED against a real store as written: this connector's own
+   * established discipline (see this file's header/class doc comment) is to
+   * mark every new live-API method this way until it's actually exercised
+   * against a real dev store (see the opt-in step in
+   * scripts/shopify-sandbox-smoke-test.ts, gated on
+   * SHOPIFY_SANDBOX_TEST_WEBHOOK_CALLBACK_URL) -- do that before trusting
+   * this beyond what's transcribed from shopify.dev's docs. In particular,
+   * whether Shopify treats a *repeat* registration for a topic+uri pair
+   * already subscribed (e.g. a tenant reconnecting without changing
+   * anything) as a harmless no-op or a rejected userError is not yet known
+   * -- this method doesn't special-case a guess, it just surfaces whatever
+   * userErrors come back.
+   */
+  async registerWebhooks(callbackUrl: string): Promise<ShopifyWebhookRegistrationResult[]> {
+    const results: ShopifyWebhookRegistrationResult[] = [];
+
+    for (const topic of SHOPIFY_WEBHOOK_TOPICS) {
+      try {
+        const response = await this.graphql<WebhookSubscriptionCreateResponse>(
+          `mutation ($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
+            webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
+              webhookSubscription { id }
+              userErrors { field message }
+            }
+          }`,
+          { topic, webhookSubscription: { uri: callbackUrl, format: "JSON" } },
+        );
+
+        if (response.errors) {
+          results.push({
+            topic,
+            success: false,
+            webhookSubscriptionId: null,
+            error: ShopifyConnector.formatGraphQLErrors(response.errors, "unknown error"),
+          });
+          continue;
+        }
+
+        const userErrors = response.data?.webhookSubscriptionCreate.userErrors ?? [];
+        if (userErrors.length > 0) {
+          results.push({
+            topic,
+            success: false,
+            webhookSubscriptionId: null,
+            error: ShopifyConnector.formatUserErrors(userErrors, "unknown error"),
+          });
+          continue;
+        }
+
+        const webhookSubscriptionId = response.data?.webhookSubscriptionCreate.webhookSubscription?.id ?? null;
+        if (!webhookSubscriptionId) {
+          results.push({ topic, success: false, webhookSubscriptionId: null, error: "no webhookSubscription returned" });
+          continue;
+        }
+
+        results.push({ topic, success: true, webhookSubscriptionId, error: null });
+      } catch (err) {
+        results.push({
+          topic,
+          success: false,
+          webhookSubscriptionId: null,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return results;
   }
 
   /**

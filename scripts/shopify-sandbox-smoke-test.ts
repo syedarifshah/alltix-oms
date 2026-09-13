@@ -108,6 +108,26 @@ async function main(): Promise<void> {
     );
   }
 
+  const webhookCallbackUrl = process.env.SHOPIFY_SANDBOX_TEST_WEBHOOK_CALLBACK_URL;
+  if (webhookCallbackUrl) {
+    console.log(`\nSHOPIFY_SANDBOX_TEST_WEBHOOK_CALLBACK_URL set -- registering webhooks against '${webhookCallbackUrl}'...`);
+    const results = await connector.registerWebhooks(webhookCallbackUrl);
+    for (const result of results) {
+      console.log(
+        `  - ${result.topic}: ${result.success ? `registered (id ${result.webhookSubscriptionId})` : `FAILED (${result.error})`}`,
+      );
+    }
+    if (results.some((r) => !r.success)) {
+      throw new Error("registerWebhooks did not fully succeed -- see results above.");
+    }
+  } else {
+    console.log(
+      "\nSHOPIFY_SANDBOX_TEST_WEBHOOK_CALLBACK_URL not set -- skipping registerWebhooks (opt-in: this creates real, " +
+        "persistent webhook subscriptions on the dev store, so it needs a callback URL the operator picked on " +
+        "purpose -- e.g. an ngrok/Vercel preview URL that can actually receive a delivery).",
+    );
+  }
+
   console.log("\nSmoke test PASSED: talked to real Shopify Admin API infrastructure.");
 }
 

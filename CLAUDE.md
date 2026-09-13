@@ -377,11 +377,12 @@ succeeded or failed."
   is on a third-party-fulfilled product (e.g. Shopify's own demo "3p Fulfilled"
   product) needs the third-party scope specifically; merchant-managed is the
   default/simplest case and what a normal seller-fulfilled product needs.
-- **Not implemented**: `submitListing`/`getFeedStatus` (NormalizedListing lacks fields
-  Shopify's product-creation mutations require) and `subscribeToEvents` (Shopify's
-  webhooks need a public HTTP endpoint with HMAC verification — application/web-layer
-  infrastructure not built yet; `verifyShopifyWebhookHmac()` is implemented and
-  unit-tested standalone so a future webhook route doesn't start from zero).
+- **Not implemented**: `submitListing`/`getFeedStatus` — `NormalizedListing` lacks
+  fields Shopify's product-creation mutations require (title, a price, at least one
+  variant), and no "create a listing" UI exists anywhere in the app yet. Real-time
+  webhooks (formerly listed here as not built, `subscribeToEvents` still a deliberate
+  no-op on the connector itself) are now wired in as application/web-layer
+  infrastructure instead — see the new paragraph below.
 - **Wired into the app** (migration `0019_channel_connections_shopify.sql`): a
   Shopify row in `channel_connections` reuses the same table Amazon's OAuth flow
   populates, with `lwa_client_id`/`encrypted_client_secret`/`encrypted_refresh_token`
@@ -437,6 +438,61 @@ succeeded or failed."
   quantities and skipped this store's SKU-less demo variants with the expected warning,
   on the first live attempt (unlike `pullOrders`/`pushInventory`/`confirmShipment`, each
   of which needed multiple rounds of live debugging — see their own history above).
+- **Real-time webhooks** (`ShopifyConnector.registerWebhooks()`, `POST
+  /api/webhooks/shopify`): closes the "still cron-polling, once daily" gap — orders now
+  sync within seconds of being placed/cancelled instead of waiting for the next
+  `shopify-order-sync` cron run, which stays wired in as a same-day fallback for a
+  tenant who hasn't enabled webhooks or whose one delivery got dropped. Built on the
+  **per-tenant custom-app model** (not a distributed/public OAuth app) — an explicit
+  choice made when this was scoped, keeping the "one custom app per merchant" shape the
+  rest of this connector already uses rather than taking on an OAuth consent flow for
+  one feature.
+  - **Credential**: a custom app's Dev Dashboard API credentials page shows an "API
+    secret key" alongside the Admin API access token — a different credential, never
+    sent to Shopify on any call this connector makes, used only to verify the
+    `X-Shopify-Hmac-Sha256` header on each inbound delivery (`verifyShopifyWebhookHmac`,
+    already implemented/unit-tested before this pass). It's optional on the "Connect
+    Shopify" form — a tenant can connect and stay cron-only forever without it — and,
+    once submitted, is stored in `channel_connections.encrypted_client_secret`,
+    **reusing** the column `0019_channel_connections_shopify.sql` relaxed to nullable
+    for the opposite reason (a Shopify row had nothing to put there before webhooks
+    existed) rather than adding a new column: a per-tenant client secret is now a
+    genuinely correct value for a column literally named that. There's no way to
+    validate a client secret's correctness up front the way `verifyConnection()`
+    validates the access token (Shopify has no "check this secret" API) — a mistyped
+    one just means every real delivery gets rejected with 401 at the route, logged,
+    until corrected.
+  - **Topics**: `ORDERS_CREATE`, `ORDERS_CANCELLED`, `APP_UNINSTALLED` (registered via
+    `webhookSubscriptionCreate`, using the store's existing access token — registration
+    itself needs no client secret). `orders/create` persists through the identical
+    `OrderService.persistPulledOrders()` path the cron job uses, so it gets the same
+    `(tenant_id, channel, external_order_id)` dedupe and the same routing-rule
+    opportunity. `orders/cancelled` re-uses `OrderService.transition(..., 'cancelled')`
+    — the same mechanism a human's own Cancel button on the order page calls — and
+    treats a redelivery of an already-cancelled order as an idempotent no-op rather than
+    letting the guarded `UPDATE` throw. `app/uninstalled` flips the connection to
+    `disconnected`, closing the "no alerting on a dead token" gap `syncTenant`'s own
+    comment in `packages/scheduler` still flags as open for Amazon.
+  - **Multi-tenant credential resolution**: a webhook delivery carries no tenant id,
+    only `X-Shopify-Shop-Domain` — resolving that to a tenant and its
+    `encrypted_client_secret`, before RLS can scope anything, is an inherently
+    cross-tenant lookup. `/api/webhooks/shopify` uses `getAdminPool()` (`DATABASE_URL`,
+    bypasses RLS) for exactly that one query, the same justified, narrowly-scoped
+    exception `packages/scheduler`'s tenant-enumeration queries already use — every
+    subsequent read/write for the resolved tenant goes through the normal `app_user` +
+    `withTenant()` path.
+  - **Known gap, documented not solved**: an `orders/cancelled` delivery that arrives
+    before the corresponding order has ever been created locally (out-of-order delivery,
+    or a tenant enabling webhooks after an order was already placed *and* cancelled on
+    Shopify) has nothing to cancel yet — logged and acknowledged, but a later
+    cron/`orders/create` delivery for the same order will still insert it as a normal
+    `'received'` order and allocate against it as if it were never cancelled. Closing
+    this needs either re-reading Shopify's current order state instead of trusting
+    delivery order, or a small "seen but not yet local" staging table — neither built.
+  - **UNVERIFIED against a real store as written** (this connector's usual discipline):
+    `registerWebhooks()` is transcribed from shopify.dev, not yet exercised live — the
+    opt-in step in `shopify-sandbox-smoke-test.ts`
+    (`SHOPIFY_SANDBOX_TEST_WEBHOOK_CALLBACK_URL`) exists for exactly that, not run yet.
 
 ## 5. Technology Stack
 
