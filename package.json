@@ -25,7 +25,8 @@
     "stripe:setup-mvp-plan": "tsx scripts/stripe-setup-mvp-plan.ts",
     "shopify:sandbox-smoke-test": "tsx scripts/shopify-sandbox-smoke-test.ts",
     "shopify:order-sync-job": "tsx scripts/shopify-order-sync-job.ts",
-    "shopify:order-sync-scheduler": "tsx scripts/shopify-order-sync-scheduler.ts"
+    "shopify:order-sync-scheduler": "tsx scripts/shopify-order-sync-scheduler.ts",
+    "catalog:add-channel-listing": "tsx scripts/add-channel-listing.ts"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
