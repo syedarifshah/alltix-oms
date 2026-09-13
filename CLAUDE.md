@@ -409,6 +409,34 @@ succeeded or failed."
   entry in `vercel.json`. `WarehouseService.confirmShipment()` dispatches to
   `createShopifyConnectorFromChannelConnection` on `order.channel === "shopify"`,
   alongside its existing Amazon branch.
+- **Automatic catalog sync** (`ShopifyConnector.pullProductCatalog()`,
+  `packages/scheduler`'s `syncShopifyCatalog`/`runShopifyCatalogSyncJob`, cron route
+  `GET /api/cron/shopify-catalog-sync` at 4:30am — before the 5am order-sync cron, so a
+  genuinely new product is more likely mapped before that day's orders reference it,
+  though Hobby's ±59min per-job scheduling imprecision means this ordering is a
+  best-effort default, not a guarantee): closes the gap
+  `scripts/add-channel-listing.ts` is a manual, one-SKU-at-a-time stopgap for. Pulls
+  every SKU'd variant in the store and upserts a `products`/`channel_listings` row per
+  variant, using the exact same `internal_sku = "shopify-<sku>"` convention that script
+  defaults to — so a SKU already onboarded by hand is found and updated, never
+  duplicated. Baseline stock is seeded once via `InventoryService.recordInventoryEvent`
+  (a real `receipt` event, never a direct `inventory_levels` write) from Shopify's own
+  currently-reported quantity, summed across every Location the item has a level at
+  (this codebase's own `locations` table still has no per-Shopify-location mapping —
+  Phase 4 work, see §8). The idempotency key
+  (`catalog-onboarding:<tenantId>:shopify:<sku>`) is **deliberately** the same prefix
+  `scripts/add-channel-listing.ts` already uses, not a separate one: idempotency_key is
+  UNIQUE across all of `inventory_events` regardless of which script or job wrote it, so
+  a SKU a human already seeded by hand is never re-baselined (and potentially
+  double-counted) by this job — every later run just keeps the catalog mapping current
+  without touching inventory again, since the tenant's own ledger is the ongoing source
+  of truth after the first baseline. A variant with no SKU set can't be mapped at all
+  and is skipped with a warning (`pullProductCatalog`'s own doc comment) — that edge
+  case stays manual. **Unverified against a real store** as written, unlike
+  `pullOrders`/`pushInventory`/`confirmShipment` (all live-debugged already) — it reuses
+  the exact `inventoryItem { inventoryLevels(...) }` shape those already proved live,
+  but run `npm run shopify:sandbox-smoke-test` (now exercises this too) against a real
+  store before trusting it in production.
 
 ## 5. Technology Stack
 

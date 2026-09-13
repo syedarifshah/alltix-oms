@@ -11,7 +11,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { normalizeShopifyOrder, verifyShopifyWebhookHmac, type ShopifyOrder } from "../src/shopify-connector.js";
+import {
+  normalizeShopifyOrder,
+  normalizeShopifyProductVariant,
+  verifyShopifyWebhookHmac,
+  type RawProductVariantNode,
+  type ShopifyOrder,
+} from "../src/shopify-connector.js";
 
 function makeShopifyOrder(overrides: Partial<ShopifyOrder> = {}): ShopifyOrder {
   return {
@@ -102,6 +108,66 @@ test("normalizeShopifyOrder preserves the raw order as rawPayload", () => {
   const raw = makeShopifyOrder();
   const normalized = normalizeShopifyOrder(raw);
   assert.deepEqual(normalized.rawPayload, raw);
+});
+
+function makeVariantNode(overrides: Partial<RawProductVariantNode> = {}): RawProductVariantNode {
+  return {
+    id: "gid://shopify/ProductVariant/1",
+    sku: "SKU-001",
+    title: "Default Title",
+    product: { title: "Test Product" },
+    inventoryItem: {
+      id: "gid://shopify/InventoryItem/1",
+      inventoryLevels: { edges: [{ node: { location: { id: "gid://shopify/Location/1" }, quantities: [{ quantity: 10 }] } }] },
+    },
+    ...overrides,
+  };
+}
+
+test("normalizeShopifyProductVariant returns null for a variant with no SKU set", () => {
+  assert.equal(normalizeShopifyProductVariant(makeVariantNode({ sku: null })), null);
+});
+
+test("normalizeShopifyProductVariant sums quantity across every location the item has a level at", () => {
+  const normalized = normalizeShopifyProductVariant(
+    makeVariantNode({
+      inventoryItem: {
+        id: "gid://shopify/InventoryItem/1",
+        inventoryLevels: {
+          edges: [
+            { node: { location: { id: "gid://shopify/Location/1" }, quantities: [{ quantity: 10 }] } },
+            { node: { location: { id: "gid://shopify/Location/2" }, quantities: [{ quantity: 5 }] } },
+          ],
+        },
+      },
+    }),
+  );
+  assert.equal(normalized?.totalAvailable, 15);
+});
+
+test("normalizeShopifyProductVariant treats a variant with no inventory levels yet as zero available, not an error", () => {
+  const normalized = normalizeShopifyProductVariant(
+    makeVariantNode({ inventoryItem: { id: "gid://shopify/InventoryItem/1", inventoryLevels: { edges: [] } } }),
+  );
+  assert.equal(normalized?.totalAvailable, 0);
+});
+
+test("normalizeShopifyProductVariant drops Shopify's 'Default Title' suffix for a single-variant product", () => {
+  const normalized = normalizeShopifyProductVariant(makeVariantNode({ title: "Default Title", product: { title: "Test Product" } }));
+  assert.equal(normalized?.title, "Test Product");
+});
+
+test("normalizeShopifyProductVariant combines product and variant titles when the variant has a real one", () => {
+  const normalized = normalizeShopifyProductVariant(makeVariantNode({ title: "Large / Blue", product: { title: "Test Product" } }));
+  assert.equal(normalized?.title, "Test Product - Large / Blue");
+});
+
+test("normalizeShopifyProductVariant carries the SKU and inventoryItem gid through unchanged", () => {
+  const normalized = normalizeShopifyProductVariant(
+    makeVariantNode({ sku: "SKU-XYZ", inventoryItem: { id: "gid://shopify/InventoryItem/99", inventoryLevels: { edges: [] } } }),
+  );
+  assert.equal(normalized?.externalSku, "SKU-XYZ");
+  assert.equal(normalized?.inventoryItemId, "gid://shopify/InventoryItem/99");
 });
 
 test("verifyShopifyWebhookHmac accepts a correctly-signed body", () => {

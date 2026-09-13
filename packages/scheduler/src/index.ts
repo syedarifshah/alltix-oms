@@ -5,7 +5,9 @@ import {
   createAmazonConnectorFromChannelConnection,
   SP_API_SANDBOX_TEST_CASE_CREATED_AFTER,
   createShopifyConnectorFromChannelConnection,
+  type NormalizedShopifyProductVariant,
 } from "@alltix/channel-connectors";
+import { InventoryService } from "@alltix/inventory-service";
 import { OrderService } from "@alltix/order-service";
 import { RulesEngine } from "@alltix/rules-engine";
 
@@ -257,6 +259,181 @@ async function syncShopifyTenant(appPool: Pool, orderService: OrderService, tena
     // or alerting yet, see that function's comment.
     return { tenantId, success: false, insertedOrderIds: [], skippedExternalOrderIds: [], error: message };
   }
+}
+
+/** Every product/channel_listings row this catalog-sync job maintains uses
+ *  this same location for its baseline stock -- see syncShopifyCatalogForTenant's
+ *  doc comment. Deliberately the exact string
+ *  scripts/add-channel-listing.ts's own LOCATION_NAME default already uses,
+ *  so a SKU onboarded manually and a SKU picked up later by this automatic
+ *  sync land in the same `locations` row instead of silently fragmenting a
+ *  tenant's stock across two differently-named locations for the same
+ *  physical warehouse. */
+const CATALOG_SYNC_LOCATION_NAME = "Primary Warehouse";
+
+export interface CatalogSyncResult {
+  tenantId: string;
+  success: boolean;
+  variantsUpserted: number;
+  error: string | null;
+}
+
+export interface SyncShopifyCatalogParams {
+  /** Same two-pool pattern as SyncAmazonOrdersParams -- see its doc comment. */
+  appPool: Pool;
+  adminPool: Pool;
+}
+
+/**
+ * Closes the gap scripts/add-channel-listing.ts is a manual, one-SKU-at-a-time
+ * stopgap for: pulls every tenant's connected Shopify store's full product
+ * catalog (ShopifyConnector.pullProductCatalog) and upserts a
+ * products/channel_listings row per SKU'd variant, exactly the shape that
+ * script already creates by hand. Same discovery/per-tenant-isolation shape
+ * as syncShopifyOrders (enumerate active 'shopify' channel_connections via
+ * adminPool, sync each tenant via appPool, one tenant's failure never stops
+ * the rest) -- kept as its own function rather than folded into
+ * syncShopifyOrders since catalog sync and order sync are genuinely
+ * different operations with different failure/idempotency shapes, not just
+ * a parameter away from each other.
+ */
+export async function syncShopifyCatalog(params: SyncShopifyCatalogParams): Promise<CatalogSyncResult[]> {
+  const { appPool, adminPool } = params;
+  const inventoryService = new InventoryService(appPool);
+
+  const tenants = await adminPool.query<{ tenant_id: string }>(
+    `SELECT DISTINCT tenant_id FROM channel_connections WHERE channel = 'shopify' AND status = 'active'`,
+  );
+
+  const results: CatalogSyncResult[] = [];
+  for (const { tenant_id: tenantId } of tenants.rows) {
+    results.push(await syncShopifyCatalogForTenant(appPool, inventoryService, tenantId));
+  }
+  return results;
+}
+
+/** Convenience entrypoint mirroring {@link runAmazonOrderSyncJob} -- see its doc comment. */
+export async function runShopifyCatalogSyncJob(appPool: Pool, adminPool: Pool): Promise<CatalogSyncResult[]> {
+  return syncShopifyCatalog({ appPool, adminPool });
+}
+
+/**
+ * Syncs one tenant's catalog. Never throws -- same per-tenant error
+ * isolation as syncShopifyTenant/syncTenant.
+ *
+ * For each SKU'd variant: upsert `products` (keyed on its own
+ * (tenant_id, internal_sku) UNIQUE constraint, internal_sku defaulting to
+ * "shopify-<sku>" -- the exact convention scripts/add-channel-listing.ts
+ * also defaults to, so a SKU already onboarded manually is found and
+ * updated here, never duplicated) and `channel_listings` (keyed on its own
+ * (tenant_id, channel, channel_marketplace, external_id) UNIQUE constraint,
+ * external_id = the variant's InventoryItem gid -- distinct per variant, so
+ * two different SKUs never collide the way two empty external_ids would).
+ *
+ * Baseline stock is seeded via InventoryService.recordInventoryEvent with
+ * idempotency_key = "catalog-onboarding:<tenantId>:shopify:<sku>" --
+ * DELIBERATELY the same key prefix scripts/add-channel-listing.ts's own
+ * manual seeding uses, not a separate "catalog-sync:" prefix: idempotency_key
+ * is UNIQUE across the whole inventory_events table regardless of which
+ * script or job wrote it, so a SKU a human already onboarded by hand stays
+ * at whatever quantity they entered -- this job's own attempt to seed a
+ * baseline for that same SKU correctly becomes a no-op instead of adding a
+ * second, conflicting "initial" receipt on top of real, already-allocated
+ * stock. Every subsequent run of this job (for a SKU it or the manual
+ * script already baselined) only re-upserts the product/listing rows --
+ * cheap and idempotent on their own UNIQUE constraints -- without touching
+ * inventory again: this tenant's own ledger (orders, allocations, manual
+ * pushInventory) is the ongoing source of truth after the first baseline,
+ * not Shopify's currently-reported quantity.
+ */
+async function syncShopifyCatalogForTenant(
+  appPool: Pool,
+  inventoryService: InventoryService,
+  tenantId: string,
+): Promise<CatalogSyncResult> {
+  let variants: NormalizedShopifyProductVariant[];
+  try {
+    const connector = await createShopifyConnectorFromChannelConnection(appPool, tenantId);
+    variants = await connector.pullProductCatalog();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`Shopify catalog sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
+    return { tenantId, success: false, variantsUpserted: 0, error: message };
+  }
+
+  let variantsUpserted = 0;
+  for (const variant of variants) {
+    try {
+      const internalSku = `shopify-${variant.externalSku}`;
+
+      const { productId, locationId } = await withTenant(appPool, tenantId, async (client) => {
+        const product = await client.query<{ id: string }>(
+          `INSERT INTO products (tenant_id, internal_sku, name)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (tenant_id, internal_sku) DO UPDATE SET name = EXCLUDED.name
+           RETURNING id`,
+          [tenantId, internalSku, variant.title],
+        );
+        const productId = product.rows[0]!.id;
+
+        await client.query(
+          `INSERT INTO channel_listings
+             (tenant_id, product_id, channel, channel_marketplace, external_id, external_sku, listing_status)
+           VALUES ($1, $2, 'shopify', '', $3, $4, 'active')
+           ON CONFLICT (tenant_id, channel, channel_marketplace, external_id) DO UPDATE SET
+             product_id = EXCLUDED.product_id,
+             external_sku = EXCLUDED.external_sku,
+             listing_status = 'active',
+             updated_at = now()`,
+          [tenantId, productId, variant.inventoryItemId, variant.externalSku],
+        );
+
+        const existingLocation = await client.query<{ id: string }>(
+          `SELECT id FROM locations WHERE tenant_id = $1 AND name = $2 LIMIT 1`,
+          [tenantId, CATALOG_SYNC_LOCATION_NAME],
+        );
+        const locationId = existingLocation.rows[0]
+          ? existingLocation.rows[0].id
+          : (
+              await client.query<{ id: string }>(
+                `INSERT INTO locations (tenant_id, name, type) VALUES ($1, $2, 'warehouse') RETURNING id`,
+                [tenantId, CATALOG_SYNC_LOCATION_NAME],
+              )
+            ).rows[0]!.id;
+
+        return { productId, locationId };
+      });
+
+      await inventoryService.recordInventoryEvent({
+        tenantId,
+        productId,
+        locationId,
+        eventType: "receipt",
+        quantityDelta: variant.totalAvailable,
+        referenceType: "manual",
+        idempotencyKey: `catalog-onboarding:${tenantId}:shopify:${variant.externalSku}`,
+      });
+
+      variantsUpserted++;
+    } catch (err) {
+      // One bad variant (e.g. a genuinely malformed row) shouldn't abort
+      // the rest of this tenant's catalog -- same per-item isolation
+      // philosophy as syncTenant's own per-tenant isolation, one level
+      // deeper.
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(
+        `Shopify catalog sync: failed to upsert sku='${variant.externalSku}' for tenant ${tenantId}, continuing with remaining variants:`,
+        message,
+      );
+    }
+  }
+
+  return {
+    tenantId,
+    success: true,
+    variantsUpserted,
+    error: null,
+  };
 }
 
 // The recurring trigger this file's own header comment above flagged as

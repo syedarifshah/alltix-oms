@@ -26,6 +26,7 @@
     "shopify:sandbox-smoke-test": "tsx scripts/shopify-sandbox-smoke-test.ts",
     "shopify:order-sync-job": "tsx scripts/shopify-order-sync-job.ts",
     "shopify:order-sync-scheduler": "tsx scripts/shopify-order-sync-scheduler.ts",
+    "shopify:catalog-sync-job": "tsx scripts/shopify-catalog-sync-job.ts",
     "catalog:add-channel-listing": "tsx scripts/add-channel-listing.ts"
   },
   "devDependencies": {

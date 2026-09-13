@@ -198,6 +198,29 @@ interface OrdersQueryResponse {
   };
 }
 
+/** Raw shape of one node from the `productVariants` query used by
+ *  {@link pullProductCatalog} -- deliberately the same
+ *  `inventoryItem { id inventoryLevels(...) }` sub-selection
+ *  pushInventory()'s own variant lookup already uses and has verified live,
+ *  reused here rather than re-derived. */
+export interface RawProductVariantNode {
+  id: string;
+  sku: string | null;
+  title: string;
+  product: { title: string };
+  inventoryItem: {
+    id: string;
+    inventoryLevels: { edges: Array<{ node: { location: { id: string }; quantities: Array<{ quantity: number }> } }> };
+  };
+}
+
+interface ProductVariantsQueryResponse {
+  productVariants: {
+    edges: Array<{ cursor: string; node: RawProductVariantNode }>;
+    pageInfo: { hasNextPage: boolean; endCursor: string | null };
+  };
+}
+
 interface LocationsQueryResponse {
   locations: { edges: Array<{ node: { id: string; name: string } }> };
 }
@@ -290,6 +313,57 @@ export function normalizeShopifyOrder(order: ShopifyOrder): NormalizedOrder {
     lines: order.lineItems.edges.map((edge) => normalizeShopifyOrderLine(edge.node)),
     rawPayload: order,
   };
+}
+
+/** One SKU-mapped variant pulled by {@link ShopifyConnector.pullProductCatalog} --
+ *  the shape a catalog-sync job needs to upsert a `products`/`channel_listings`
+ *  row and seed a baseline stock level (mirrors the exact fields
+ *  `scripts/add-channel-listing.ts` already asks a human to supply by hand
+ *  for one SKU at a time). */
+export interface NormalizedShopifyProductVariant {
+  /** Matches pullOrders()'s own NormalizedOrderLine.externalSku exactly --
+   *  this is what channel_listings.external_sku must equal for
+   *  OrderService.persistPulledOrders to resolve an order line to a
+   *  product_id. */
+  externalSku: string;
+  /** Shopify's InventoryItem gid -- a natural per-variant identifier
+   *  distinct from the SKU, recorded as channel_listings.external_id (the
+   *  same "seller id / merchant id, channel-specific" column Amazon's ASIN
+   *  and Walmart's Item ID already use for their own per-listing id). */
+  inventoryItemId: string;
+  /** "<Product title> - <Variant title>", except Shopify's own default
+   *  "Default Title" variant name is dropped so a single-variant product
+   *  (the common case for a small seller) doesn't get a meaningless
+   *  " - Default Title" suffix on its internal products.name. */
+  title: string;
+  /** Summed across every Location this item has a reported level at.
+   *  Deliberately NOT per-location: this codebase's own `locations` table
+   *  (CLAUDE.md §2.4) has no established mapping to a *Shopify* location
+   *  yet, and real multi-location allocation is Phase 4 work (CLAUDE.md
+   *  §8) -- summing gives a correct single total rather than an arbitrary
+   *  single location's partial count, consistent with the "one location
+   *  per item" simplification pushInventory()/primaryLocationId() already
+   *  document. */
+  totalAvailable: number;
+}
+
+/** Pure normalization -- no network access -- so it's unit-testable without
+ *  a live store, unlike {@link ShopifyConnector.pullProductCatalog} itself.
+ *  Returns null for a variant with no SKU set: an order line can only
+ *  resolve to a product via channel_listings.external_sku (see
+ *  OrderService.persistPulledOrders -> insertOrderLines), so a SKU-less
+ *  variant has nothing this connector can map it by -- pullProductCatalog
+ *  counts and warns about these rather than silently dropping them. */
+export function normalizeShopifyProductVariant(node: RawProductVariantNode): NormalizedShopifyProductVariant | null {
+  if (!node.sku) return null;
+
+  const totalAvailable = node.inventoryItem.inventoryLevels.edges.reduce(
+    (sum, edge) => sum + (edge.node.quantities[0]?.quantity ?? 0),
+    0,
+  );
+  const title = node.title && node.title !== "Default Title" ? `${node.product.title} - ${node.title}` : node.product.title;
+
+  return { externalSku: node.sku, inventoryItemId: node.inventoryItem.id, title, totalAvailable };
 }
 
 /**
@@ -557,6 +631,118 @@ export class ShopifyConnector {
     }
 
     return normalizedOrders;
+  }
+
+  /**
+   * Pulls every product variant in the store (paginated the same
+   * cursor-loop way as pullOrders()) and normalizes each one that has a
+   * SKU set. Not part of the `ChannelConnector` interface -- no other
+   * connector in this package has an inbound "read the channel's own
+   * catalog" capability yet (Amazon/Walmart only ever push a listing OUT
+   * via submitListing/getFeedStatus), so this stays Shopify-specific
+   * rather than speculatively shaping a cross-channel interface method
+   * with only one implementation to validate it against -- the same
+   * "don't trust the interface until forced by a second implementation"
+   * discipline this file's own header comment already applies to
+   * `ChannelConnector` itself.
+   *
+   * This is what closes the gap `scripts/add-channel-listing.ts` is a
+   * manual stopgap for: instead of a human supplying one SKU/product
+   * name/quantity at a time, a catalog-sync job (packages/scheduler)
+   * calls this, upserts a products/channel_listings row per variant the
+   * same way that script does, and seeds each SKU's starting stock from
+   * Shopify's own currently-reported quantity -- the realistic version of
+   * "onboarding an existing store's catalog." See
+   * NormalizedShopifyProductVariant's own doc comment for the shape and
+   * why it sums quantity across locations rather than picking one.
+   *
+   * No `since`/incremental pagination the way pullOrders() has: a
+   * catalog's size doesn't grow unboundedly the way an order history does
+   * (CLAUDE.md §0's target of 50-5,000 orders/month is a very different
+   * scale than a seller's typical product count), so a full re-pull every
+   * run is simple and correct rather than a premature optimization -- a
+   * consuming job re-upserting a SKU it already knows about is a cheap,
+   * idempotent no-op (see syncShopifyCatalog in packages/scheduler).
+   * Requires the `read_products` scope (already documented in .env.example
+   * for pushInventory's own variant lookup).
+   *
+   * UNVERIFIED against a real store as written -- unlike pullOrders/
+   * pushInventory/confirmShipment (all live-debugged against
+   * alltixoms-dev.myshopify.com), this method has not yet been run against
+   * real Shopify infrastructure. It reuses the exact
+   * `inventoryItem { inventoryLevels(...) }` sub-selection pushInventory's
+   * own variant lookup already proved live, so the query shape itself is
+   * low-risk, but treat this the same way the rest of this file was
+   * treated before its own live debugging pass: run
+   * `npm run shopify:sandbox-smoke-test` (now exercises this too) against
+   * a real store before trusting it in a production cron.
+   */
+  async pullProductCatalog(): Promise<NormalizedShopifyProductVariant[]> {
+    const variants: NormalizedShopifyProductVariant[] = [];
+    let cursor: string | null = null;
+    let skippedNoSku = 0;
+
+    const query = `
+      query PulledProductVariants($cursor: String) {
+        productVariants(first: 100, after: $cursor) {
+          edges {
+            cursor
+            node {
+              id
+              sku
+              title
+              product { title }
+              inventoryItem {
+                id
+                inventoryLevels(first: 10) {
+                  edges { node { location { id } quantities(names: ["available"]) { quantity } } }
+                }
+              }
+            }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    `;
+
+    for (;;) {
+      const response: GraphQLResponse<ProductVariantsQueryResponse> = await this.graphql<ProductVariantsQueryResponse>(query, {
+        cursor,
+      });
+
+      const page = response.data?.productVariants;
+      if (!page) {
+        throw new Error(`Shopify productVariants query failed: ${ShopifyConnector.formatGraphQLErrors(response.errors, "unknown error")}`);
+      }
+      if (response.errors?.length) {
+        // Same partial-data tolerance as pullOrders() -- a restricted field
+        // elsewhere in the response shouldn't block variants that came
+        // back fine.
+        console.warn(
+          `Shopify productVariants query returned partial data: ${ShopifyConnector.formatGraphQLErrors(response.errors, "unknown error")}`,
+        );
+      }
+
+      for (const edge of page.edges) {
+        const normalized = normalizeShopifyProductVariant(edge.node);
+        if (normalized) {
+          variants.push(normalized);
+        } else {
+          skippedNoSku++;
+        }
+      }
+
+      if (!page.pageInfo.hasNextPage) break;
+      cursor = page.pageInfo.endCursor;
+    }
+
+    if (skippedNoSku > 0) {
+      console.warn(
+        `Shopify pullProductCatalog: skipped ${skippedNoSku} variant(s) with no SKU set -- cannot map an unSKU'd variant to channel_listings.external_sku.`,
+      );
+    }
+
+    return variants;
   }
 
   /**

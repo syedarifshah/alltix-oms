@@ -62,6 +62,22 @@ async function main(): Promise<void> {
     );
   }
 
+  console.log("\nPulling the store's product catalog (pullProductCatalog)...");
+  const variants = await connector.pullProductCatalog();
+  console.log(`Received ${variants.length} SKU'd variant(s).`);
+  for (const variant of variants) {
+    console.log(
+      `  - sku=${variant.externalSku} title="${variant.title}" totalAvailable=${variant.totalAvailable} ` +
+        `inventoryItemId=${variant.inventoryItemId}`,
+    );
+  }
+  if (variants.length === 0) {
+    console.log(
+      "  (zero variants either means a fresh store with no products yet, or every variant is missing a SKU " +
+        "-- check the warning above for a skipped-count if so.)",
+    );
+  }
+
   const testSku = process.env.SHOPIFY_SANDBOX_TEST_SKU;
   if (testSku) {
     console.log(`\nSHOPIFY_SANDBOX_TEST_SKU set -- pushing inventory for sku '${testSku}'...`);

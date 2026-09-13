@@ -8,6 +8,7 @@
   "references": [
     { "path": "../channel-connectors" },
     { "path": "../db" },
+    { "path": "../inventory-service" },
     { "path": "../order-service" },
     { "path": "../rules-engine" },
     { "path": "../shared" }

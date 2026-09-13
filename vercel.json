@@ -10,6 +10,10 @@
       "schedule": "0 4 * * *"
     },
     {
+      "path": "/api/cron/shopify-catalog-sync",
+      "schedule": "30 4 * * *"
+    },
+    {
       "path": "/api/cron/shopify-order-sync",
       "schedule": "0 5 * * *"
     }
