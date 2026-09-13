@@ -432,11 +432,11 @@ succeeded or failed."
   without touching inventory again, since the tenant's own ledger is the ongoing source
   of truth after the first baseline. A variant with no SKU set can't be mapped at all
   and is skipped with a warning (`pullProductCatalog`'s own doc comment) — that edge
-  case stays manual. **Unverified against a real store** as written, unlike
-  `pullOrders`/`pushInventory`/`confirmShipment` (all live-debugged already) — it reuses
-  the exact `inventoryItem { inventoryLevels(...) }` shape those already proved live,
-  but run `npm run shopify:sandbox-smoke-test` (now exercises this too) against a real
-  store before trusting it in production.
+  case stays manual. **Confirmed against a real dev store** (`npm run
+  shopify:sandbox-smoke-test`) — correctly pulled every SKU'd variant with the right
+  quantities and skipped this store's SKU-less demo variants with the expected warning,
+  on the first live attempt (unlike `pullOrders`/`pushInventory`/`confirmShipment`, each
+  of which needed multiple rounds of live debugging — see their own history above).
 
 ## 5. Technology Stack
 

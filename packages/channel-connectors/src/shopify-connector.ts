@@ -666,16 +666,17 @@ export class ShopifyConnector {
    * Requires the `read_products` scope (already documented in .env.example
    * for pushInventory's own variant lookup).
    *
-   * UNVERIFIED against a real store as written -- unlike pullOrders/
-   * pushInventory/confirmShipment (all live-debugged against
-   * alltixoms-dev.myshopify.com), this method has not yet been run against
-   * real Shopify infrastructure. It reuses the exact
+   * CONFIRMED against a real dev store (alltixoms-dev.myshopify.com,
+   * `npm run shopify:sandbox-smoke-test`): correctly pulled every SKU'd
+   * variant with the right quantities and skipped 22 SKU-less demo
+   * variants (this store's stock Shopify sample products) with the
+   * expected warning, on the very first live attempt -- no fix needed,
+   * unlike pullOrders/pushInventory/confirmShipment, each of which took
+   * multiple rounds of live debugging (see their own doc comments). Most
+   * likely because this method reuses the exact
    * `inventoryItem { inventoryLevels(...) }` sub-selection pushInventory's
-   * own variant lookup already proved live, so the query shape itself is
-   * low-risk, but treat this the same way the rest of this file was
-   * treated before its own live debugging pass: run
-   * `npm run shopify:sandbox-smoke-test` (now exercises this too) against
-   * a real store before trusting it in a production cron.
+   * own variant lookup already proved live, rather than untested new
+   * query shape.
    */
   async pullProductCatalog(): Promise<NormalizedShopifyProductVariant[]> {
     const variants: NormalizedShopifyProductVariant[] = [];
