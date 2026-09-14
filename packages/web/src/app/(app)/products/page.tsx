@@ -18,7 +18,7 @@ interface ProductRow {
 }
 
 interface ProductsPageProps {
-  searchParams: Promise<{ error?: string; shopify_listing_created?: string }>;
+  searchParams: Promise<{ error?: string; shopify_listing_created?: string; product_created?: string }>;
 }
 
 /**
@@ -43,7 +43,7 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
 
   const pool = getAppPool();
   const tenantId = await resolveTenantId(pool, authContext.clerkUserId);
-  const { error, shopify_listing_created: shopifyListingCreated } = await searchParams;
+  const { error, shopify_listing_created: shopifyListingCreated, product_created: productCreated } = await searchParams;
 
   if (!tenantId) {
     return (
@@ -86,7 +86,20 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
           storefront). Starting stock was synced from your current available-to-sell quantity.
         </div>
       )}
+      {productCreated === "1" && <div className="alert alert-success">Product added to your catalog.</div>}
       {error && <div className="alert alert-danger">{describeError(error)}</div>}
+
+      <details className="stack" style={{ marginBottom: 16 }}>
+        <summary>Add a product</summary>
+        {/* Every existing product so far arrived via catalog sync or order persistence --
+            this is the only way to get a brand-new internal product into the catalog on
+            purpose, e.g. specifically to try the "List on Shopify" flow below on it. */}
+        <form action="/api/products/create" method="POST" className="row" style={{ gap: 6, marginTop: 8 }}>
+          <input type="text" name="internalSku" placeholder="internal-sku-001" required />
+          <input type="text" name="name" placeholder="Product name" required />
+          <button type="submit">Add product</button>
+        </form>
+      </details>
 
       {!hasActiveShopifyConnection && (
         <div className="alert alert-info">
@@ -154,6 +167,11 @@ function CreateListingForm({ productId }: { productId: string }): ReactElement {
 }
 
 function describeError(error: string): string {
+  if (error === "product_missing_fields") return "Enter both a SKU and a name before submitting.";
+  if (error === "product_sku_already_exists") return "A product with that SKU already exists.";
+  if (error.startsWith("product_create_failed:")) {
+    return `Could not add that product: ${error.slice("product_create_failed:".length)}`;
+  }
   if (error === "shopify_listing_missing_fields") return "Enter a price before submitting.";
   if (error === "shopify_listing_invalid_price") return "Price must look like 19.99 (up to two decimal places).";
   if (error === "shopify_listing_product_not_found") return "That product could not be found.";
