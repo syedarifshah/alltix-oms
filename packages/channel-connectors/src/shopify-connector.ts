@@ -1345,16 +1345,20 @@ export class ShopifyConnector {
    * "don't trust the interface, add a channel-specific method instead" call
    * this file already made for pullProductCatalog().
    *
-   * UNVERIFIED against a real store as written -- this connector's usual
-   * discipline (see the class doc comment): transcribed from shopify.dev,
-   * not yet exercised live. The `productOptions`/`optionValues` shape below
-   * (a single "Title" option valued "Default Title", Shopify's long-standing
-   * convention for a product with no real configurable options) is the part
-   * most likely to be wrong if this fails on first live attempt -- no
-   * worked single-variant productSet example was found during research, only
-   * the field reference. The opt-in step in shopify-sandbox-smoke-test.ts
-   * (SHOPIFY_SANDBOX_TEST_CREATE_LISTING_SKU) exists for exactly that live
-   * verification, not run yet.
+   * CONFIRMED against a real dev store -- succeeded end-to-end from the
+   * /products UI on the first live attempt once the app's access token
+   * actually carried write_products. The `productOptions`/`optionValues`
+   * shape (a single "Title" option valued "Default Title") was the part
+   * flagged as riskiest pre-verification, since no worked single-variant
+   * productSet example was found during research; it worked as written.
+   *
+   * Real-world gotcha this surfaced, not specific to this method's own
+   * logic: adding write_products to a custom app and saving does not
+   * retroactively grant it to an already-issued access token -- the
+   * existing token keeps failing with ACCESS_DENIED ("productSet failed")
+   * until the tenant reinstalls the app and reconnects with the newly
+   * issued token (CLAUDE.md §4.5 records this under "Outbound listing
+   * creation").
    */
   async createListing(input: ShopifyListingSubmission): Promise<ShopifyListingResult> {
     // Shopify handles must be URL-safe; derived from the SKU (stable,

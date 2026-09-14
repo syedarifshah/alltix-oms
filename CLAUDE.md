@@ -532,11 +532,18 @@ succeeded or failed."
     Shopify-side create succeeds but the local DB insert fails afterward, so a retry
     from `/products` doesn't blindly create a second Shopify product for the same
     internal product.
-  - **UNVERIFIED against a real store as written**: `createListing()` is transcribed
-    from shopify.dev with no worked single-variant `productSet` example found during
-    research — the `productOptions`/`optionValues` shape is the riskiest unverified
-    part. The opt-in step in `shopify-sandbox-smoke-test.ts`
-    (`SHOPIFY_SANDBOX_TEST_CREATE_LISTING_SKU`) exists for exactly that, not run yet.
+  - **Confirmed against a real dev store**: `createListing()` succeeded end-to-end from
+    the `/products` UI against a real custom app -- `productSet` accepted the
+    single-variant `productOptions`/`optionValues` shape (the part flagged as riskiest
+    pre-verification) on the first attempt once the app actually had `write_products`
+    granted. One real-world gotcha worth recording: adding a scope to a custom app and
+    saving it does **not** retroactively grant that scope to an *already-issued* Admin
+    API access token -- the existing token silently keeps failing with
+    `ACCESS_DENIED`/`productSet failed` until the tenant reinstalls the custom app (or
+    otherwise gets Shopify to reissue the token) and reconnects with the new one. This
+    app has no way to detect or explain that distinction itself; a tenant who adds
+    `write_products` after already connecting will hit this exact confusing error and
+    need to reconnect with a fresh token.
 
 ## 5. Technology Stack
 
