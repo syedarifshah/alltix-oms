@@ -23,6 +23,11 @@ import { ShopifyConnector } from "../packages/channel-connectors/src/shopify-con
 //      (opt-in for the same reason: this creates a real fulfillment against
 //      a real order, so it needs an order the operator picked on purpose --
 //      e.g. a throwaway test order placed in the dev store's checkout).
+//   5. createListing() -- only if SHOPIFY_SANDBOX_TEST_CREATE_LISTING_SKU is
+//      set (opt-in: this creates a brand-new, real product on the dev store
+//      every run -- there's no dedupe/upsert, see createListing()'s own doc
+//      comment -- so it needs a SKU the operator chose on purpose, not one
+//      that runs on every smoke-test invocation).
 //
 // Run with: npm run shopify:sandbox-smoke-test
 
@@ -105,6 +110,33 @@ async function main(): Promise<void> {
     console.log(
       "SHOPIFY_SANDBOX_TEST_ORDER_ID not set -- skipping confirmShipment (opt-in, needs a real order id " +
         "from the dev store, see this file's header comment).",
+    );
+  }
+
+  const createListingSku = process.env.SHOPIFY_SANDBOX_TEST_CREATE_LISTING_SKU;
+  if (createListingSku) {
+    console.log(`\nSHOPIFY_SANDBOX_TEST_CREATE_LISTING_SKU set -- creating a new listing for sku '${createListingSku}'...`);
+    const result = await connector.createListing({
+      internalSku: createListingSku,
+      title: `Smoke test listing (${createListingSku})`,
+      price: "9.99",
+    });
+    console.log("createListing result:");
+    console.log(`  success: ${result.success}`);
+    if (result.productGid) console.log(`  productGid: ${result.productGid}`);
+    if (result.inventoryItemGid) console.log(`  inventoryItemGid: ${result.inventoryItemGid}`);
+    if (result.error) console.log(`  error: ${result.error}`);
+    if (!result.success) {
+      throw new Error("createListing did not succeed -- see result above.");
+    }
+    console.log(
+      "  (created as a draft product, not published to any sales channel -- see createListing()'s own doc " +
+        "comment; publish it manually from the dev store's admin if you want to see it live.)",
+    );
+  } else {
+    console.log(
+      "\nSHOPIFY_SANDBOX_TEST_CREATE_LISTING_SKU not set -- skipping createListing (opt-in, see this file's " +
+        "header comment).",
     );
   }
 

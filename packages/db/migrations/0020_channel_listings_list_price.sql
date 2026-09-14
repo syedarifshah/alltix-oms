@@ -1,0 +1,14 @@
+-- Adds a per-channel-listing price, needed for the outbound "create a new
+-- listing" flow (packages/channel-connectors/src/shopify-connector.ts's
+-- createListing(), packages/web's /api/channels/shopify/listings route).
+--
+-- Deliberately on channel_listings, not products: a multichannel seller
+-- commonly prices the same internal product differently per channel (a
+-- Shopify DTC price vs. an Amazon price, say) -- CLAUDE.md §2.1's products
+-- table is the channel-agnostic internal record on purpose, and §2.3's
+-- order_lines already tracks the *realized* per-order price separately from
+-- any list price. Nullable: every existing row (pulled FROM a channel via
+-- pullOrders/pullProductCatalog, which have never had a price to record)
+-- simply has none yet -- only a listing created THROUGH this app's own
+-- outbound flow sets it going forward. Expand-only per CLAUDE.md §9.
+ALTER TABLE channel_listings ADD COLUMN list_price NUMERIC;

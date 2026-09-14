@@ -492,6 +492,46 @@ export function normalizeShopifyOrderWebhookPayload(payload: ShopifyOrderWebhook
   };
 }
 
+/** Input for {@link ShopifyConnector.createListing} -- the minimum data
+ *  needed to create a brand-new, single-variant Shopify product from an
+ *  internal product (packages/web's `/api/channels/shopify/listings` route
+ *  supplies these from `products.internal_sku`/`products.name` plus a price
+ *  the tenant enters, persisted to the new `channel_listings.list_price`
+ *  column -- see migration 0020). Deliberately narrower than a full
+ *  "push anything" shape: v1 scope is single-variant only, matching every
+ *  other per-SKU simplification this connector already makes
+ *  (primaryLocationId, the "one location per item" assumption in
+ *  pushInventory). */
+export interface ShopifyListingSubmission {
+  internalSku: string;
+  title: string;
+  /** A Money-scalar-compatible string, e.g. "19.99" -- the same string
+   *  convention NormalizedOrderLine.unitPrice already uses, not a float
+   *  (floats and money don't mix). */
+  price: string;
+}
+
+export interface ShopifyListingResult {
+  success: boolean;
+  productGid: string | null;
+  /** The single default variant's InventoryItem gid -- the same id
+   *  pullProductCatalog()/pushInventory() use as channel_listings.external_id,
+   *  so a listing created here is indistinguishable in storage from one
+   *  discovered later by catalog sync. */
+  inventoryItemGid: string | null;
+  error: string | null;
+}
+
+interface ProductSetResponse {
+  productSet: {
+    product: {
+      id: string;
+      variants: { edges: Array<{ node: { id: string; sku: string | null; inventoryItem: { id: string } } }> };
+    } | null;
+    userErrors: GraphQLUserError[];
+  };
+}
+
 /**
  * Shopify Admin API connector. Implements authenticate()/pullOrders()/
  * pushInventory()/confirmShipment() -- see this file's header comment for
@@ -1252,5 +1292,136 @@ export class ShopifyConnector {
     if (userErrors.length > 0) {
       throw new Error(`Shopify fulfillmentCreateV2 rejected: ${ShopifyConnector.formatUserErrors(userErrors, "unknown error")}`);
     }
+  }
+
+  /**
+   * Creates a brand-new, single-variant Shopify product via `productSet`
+   * (shopify.dev: "If your app syncs product data from an external source,
+   * use the productSet mutation to add data in a single operation" -- the
+   * modern replacement for the older productCreate + productVariantsBulkCreate
+   * + inventorySetQuantities sequence, doing the same thing in one call).
+   * Requires the `write_products` scope, which no other method in this
+   * class has needed before now (see .env.example's Shopify scope list).
+   * https://shopify.dev/docs/api/admin-graphql/latest/mutations/productSet
+   *
+   * SCOPE (an explicit decision, matching this file's "don't build
+   * speculatively" discipline):
+   *  - Single-variant only, one default option ("Title" / "Default Title")
+   *    -- no multi-variant/option support. Same per-SKU simplification
+   *    every other method in this class already makes.
+   *  - Does NOT publish the product to any sales channel. Shopify's newer
+   *    product model needs a *separate* `publishablePublish` mutation
+   *    (against a specific publicationId, e.g. "Online Store") before a
+   *    product is actually visible/purchasable -- `status: ACTIVE` on
+   *    productSet alone is not enough (shopify.dev: "A product won't appear
+   *    on a sales channel until published to that channel's publication,
+   *    regardless of its active status"). That mutation needs its own
+   *    `write_publications` scope, and whether a *custom* app (this
+   *    connector's entire auth model -- see this file's header comment) can
+   *    even be granted that scope, or has a "current channel" of its own to
+   *    publish to at all, is genuinely unclear from shopify.dev's docs and
+   *    untested. Rather than guess at an extra scope and a publish call
+   *    that might silently fail for exactly the app type this connector
+   *    targets, this method stops at creating an ACTIVE-status product and
+   *    documents the gap instead: the tenant makes it visible with one
+   *    click from their own Shopify admin (Products -> the new product ->
+   *    Publish). This is *why* the caller should record
+   *    channel_listings.listing_status as 'draft', not 'active', for a
+   *    listing created this way -- unlike a listing catalog sync discovers
+   *    (recorded 'active' because it was *already* live on Shopify by
+   *    definition), one created here exists but isn't confirmed published.
+   *  - Does not seed initial inventory itself -- the caller is expected to
+   *    follow a successful createListing() with the existing
+   *    pushInventory(sku, currentAvailableQty) call, the same absolute-set
+   *    write every other inventory sync in this app already uses, rather
+   *    than this method inventing a second inventory-writing code path.
+   *
+   * Not part of the shared ChannelConnector interface's submitListing()/
+   * getFeedStatus() pair -- that shape is Walmart's async
+   * submit-a-feed-then-poll pattern (see WalmartConnector.submitListing's
+   * own doc comment), and productSet is a single synchronous call with no
+   * feed/polling concept at all, so forcing it through a `{feedId}` handle
+   * would invent a fake pending state that never actually happens. Same
+   * "don't trust the interface, add a channel-specific method instead" call
+   * this file already made for pullProductCatalog().
+   *
+   * UNVERIFIED against a real store as written -- this connector's usual
+   * discipline (see the class doc comment): transcribed from shopify.dev,
+   * not yet exercised live. The `productOptions`/`optionValues` shape below
+   * (a single "Title" option valued "Default Title", Shopify's long-standing
+   * convention for a product with no real configurable options) is the part
+   * most likely to be wrong if this fails on first live attempt -- no
+   * worked single-variant productSet example was found during research, only
+   * the field reference. The opt-in step in shopify-sandbox-smoke-test.ts
+   * (SHOPIFY_SANDBOX_TEST_CREATE_LISTING_SKU) exists for exactly that live
+   * verification, not run yet.
+   */
+  async createListing(input: ShopifyListingSubmission): Promise<ShopifyListingResult> {
+    // Shopify handles must be URL-safe; derived from the SKU (stable,
+    // unique per tenant) rather than the title (which a merchant could
+    // reuse across products, and which may contain characters a handle
+    // can't). Falls back to letting Shopify auto-generate one from the
+    // title (by omitting the field, dropped from the JSON body by
+    // JSON.stringify) if the SKU happens to reduce to nothing usable.
+    const handle = input.internalSku
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+
+    const response = await this.graphql<ProductSetResponse>(
+      `mutation ($input: ProductSetInput!) {
+        productSet(input: $input, synchronous: true) {
+          product {
+            id
+            variants(first: 1) {
+              edges { node { id sku inventoryItem { id } } }
+            }
+          }
+          userErrors { field message }
+        }
+      }`,
+      {
+        input: {
+          title: input.title,
+          handle: handle || undefined,
+          status: "ACTIVE",
+          productOptions: [{ name: "Title", values: [{ name: "Default Title" }] }],
+          variants: [
+            {
+              price: input.price,
+              sku: input.internalSku,
+              optionValues: [{ optionName: "Title", name: "Default Title" }],
+            },
+          ],
+        },
+      },
+    );
+
+    if (response.errors) {
+      return {
+        success: false,
+        productGid: null,
+        inventoryItemGid: null,
+        error: `Shopify productSet failed: ${ShopifyConnector.formatGraphQLErrors(response.errors, "unknown error")}`,
+      };
+    }
+
+    const userErrors = response.data?.productSet.userErrors ?? [];
+    if (userErrors.length > 0) {
+      return {
+        success: false,
+        productGid: null,
+        inventoryItemGid: null,
+        error: `Shopify productSet rejected: ${ShopifyConnector.formatUserErrors(userErrors, "unknown error")}`,
+      };
+    }
+
+    const product = response.data?.productSet.product;
+    const variant = product?.variants.edges[0]?.node;
+    if (!product || !variant) {
+      return { success: false, productGid: null, inventoryItemGid: null, error: "Shopify productSet returned no product/variant" };
+    }
+
+    return { success: true, productGid: product.id, inventoryItemGid: variant.inventoryItem.id, error: null };
   }
 }

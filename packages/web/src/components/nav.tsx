@@ -4,8 +4,11 @@ import type { ReactElement } from "react";
 import { ThemeToggle } from "@/components/theme-toggle";
 
 /**
- * Static top nav across every page. Amazon-only MVP (CLAUDE.md §0): no
- * Walmart/Shopify/eBay entries here on purpose.
+ * Static top nav across every page. Channel connectors (Amazon, Shopify)
+ * still don't get their own nav entries -- they're configured from
+ * /settings/channels, not a dedicated per-channel page -- but /products now
+ * does (added alongside outbound Shopify listing creation) since it's a
+ * page in its own right, not a channel settings screen.
  *
  * An async Server Component (not just a static one) so it can check the
  * same test-auth-bypass condition src/lib/auth-context.ts and src/proxy.ts
@@ -41,6 +44,7 @@ export async function Nav(): Promise<ReactElement> {
       </a>
       <a href="/orders">Orders</a>
       <a href="/inventory">Inventory</a>
+      <a href="/products">Products</a>
       <a href="/picklists">Picklists</a>
       <a href="/rules">Rules</a>
       <a href="/settings/billing">Billing</a>

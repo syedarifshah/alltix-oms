@@ -377,12 +377,14 @@ succeeded or failed."
   is on a third-party-fulfilled product (e.g. Shopify's own demo "3p Fulfilled"
   product) needs the third-party scope specifically; merchant-managed is the
   default/simplest case and what a normal seller-fulfilled product needs.
-- **Not implemented**: `submitListing`/`getFeedStatus` — `NormalizedListing` lacks
-  fields Shopify's product-creation mutations require (title, a price, at least one
-  variant), and no "create a listing" UI exists anywhere in the app yet. Real-time
-  webhooks (formerly listed here as not built, `subscribeToEvents` still a deliberate
-  no-op on the connector itself) are now wired in as application/web-layer
-  infrastructure instead — see the new paragraph below.
+- **Still not implemented**: the shared `ChannelConnector.submitListing`/
+  `getFeedStatus` interface itself — `NormalizedListing` still lacks the fields
+  Shopify's product-creation mutations require (title, a price, at least one variant),
+  and nothing forces `createListing()` (see the new paragraph below) into that
+  async-feed shape, the same reasoning `pullProductCatalog()` already used. Amazon/
+  Walmart still have no outbound listing-creation path at all. `subscribeToEvents` is
+  still a deliberate no-op on the connector itself — real-time webhooks are wired in as
+  application/web-layer infrastructure instead, see the paragraph below.
 - **Wired into the app** (migration `0019_channel_connections_shopify.sql`): a
   Shopify row in `channel_connections` reuses the same table Amazon's OAuth flow
   populates, with `lwa_client_id`/`encrypted_client_secret`/`encrypted_refresh_token`
@@ -493,6 +495,48 @@ succeeded or failed."
     `registerWebhooks()` is transcribed from shopify.dev, not yet exercised live — the
     opt-in step in `shopify-sandbox-smoke-test.ts`
     (`SHOPIFY_SANDBOX_TEST_WEBHOOK_CALLBACK_URL`) exists for exactly that, not run yet.
+- **Outbound listing creation** (`ShopifyConnector.createListing()`, `POST
+  /api/channels/shopify/listings`, `/products` page): closes part of the "Not
+  implemented" gap above for Shopify specifically — a tenant can now push an existing
+  internal `products` row out as a brand-new Shopify product, rather than this
+  connector only ever pulling listings in. Single call to `productSet(...,
+  synchronous: true)`, the modern replacement for the old productCreate +
+  productVariantsBulkCreate + inventorySetQuantities sequence.
+  - **v1 scope, deliberately narrow**: one variant only (`"Title"`/`"Default Title"`),
+    no options/variant matrix — `ShopifyListingSubmission` only carries
+    `internalSku`/`title`/`price`. `status: "ACTIVE"` on the product does **not** make
+    it visible on any storefront: publishing to a sales channel is a separate
+    `publishablePublish` mutation needing `write_publications`, deliberately not called
+    here since it's unconfirmed whether a custom app can even be granted that scope —
+    the tenant does that one step by hand in their own Shopify admin. `channel_listings.
+    listing_status` reflects this: rows from this flow are inserted as `'draft'`, never
+    `'active'` — a semantic split from every *inbound*-discovered listing (catalog sync,
+    `add-channel-listing.ts`), which use `'active'` to mean "confirmed already live on
+    the channel."
+  - **Price storage**: new nullable `channel_listings.list_price` column (migration
+    `0020_channel_listings_list_price.sql`) — deliberately not on `products`, since
+    §2.1's product master is channel-agnostic on purpose and a multichannel seller
+    commonly prices the same product differently per channel.
+  - **Starting stock**: not part of `createListing()` itself — the route
+    (`/api/channels/shopify/listings`) makes a best-effort follow-up call to the
+    existing `pushInventory()` after a successful create, seeding the new listing with
+    this tenant's current `SUM(inventory_levels.available)` rather than leaving it at
+    Shopify's default of zero. This is `pushInventory()`'s first real caller — it was
+    previously flagged in this file as built but never wired into any trigger.
+  - **Duplicate-create guard**: `productSet` with no `identifier` always creates a new
+    product — it doesn't upsert by SKU the way a *pulled-in* listing's
+    `(tenant_id, channel, channel_marketplace, external_id)` UNIQUE constraint makes
+    naturally idempotent. The route checks for an existing `channel_listings` row for
+    `(tenant_id, product_id, channel='shopify')` before calling Shopify at all, and has
+    a distinct `shopify_listing_created_but_not_recorded:<productGid>` error path if the
+    Shopify-side create succeeds but the local DB insert fails afterward, so a retry
+    from `/products` doesn't blindly create a second Shopify product for the same
+    internal product.
+  - **UNVERIFIED against a real store as written**: `createListing()` is transcribed
+    from shopify.dev with no worked single-variant `productSet` example found during
+    research — the `productOptions`/`optionValues` shape is the riskiest unverified
+    part. The opt-in step in `shopify-sandbox-smoke-test.ts`
+    (`SHOPIFY_SANDBOX_TEST_CREATE_LISTING_SKU`) exists for exactly that, not run yet.
 
 ## 5. Technology Stack
 
