@@ -1,6 +1,6 @@
 import { schedule, type ScheduledTask } from "node-cron";
 import type { Pool } from "pg";
-import { runAmazonOrderSyncJob, runShopifyOrderSyncJob, type TenantSyncResult } from "./index.js";
+import { runAmazonOrderSyncJob, runShopifyOrderSyncJob, runWalmartOrderSyncJob, type TenantSyncResult } from "./index.js";
 
 // The "how it gets triggered" layer packages/scheduler/src/index.ts's own
 // header comment flagged as separate, later infrastructure work -- this is
@@ -261,6 +261,109 @@ export function startShopifyOrderSyncScheduler(options: ShopifyOrderSyncSchedule
   console.log(
     JSON.stringify({
       event: "shopify_order_sync_scheduler_started",
+      cronExpression,
+      timezone: timezone ?? "system default",
+      at: new Date().toISOString(),
+    }),
+  );
+
+  return task;
+}
+
+// -- Walmart counterparts. Same parallel-function call as Shopify's above --
+// still not enough shared shape to justify a generic abstraction with three
+// channels wired this way, and walmart_order_sync_run needs to stay its own
+// distinguishable log event same as the other two.
+
+const DEFAULT_WALMART_CRON_EXPRESSION = "*/5 * * * *"; // every 5 minutes, same conservative default as Amazon/Shopify's
+
+export interface WalmartOrderSyncSchedulerOptions {
+  appPool: Pool;
+  adminPool: Pool;
+  cronExpression?: string;
+  timezone?: string;
+  maxRetries?: number;
+  retryDelayMs?: number;
+}
+
+/** Walmart counterpart to {@link runShopifyOnceWithRetry} -- see its doc
+ *  comment for the retry contract (systemic-failure-only; a single tenant's
+ *  failure is already caught and returned as a non-throwing result inside
+ *  runWalmartOrderSyncJob's own syncWalmartTenant). */
+export async function runWalmartOnceWithRetry(
+  appPool: Pool,
+  adminPool: Pool,
+  maxRetries: number = DEFAULT_MAX_RETRIES,
+  retryDelayMs: number = DEFAULT_RETRY_DELAY_MS,
+): Promise<void> {
+  const startedAt = Date.now();
+  const runId = new Date(startedAt).toISOString();
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      const results = await runWalmartOrderSyncJob(appPool, adminPool);
+      console.log(
+        JSON.stringify({
+          event: "walmart_order_sync_run",
+          runId,
+          attempt,
+          success: true,
+          durationMs: Date.now() - startedAt,
+          ...summarizeResults(results),
+        }),
+      );
+      return;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const willRetry = attempt <= maxRetries;
+      console.error(
+        JSON.stringify({
+          event: "walmart_order_sync_run",
+          runId,
+          attempt,
+          success: false,
+          durationMs: Date.now() - startedAt,
+          error: message,
+          willRetry,
+        }),
+      );
+      if (!willRetry) return;
+      await sleep(retryDelayMs * attempt);
+    }
+  }
+}
+
+/** Walmart counterpart to {@link startShopifyOrderSyncScheduler} -- same
+ *  noOverlap reasoning (two overlapping passes could race to write the same
+ *  tenant's channel_connections.last_order_sync_at row). A separate
+ *  node-cron task from Amazon's and Shopify's, so all three channels'
+ *  polling cadences can be tuned independently and started/stopped on their
+ *  own. */
+export function startWalmartOrderSyncScheduler(options: WalmartOrderSyncSchedulerOptions): ScheduledTask {
+  const {
+    appPool,
+    adminPool,
+    cronExpression = DEFAULT_WALMART_CRON_EXPRESSION,
+    timezone,
+    maxRetries = DEFAULT_MAX_RETRIES,
+    retryDelayMs = DEFAULT_RETRY_DELAY_MS,
+  } = options;
+
+  const task = schedule(cronExpression, () => runWalmartOnceWithRetry(appPool, adminPool, maxRetries, retryDelayMs), {
+    name: "walmart-order-sync",
+    noOverlap: true,
+    timezone,
+  });
+
+  task.on("execution:overlap", () => {
+    console.warn(
+      JSON.stringify({ event: "walmart_order_sync_skipped_overlap", at: new Date().toISOString() }),
+    );
+  });
+
+  console.log(
+    JSON.stringify({
+      event: "walmart_order_sync_scheduler_started",
       cronExpression,
       timezone: timezone ?? "system default",
       at: new Date().toISOString(),

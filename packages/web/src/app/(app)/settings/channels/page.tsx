@@ -32,6 +32,18 @@ interface ShopifyConnectionRow {
   has_webhook_secret: boolean;
 }
 
+/** Walmart's row, like Shopify's, has no marketplace concept worth showing
+ *  (stored as '' -- see loadWalmartCredentialsFromChannelConnection's own
+ *  doc comment in walmart-connector.ts). external_account_id is the
+ *  tenant's own Walmart clientId, not an independent seller id -- see the
+ *  connect route's comment for why that reuse is deliberate. */
+interface WalmartConnectionRow {
+  external_account_id: string;
+  status: string;
+  created_at: string;
+  last_order_sync_at: string | null;
+}
+
 /** Sandbox vs. production is never stored as its own column (see
  *  packages/db/migrations/0012_channel_connections.sql) -- the connection's
  *  own lwa_client_id is compared against this process's known sandbox/
@@ -75,7 +87,7 @@ export default async function ChannelsSettingsPage({
     );
   }
 
-  const { connection, shopifyConnection } = await withTenant(pool, tenantId, async (client) => {
+  const { connection, shopifyConnection, walmartConnection } = await withTenant(pool, tenantId, async (client) => {
     const amazonResult = await client.query<ChannelConnectionRow>(
       `SELECT external_account_id, marketplace, status, created_at, last_order_sync_at, lwa_client_id
          FROM channel_connections
@@ -91,19 +103,36 @@ export default async function ChannelsSettingsPage({
         ORDER BY created_at DESC
         LIMIT 1`,
     );
-    return { connection: amazonResult.rows[0] ?? null, shopifyConnection: shopifyResult.rows[0] ?? null };
+    const walmartResult = await client.query<WalmartConnectionRow>(
+      `SELECT external_account_id, status, created_at, last_order_sync_at
+         FROM channel_connections
+        WHERE channel = 'walmart'
+        ORDER BY created_at DESC
+        LIMIT 1`,
+    );
+    return {
+      connection: amazonResult.rows[0] ?? null,
+      shopifyConnection: shopifyResult.rows[0] ?? null,
+      walmartConnection: walmartResult.rows[0] ?? null,
+    };
   });
 
   const isConnected = connection?.status === "active";
   const environment = connection ? classifyEnvironment(connection.lwa_client_id) : null;
   const isShopifyConnected = shopifyConnection?.status === "active";
+  const isWalmartConnected = walmartConnection?.status === "active";
 
   return (
     <main className="page">
       <h1>Channels</h1>
-      <p className="subtitle">Amazon and Shopify connectors — Walmart/eBay aren&apos;t built yet.</p>
+      <p className="subtitle">
+        Amazon, Shopify, and Walmart connectors — eBay isn&apos;t built yet. Walmart&apos;s wiring is complete but
+        UNVERIFIED against real Walmart infrastructure (no self-serve sandbox exists the way Shopify/Amazon have
+        one) — connecting will correctly fail here until a real clientId/clientSecret pair is entered.
+      </p>
 
       {connected === "amazon" && <div className="alert alert-success">Amazon connected.</div>}
+      {connected === "walmart" && <div className="alert alert-success">Walmart connected.</div>}
       {connected === "shopify" && (
         <div className="alert alert-success">
           Shopify connected.
@@ -116,10 +145,10 @@ export default async function ChannelsSettingsPage({
               : ` Webhooks partially registered (${webhooks}) -- check server logs for which topic(s) failed.`)}
         </div>
       )}
-      {error?.startsWith("shopify_") ? (
-        <div className="alert alert-danger">Shopify connection failed ({error}).</div>
-      ) : (
-        error && <div className="alert alert-danger">Amazon connection failed ({error}).</div>
+      {error?.startsWith("shopify_") && <div className="alert alert-danger">Shopify connection failed ({error}).</div>}
+      {error?.startsWith("walmart_") && <div className="alert alert-danger">Walmart connection failed ({error}).</div>}
+      {error && !error.startsWith("shopify_") && !error.startsWith("walmart_") && (
+        <div className="alert alert-danger">Amazon connection failed ({error}).</div>
       )}
 
       <h2>Amazon</h2>
@@ -183,6 +212,39 @@ export default async function ChannelsSettingsPage({
           <ShopifyConnectForm buttonLabel="Connect Shopify" />
         )}
       </div>
+
+      <h2>Walmart</h2>
+      <div className="card">
+        {walmartConnection ? (
+          <div className="stack">
+            <div className="row">
+              <span className={isWalmartConnected ? "badge badge-success" : "badge badge-danger"}>
+                {walmartConnection.status}
+              </span>
+              <span className="muted">client id {walmartConnection.external_account_id}</span>
+            </div>
+            <div className="muted">Connected since {new Date(walmartConnection.created_at).toISOString()}</div>
+            <div className="muted">
+              Last order sync:{" "}
+              {walmartConnection.last_order_sync_at
+                ? new Date(walmartConnection.last_order_sync_at).toISOString()
+                : "never synced yet"}
+            </div>
+            <div className="alert alert-info" style={{ marginTop: 8, marginBottom: 0 }}>
+              UNVERIFIED against real Walmart infrastructure — this connection is wired the same way Amazon/Shopify
+              are, but nothing has actually round-tripped against Walmart&apos;s live API yet (no self-serve
+              sandbox exists to test against ahead of an approved seller account). Order sync will fail silently
+              into this connection&apos;s error state until that&apos;s proven.
+            </div>
+            {/* No OAuth reconnect redirect (same reasoning as Shopify's own
+                form here) -- reconnecting means re-submitting this form with
+                a fresh/corrected clientId+clientSecret pair. */}
+            <WalmartConnectForm buttonLabel="Reconnect Walmart" />
+          </div>
+        ) : (
+          <WalmartConnectForm buttonLabel="Connect Walmart" />
+        )}
+      </div>
     </main>
   );
 }
@@ -218,6 +280,37 @@ function ShopifyConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElem
       <label>
         Webhook signing secret (optional -- enables real-time sync)
         <input type="password" name="clientSecret" placeholder="from the custom app's API credentials page" />
+      </label>
+      <button type="submit">{buttonLabel}</button>
+    </form>
+  );
+}
+
+/**
+ * Walmart has no OAuth consent screen either (client_credentials grant, see
+ * WalmartConnector's own class doc comment) -- a Client ID and Client Secret,
+ * issued directly to the tenant's own Walmart seller/Solution Provider
+ * account, are typed into this plain HTML form and POSTed to
+ * /api/channels/walmart/connect in one step, which authenticates the pair
+ * live before persisting anything (same "verify before persist" discipline
+ * as ShopifyConnectForm above).
+ *
+ * Unlike Shopify's webhook secret, Walmart's clientSecret is not optional --
+ * client_credentials has no separate cron-only fallback mode the way
+ * webhooks-vs-cron does for Shopify, so both fields are required every
+ * submission, including on reconnect (there's no "leave blank to keep the
+ * existing secret" affordance here).
+ */
+function WalmartConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElement {
+  return (
+    <form action="/api/channels/walmart/connect" method="POST" className="stack" style={{ marginTop: 8 }}>
+      <label>
+        Client ID
+        <input type="text" name="clientId" placeholder="Walmart Marketplace API client ID" required />
+      </label>
+      <label>
+        Client secret
+        <input type="password" name="clientSecret" placeholder="Walmart Marketplace API client secret" required />
       </label>
       <button type="submit">{buttonLabel}</button>
     </form>

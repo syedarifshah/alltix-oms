@@ -4,6 +4,7 @@ import type { PicklistLineStatus, PicklistStatus } from "@alltix/shared";
 import {
   createAmazonConnectorFromChannelConnection,
   createShopifyConnectorFromChannelConnection,
+  createWalmartConnectorFromChannelConnection,
   type TrackingInfo,
 } from "@alltix/channel-connectors";
 import type { OrderService } from "@alltix/order-service";
@@ -417,8 +418,12 @@ export class WarehouseService {
    *
    * 'amazon' (AmazonConnector.confirmShipment(), verified live against the
    * sandbox -- see its doc comment for the sandbox-has-no-matching-scenario
-   * caveat) and 'shopify' (ShopifyConnector.confirmShipment(), verified
-   * live against a real dev store -- see CLAUDE.md §4.5) are wired to real
+   * caveat), 'shopify' (ShopifyConnector.confirmShipment(), verified live
+   * against a real dev store -- see CLAUDE.md §4.5), and 'walmart'
+   * (WalmartConnector.confirmShipment(), UNVERIFIED IN PRACTICE -- wired the
+   * same way as the other two, but see CLAUDE.md §4.2 and
+   * WalmartConnector's own class doc comment for why nothing has actually
+   * round-tripped against Walmart's live API yet) are wired to real
    * connectors today. Any other channel throws a clear "not implemented"
    * error rather than silently skipping the channel call and transitioning
    * anyway.
@@ -445,6 +450,9 @@ export class WarehouseService {
       await connector.confirmShipment(order.external_order_id, tracking);
     } else if (order.channel === "shopify") {
       const connector = await createShopifyConnectorFromChannelConnection(this.pool, tenantId);
+      await connector.confirmShipment(order.external_order_id, tracking);
+    } else if (order.channel === "walmart") {
+      const connector = await createWalmartConnectorFromChannelConnection(this.pool, tenantId);
       await connector.confirmShipment(order.external_order_id, tracking);
     } else {
       throw new Error(

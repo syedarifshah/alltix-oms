@@ -27,7 +27,10 @@
     "shopify:order-sync-job": "tsx scripts/shopify-order-sync-job.ts",
     "shopify:order-sync-scheduler": "tsx scripts/shopify-order-sync-scheduler.ts",
     "shopify:catalog-sync-job": "tsx scripts/shopify-catalog-sync-job.ts",
-    "catalog:add-channel-listing": "tsx scripts/add-channel-listing.ts"
+    "catalog:add-channel-listing": "tsx scripts/add-channel-listing.ts",
+    "walmart:order-sync-job": "tsx scripts/walmart-order-sync-job.ts",
+    "walmart:order-sync-scheduler": "tsx scripts/walmart-order-sync-scheduler.ts",
+    "walmart:sandbox-smoke-test": "tsx scripts/walmart-sandbox-smoke-test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",

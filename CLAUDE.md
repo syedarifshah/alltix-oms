@@ -11,6 +11,14 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
 - **Build type**: OMS/IMS-only (Linnworks model) for v1. NOT manufacturing/BOM (Cin7 model) — that roughly doubles data-model complexity and is a v2+ vertical.
 - **Deployment**: multi-tenant SaaS, cloud-hosted, single codebase.
 - **MVP definition (ship this, nothing more)**: Amazon + Walmart + Shopify connectors → unified inventory ledger → order pull/normalize → basic pick/pack workflow → one automation rule type (order routing) → billing.
+  - Status as of this writing: all three connectors now have full application-layer
+    wiring (Settings UI connect form, per-channel scheduler/cron sync, warehouse
+    shipment-confirmation dispatch) — see §4.1/§4.2/§4.5's own "Wired into the app"
+    sections. Amazon and Shopify are confirmed working against real (sandbox/dev-store)
+    infrastructure; Walmart's wiring is complete and typechecked but UNVERIFIED IN ITS
+    ENTIRETY pending a real Walmart seller/Solution Provider account (no self-serve
+    sandbox exists to substitute — see §4.2). Everything else in this MVP definition
+    (ledger, order pull/normalize, pick/pack, order-routing rules, billing) is built.
 
 Do not expand this scope without an explicit decision — every module below assumes it.
 
@@ -280,16 +288,92 @@ data —
 
 ### 4.2 Walmart Marketplace API (build second — structurally different, feed/poll-heavy)
 
-- **Auth**: OAuth 2.0, token-based, refreshed per session.
+- **Auth**: not a refresh-token OAuth flow like Amazon's — `client_credentials` grant
+  (`POST /v3/token`, HTTP Basic `client_id:client_secret`, `grant_type=client_credentials`),
+  a short-lived (900s) access token cached in memory and refreshed near expiry, same
+  shape as `AmazonConnector.authenticate()`'s own caching. No consent screen, no
+  redirect/callback pair — a Client ID + Client Secret issued directly to the seller/
+  Solution Provider account is the entire credential, same "paste two values into a
+  form" simplicity as Shopify's static token, just short-lived instead of non-expiring.
+  Implemented in `packages/channel-connectors/src/walmart-connector.ts`.
 - **Items API**: "Offer Setup by Match" for existing catalog items, "Full Item Setup"
   for new.
 - **Feeds API**: bulk operations — submit a feed file, get a `feedId`, poll
   `GET /v3/feeds/{feedId}` until `PROCESSED`, then inspect item-level `ingestionErrors`.
-- **Inventory API**: real-time single-item stock updates.
-- **Orders API**: retrieve/acknowledge/ship/cancel/refund; each order line carries a
-  `fulfillmentOption` (`seller_fulfilled` vs WFS).
+  This is also the *only* path `WalmartConnector.submitListing()` has for Offer Setup by
+  Match (no synchronous equivalent the way Shopify's `productSet` mutation is) — see
+  §4.3's note on why this forced `ChannelConnector.submitListing`/`getFeedStatus` to
+  split out of a single `pushListing()` in the first place. `submitListing()` itself
+  currently throws rather than submitting: `NormalizedListing` doesn't yet carry the
+  fields Walmart's match-feed payload requires (price, productIdentifiers, condition,
+  shippingWeight) — see its doc comment for the exact list.
+- **Inventory API**: real-time single-item stock updates (`PUT /v3/inventory?sku=...`).
+  Implemented as `WalmartConnector.pushInventory()` — like Amazon's Listings Items API,
+  the interface's `productId` parameter must actually be the channel's own SKU
+  (`channel_listings.external_sku`), not the internal `products.id`; the caller resolves
+  that mapping before calling in.
+- **Orders API**: `GET /v3/orders`, called once per ship-node type
+  (`SellerFulfilled`/`WFSFulfilled`/`3PLFulfilled` — there's no "all fulfillment types"
+  wildcard) and merged; acknowledge (`POST .../acknowledge`) then ship
+  (`POST .../shipping`) as two sequential calls inside one `confirmShipment()`, since the
+  interface has no reason to expose that two-step Walmart-specific sequence to callers.
+  `TrackingInfo`'s single {carrier, trackingNumber, shippedAt} is applied to every line
+  of a multi-line order — correct for the common single-package case, but can't
+  represent a split/partial shipment; `TrackingInfo` would need a per-line shape to fix
+  that properly.
 - **Required header**: `WM_QOS.CORRELATION_ID` (a GUID generated per call) — mandatory
-  for support escalations, build it into the HTTP client wrapper globally, not per-call.
+  for support escalations, built into `WalmartConnector`'s private `request()` wrapper
+  globally (also sets `WM_SEC.ACCESS_TOKEN`, `WM_SVC.NAME`, and `WM_SANDBOX` when talking
+  to the sandbox host), not per-call-site.
+
+**UNVERIFIED IN ITS ENTIRETY**: unlike Amazon (proven against its SP-API sandbox) and
+Shopify (proven against a real dev store), there is no self-serve Walmart sandbox to
+register for — every request shape above is transcribed from developer.walmart.com, not
+exercised against a live endpoint. Pure request/response mapping logic (`WalmartConnector`'s
+own `normalizeWalmartOrder`/`normalizeWalmartOrderLine`/`mapShipNodeTypeToFulfillmentType`)
+is unit-tested (`packages/channel-connectors/test/walmart-connector.test.ts`) — everything
+past that boundary (`authenticate`, `pullOrders`, `pushInventory`, `submitListing`/
+`getFeedStatus`, `confirmShipment`) stays a well-researched first draft until run against
+real credentials, not a proven implementation, the same status Amazon carried before its
+sandbox pass. `scripts/walmart-sandbox-smoke-test.ts` exists so that day is "run one
+command," not "write a smoke test from scratch" — see `.env.example`'s `WALMART_SANDBOX_*`
+entries for what it needs.
+
+- **Wired into the app** (no new migration — reuses `channel_connections.lwa_client_id`/
+  `encrypted_client_secret`, both already relaxed to nullable by migration `0019` for
+  Shopify's sake, so a third channel's differently-shaped credential fits without a
+  schema change): a Walmart row stores the tenant's own `clientId` in both
+  `lwa_client_id` and `external_account_id` (no independent Walmart seller id this
+  connector's calls need — reusing `clientId` keeps the table's
+  `(tenant_id, channel, marketplace, external_account_id)` UNIQUE constraint meaningful,
+  same as Amazon's), `encrypted_client_secret` holds the pgcrypto-encrypted secret, and
+  `marketplace` is always `''` (same "no per-region concept" reasoning as Shopify's own
+  row). Like Shopify, no OAuth redirect: `/settings/channels` has a plain "Connect
+  Walmart" form (Client ID + Client secret, both required every submission — no
+  "leave blank to keep the existing secret" the way Shopify's optional webhook field
+  allows) that POSTs to `/api/channels/walmart/connect`, which calls
+  `WalmartConnector.authenticate()` live (a real `client_credentials` token exchange) to
+  reject a bad pair before persisting anything, then encrypts and upserts the row —
+  always against `WALMART_PRODUCTION_BASE_URL`, never this repo's internal sandbox host,
+  since a real tenant is connecting their real seller account.
+  `createWalmartConnectorFromChannelConnection(pool, tenantId)` mirrors
+  `createShopifyConnectorFromChannelConnection` exactly for resolving a tenant's stored
+  credentials back into a live connector. The scheduler
+  (`packages/scheduler/src/{index,cron-runner}.ts`) runs a Walmart order-sync pass in
+  parallel to Amazon's and Shopify's — `syncWalmartOrders`/`runWalmartOrderSyncJob`/
+  `startWalmartOrderSyncScheduler`, a separate node-cron task and separate
+  `scripts/walmart-order-sync-{job,scheduler}.ts` entrypoints, kept parallel rather than
+  merged for the same "not enough shared shape yet, three channels each want their own
+  distinguishable log event" reasoning `syncShopifyOrders`'s own doc comment gives. What
+  actually triggers a sync on this app's Vercel deployment is
+  `GET /api/cron/walmart-order-sync` (mirrors the other two cron routes exactly — same
+  `CRON_SECRET` Bearer-token gate, same idempotency contract) plus its `crons` entry in
+  `vercel.json` (`30 5 * * *`, staggered 30 minutes after Shopify's own order-sync cron).
+  `WarehouseService.confirmShipment()` dispatches to
+  `createWalmartConnectorFromChannelConnection` on `order.channel === "walmart"`,
+  alongside its existing Amazon and Shopify branches. No automatic catalog sync exists
+  for Walmart yet (unlike Shopify's `syncShopifyCatalog`) — onboarding a Walmart SKU
+  today still means `scripts/add-channel-listing.ts` by hand.
 
 ### 4.3 Connector abstraction (the interface every adapter implements)
 
@@ -491,10 +575,17 @@ succeeded or failed."
     `'received'` order and allocate against it as if it were never cancelled. Closing
     this needs either re-reading Shopify's current order state instead of trusting
     delivery order, or a small "seen but not yet local" staging table — neither built.
-  - **UNVERIFIED against a real store as written** (this connector's usual discipline):
-    `registerWebhooks()` is transcribed from shopify.dev, not yet exercised live — the
-    opt-in step in `shopify-sandbox-smoke-test.ts`
-    (`SHOPIFY_SANDBOX_TEST_WEBHOOK_CALLBACK_URL`) exists for exactly that, not run yet.
+  - **Confirmed against a real dev store**: registration succeeded 3/3 topics from the
+    `/settings/channels` "Connect Shopify" flow, and the full round trip was proven — a
+    genuinely new order placed after registration reached `POST /api/webhooks/shopify`
+    and appeared in `/orders` within seconds, no cron involved. One real incident this
+    surfaced along the way: an order for a product with no `channel_listings` mapping
+    (a store demo product that had never been onboarded) correctly failed loudly and
+    rolled back rather than silently persisting a broken order — expected behavior per
+    `insertOrderLines`'s own doc comment, not a webhook-specific bug, but the first time
+    it was actually hit in practice. Still unverified: whether a *repeat* registration
+    for an already-subscribed topic+uri is a no-op or a rejected `userError` — the live
+    test above only ever registered once per tenant.
 - **Outbound listing creation** (`ShopifyConnector.createListing()`, `POST
   /api/channels/shopify/listings`, `/products` page): closes part of the "Not
   implemented" gap above for Shopify specifically — a tenant can now push an existing

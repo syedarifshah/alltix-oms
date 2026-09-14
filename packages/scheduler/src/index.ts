@@ -5,6 +5,7 @@ import {
   createAmazonConnectorFromChannelConnection,
   SP_API_SANDBOX_TEST_CASE_CREATED_AFTER,
   createShopifyConnectorFromChannelConnection,
+  createWalmartConnectorFromChannelConnection,
   type NormalizedShopifyProductVariant,
 } from "@alltix/channel-connectors";
 import { InventoryService } from "@alltix/inventory-service";
@@ -261,6 +262,97 @@ async function syncShopifyTenant(appPool: Pool, orderService: OrderService, tena
   }
 }
 
+/**
+ * Walmart's channel counterpart to {@link syncShopifyOrders} -- identical
+ * shape again (discover every tenant with an active 'walmart'
+ * channel_connection, sync each sequentially via adminPool/appPool, never
+ * let one tenant's failure stop the rest). Kept as its own parallel function
+ * for the same duplication-vs-abstraction call syncShopifyOrders's doc
+ * comment already made for channel #2 -- now with a third channel wired
+ * this way and still no shared shape worth extracting (Amazon's
+ * isSandbox()-canned-lookback branch has no Walmart equivalent either; see
+ * syncWalmartTenant below).
+ *
+ * UNVERIFIED IN PRACTICE along with the rest of the Walmart wiring (see
+ * WalmartConnector's own class doc comment and the connect route's) --
+ * this function's *logic* mirrors syncShopifyOrders exactly and is
+ * typechecked/covered by the same "never throws per-tenant" contract, but
+ * it has never actually pulled a real order from Walmart's live API, since
+ * createWalmartConnectorFromChannelConnection() has nothing to authenticate
+ * against without a real tenant-entered clientId/clientSecret pair.
+ */
+export async function syncWalmartOrders(params: SyncAmazonOrdersParams): Promise<TenantSyncResult[]> {
+  const { appPool, adminPool, eventBus } = params;
+
+  const orderService = new OrderService(appPool, eventBus);
+  const rulesEngine = new RulesEngine(appPool);
+  rulesEngine.attach(eventBus);
+
+  const tenants = await adminPool.query<{ tenant_id: string }>(
+    `SELECT DISTINCT tenant_id FROM channel_connections WHERE channel = 'walmart' AND status = 'active'`,
+  );
+
+  const results: TenantSyncResult[] = [];
+  for (const { tenant_id: tenantId } of tenants.rows) {
+    results.push(await syncWalmartTenant(appPool, orderService, tenantId));
+  }
+  return results;
+}
+
+/** Walmart counterpart to {@link runShopifyOrderSyncJob} -- see its doc comment. */
+export async function runWalmartOrderSyncJob(appPool: Pool, adminPool: Pool): Promise<TenantSyncResult[]> {
+  return syncWalmartOrders({ appPool, adminPool, eventBus: new InProcessEventBus() });
+}
+
+/** Walmart counterpart to {@link syncShopifyTenant} -- identical
+ *  error-isolation contract (never throws; a bad clientId/clientSecret pair
+ *  or connector error becomes a failed result, not a stopped loop). No
+ *  isSandbox()/canned-lookback branch here either -- like Shopify,
+ *  WalmartConnector always talks to the real computed `since` (see
+ *  createWalmartConnectorFromChannelConnection's own comment: it's always
+ *  constructed against WALMART_PRODUCTION_BASE_URL, a real tenant connecting
+ *  their real seller account, never this repo's internal sandbox). */
+async function syncWalmartTenant(appPool: Pool, orderService: OrderService, tenantId: string): Promise<TenantSyncResult> {
+  const syncStartedAt = new Date();
+
+  try {
+    const lastSync = await withTenant(appPool, tenantId, (client) =>
+      client.query<{ last_order_sync_at: string | null }>(
+        `SELECT last_order_sync_at FROM channel_connections
+          WHERE tenant_id = $1 AND channel = 'walmart' AND status = 'active'
+          ORDER BY created_at DESC LIMIT 1`,
+        [tenantId],
+      ),
+    );
+    const lastOrderSyncAt = lastSync.rows[0]?.last_order_sync_at;
+    const since = lastOrderSyncAt ? new Date(lastOrderSyncAt) : new Date(syncStartedAt.getTime() - DEFAULT_LOOKBACK_MS);
+
+    const connector = await createWalmartConnectorFromChannelConnection(appPool, tenantId);
+    const pulled = await connector.pullOrders(since);
+    const persisted = await orderService.persistPulledOrders(tenantId, pulled);
+
+    // Same start-time-not-now reasoning as syncShopifyTenant()/syncTenant()
+    // -- migration 0015's comment applies identically here.
+    await withTenant(appPool, tenantId, (client) =>
+      client.query(
+        `UPDATE channel_connections SET last_order_sync_at = $1, updated_at = now()
+          WHERE tenant_id = $2 AND channel = 'walmart' AND status = 'active'`,
+        [syncStartedAt.toISOString(), tenantId],
+      ),
+    );
+
+    return { tenantId, success: true, ...persisted, error: null };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`Walmart order sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
+    // Same documented gap as syncTenant()/syncShopifyTenant() -- no
+    // cross-run failure tracking or alerting yet, see syncTenant()'s
+    // comment. Doubly expected to fire for every Walmart-connected tenant
+    // right now, given the UNVERIFIED status above.
+    return { tenantId, success: false, insertedOrderIds: [], skippedExternalOrderIds: [], error: message };
+  }
+}
+
 /** Every product/channel_listings row this catalog-sync job maintains uses
  *  this same location for its baseline stock -- see syncShopifyCatalogForTenant's
  *  doc comment. Deliberately the exact string
@@ -444,6 +536,9 @@ export {
   runOnceWithRetry,
   startShopifyOrderSyncScheduler,
   runShopifyOnceWithRetry,
+  startWalmartOrderSyncScheduler,
+  runWalmartOnceWithRetry,
   type AmazonOrderSyncSchedulerOptions,
   type ShopifyOrderSyncSchedulerOptions,
+  type WalmartOrderSyncSchedulerOptions,
 } from "./cron-runner.js";

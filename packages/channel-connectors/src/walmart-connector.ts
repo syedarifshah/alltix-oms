@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import type { Pool } from "pg";
+import { withTenant, decryptChannelSecret } from "@alltix/db";
 import type { FulfillmentType } from "@alltix/shared";
 import type {
   AuthToken,
@@ -60,7 +62,11 @@ const TOKEN_REFRESH_SKEW_MS = 60_000;
 // the same real-request-volume tradeoff CLAUDE.md §4.1 already notes for
 // Amazon's per-order getOrderItems call.
 const WALMART_SHIP_NODE_TYPES = ["SellerFulfilled", "WFSFulfilled", "3PLFulfilled"] as const;
-type WalmartShipNodeType = (typeof WALMART_SHIP_NODE_TYPES)[number];
+// Exported for the pure-function unit tests below (test/walmart-connector.test.ts)
+// to construct without depending on this module's own internal constant --
+// same "export the type, not just the value, so a test can build one"
+// reasoning as every other exported *Connector type in this file.
+export type WalmartShipNodeType = (typeof WALMART_SHIP_NODE_TYPES)[number];
 
 export interface WalmartCredentials {
   clientId: string;
@@ -86,6 +92,80 @@ export function loadWalmartSandboxCredentialsFromEnv(): WalmartCredentials {
     clientId: readRequiredEnv("WALMART_SANDBOX_CLIENT_ID"),
     clientSecret: readRequiredEnv("WALMART_SANDBOX_CLIENT_SECRET"),
   };
+}
+
+/**
+ * Loads a tenant's own Walmart Marketplace API credentials from their
+ * channel_connections row -- the per-tenant counterpart to
+ * loadWalmartSandboxCredentialsFromEnv() above (which is for this repo's own
+ * dev-testing script, scripts/walmart-sandbox-smoke-test.ts, not real
+ * tenants). Mirrors
+ * loadShopifyCredentialsFromChannelConnection/createShopifyConnectorFromChannelConnection
+ * in shopify-connector.ts exactly, including the column-reuse decision:
+ *
+ * Unlike Amazon (a shared platform OAuth app + per-seller refresh token) or
+ * Shopify (a single static access token), Walmart's client_credentials grant
+ * means the tenant's own clientId+clientSecret pair -- issued directly to
+ * their Walmart seller/Solution Provider account -- *is* the entire
+ * long-lived credential; there is no separate refresh token to store at all
+ * (see WalmartConnector.authenticate()'s own doc comment: a fresh access
+ * token is derived from clientId+clientSecret every time, not refreshed from
+ * a stored refresh_token). That maps cleanly onto two columns
+ * channel_connections (0012) already has, both already relaxed to nullable
+ * by migration 0019 for Shopify's sake:
+ *  - `lwa_client_id` -- named for Amazon's OAuth client id, but generically
+ *    "the channel's own OAuth client id" is exactly what a Walmart clientId
+ *    is too. Reused rather than adding a new column, same reasoning 0019
+ *    itself documents for encrypted_client_secret.
+ *  - `encrypted_client_secret` -- Walmart's clientSecret is the same shape
+ *    and sensitivity (long-lived, high-value, pgcrypto-encrypted-at-rest) as
+ *    Amazon's client secret already stored here.
+ *  - `encrypted_refresh_token` stays NULL for a Walmart row -- there is
+ *    nothing to put in it, same as a Shopify row.
+ *  - `external_account_id` (NOT NULL, part of the table's UNIQUE constraint)
+ *    has no independent Walmart concept the way Amazon's seller id or
+ *    Shopify's shop domain does -- the connect route sets it to the
+ *    clientId itself (see that route's own comment), which is sufficient to
+ *    keep one row per tenant per connected Walmart account and to show
+ *    *something* identifying on /settings/channels without inventing a
+ *    "Walmart Seller ID" form field this connector's calls don't actually
+ *    need.
+ *  - `marketplace` is stored as '' -- Walmart, like Shopify, has no
+ *    per-connection marketplace/region concept this connector targets (see
+ *    normalizeWalmartOrder's own channelMarketplace: "" comment); one
+ *    connected account is one connection, full stop.
+ */
+export async function loadWalmartCredentialsFromChannelConnection(
+  pool: Pool,
+  tenantId: string,
+): Promise<WalmartCredentials> {
+  return withTenant(pool, tenantId, async (client) => {
+    const result = await client.query<{ lwa_client_id: string | null; encrypted_client_secret: Buffer | null }>(
+      `SELECT lwa_client_id, encrypted_client_secret
+         FROM channel_connections
+        WHERE channel = 'walmart' AND status = 'active'
+        ORDER BY created_at DESC
+        LIMIT 1`,
+    );
+
+    const row = result.rows[0];
+    if (!row || !row.lwa_client_id || !row.encrypted_client_secret) {
+      throw new Error(`No active 'walmart' channel_connections row found for tenant ${tenantId}`);
+    }
+
+    const clientSecret = await decryptChannelSecret(client, row.encrypted_client_secret);
+    return { clientId: row.lwa_client_id, clientSecret };
+  });
+}
+
+/** Builds a {@link WalmartConnector} from a tenant's channel_connections row
+ *  instead of process.env, always against WALMART_PRODUCTION_BASE_URL -- a
+ *  real tenant connects their own real Walmart seller account, never this
+ *  repo's internal sandbox (see WALMART_SANDBOX_BASE_URL's own comment: that
+ *  base URL is for scripts/walmart-sandbox-smoke-test.ts only). */
+export async function createWalmartConnectorFromChannelConnection(pool: Pool, tenantId: string): Promise<WalmartConnector> {
+  const credentials = await loadWalmartCredentialsFromChannelConnection(pool, tenantId);
+  return new WalmartConnector(credentials, WALMART_PRODUCTION_BASE_URL);
 }
 
 /** Raw shape of one order line from GET /v3/orders -- only the fields this
@@ -163,7 +243,11 @@ export class FeedStillProcessingError extends Error {
   }
 }
 
-function mapShipNodeTypeToFulfillmentType(shipNodeType: WalmartShipNodeType): FulfillmentType {
+/** Exported for unit testing (see test/walmart-connector.test.ts) -- same
+ *  "pure mapping function, no network, export it so a test can call it
+ *  directly" precedent normalizeShopifyOrder/normalizeShopifyProductVariant
+ *  already set in shopify-connector.ts. */
+export function mapShipNodeTypeToFulfillmentType(shipNodeType: WalmartShipNodeType): FulfillmentType {
   switch (shipNodeType) {
     case "WFSFulfilled":
       return "wfs";
@@ -175,7 +259,8 @@ function mapShipNodeTypeToFulfillmentType(shipNodeType: WalmartShipNodeType): Fu
   }
 }
 
-function normalizeWalmartOrderLine(line: WalmartOrderLine, fulfillmentType: FulfillmentType): NormalizedOrderLine {
+/** Exported for unit testing -- see mapShipNodeTypeToFulfillmentType's own comment. */
+export function normalizeWalmartOrderLine(line: WalmartOrderLine, fulfillmentType: FulfillmentType): NormalizedOrderLine {
   const productCharge = line.charges?.charge.find((c) => c.chargeType === "PRODUCT");
   return {
     externalLineId: line.lineNumber,
@@ -186,7 +271,8 @@ function normalizeWalmartOrderLine(line: WalmartOrderLine, fulfillmentType: Fulf
   };
 }
 
-function normalizeWalmartOrder(order: WalmartOrder, shipNodeType: WalmartShipNodeType): NormalizedOrder {
+/** Exported for unit testing -- see mapShipNodeTypeToFulfillmentType's own comment. */
+export function normalizeWalmartOrder(order: WalmartOrder, shipNodeType: WalmartShipNodeType): NormalizedOrder {
   const fulfillmentType = mapShipNodeTypeToFulfillmentType(shipNodeType);
   return {
     externalOrderId: order.purchaseOrderId,

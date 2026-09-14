@@ -624,18 +624,21 @@ export class ShopifyConnector {
    * every non-success result to the tenant/logs; this only isolates one
    * topic's failure from blocking the others.
    *
-   * UNVERIFIED against a real store as written: this connector's own
-   * established discipline (see this file's header/class doc comment) is to
-   * mark every new live-API method this way until it's actually exercised
-   * against a real dev store (see the opt-in step in
-   * scripts/shopify-sandbox-smoke-test.ts, gated on
-   * SHOPIFY_SANDBOX_TEST_WEBHOOK_CALLBACK_URL) -- do that before trusting
-   * this beyond what's transcribed from shopify.dev's docs. In particular,
-   * whether Shopify treats a *repeat* registration for a topic+uri pair
-   * already subscribed (e.g. a tenant reconnecting without changing
-   * anything) as a harmless no-op or a rejected userError is not yet known
+   * Confirmed against a real dev store: registration succeeded 3/3 topics
+   * from the /settings/channels "Connect Shopify" flow, and the full round
+   * trip was proven too -- a genuinely new order placed after registration
+   * arrived at POST /api/webhooks/shopify and appeared in /orders within
+   * seconds (see CLAUDE.md §4.5's "Real-time webhooks" for the write-up,
+   * including the one real production incident this run surfaced: an order
+   * for a product with no channel_listings mapping correctly failed loudly
+   * and rolled back rather than persisting a broken order).
+   *
+   * Still genuinely unknown: whether Shopify treats a *repeat* registration
+   * for a topic+uri pair already subscribed (e.g. a tenant reconnecting
+   * without changing anything) as a harmless no-op or a rejected userError
    * -- this method doesn't special-case a guess, it just surfaces whatever
-   * userErrors come back.
+   * userErrors come back. Not exercised by the verification above, which
+   * only ever registered once per tenant.
    */
   async registerWebhooks(callbackUrl: string): Promise<ShopifyWebhookRegistrationResult[]> {
     const results: ShopifyWebhookRegistrationResult[] = [];
