@@ -464,15 +464,22 @@ export class OrderService {
    * channel adapter with no items on an order (or a future channel that
    * genuinely has none) shouldn't be unable to ever leave 'validated'.
    *
-   * Location selection: if the rules engine set orders.preferred_location_id
-   * (a route_to_warehouse action, applied while the order was still
+   * Location selection is now stock-aware across every one of the tenant's
+   * warehouse locations, not just one: resolveCandidateLocations() builds
+   * an ordered list -- orders.preferred_location_id first (a
+   * route_to_warehouse rule action applied while the order was still
    * 'received' -- see RulesEngine and events.ts's OrderReceivedPayload),
-   * that location is used instead of the default choice below, and must
-   * resolve to a real, tenant-owned, type='warehouse' location or this
-   * throws outright -- a routing decision that points at garbage should
-   * fail loudly, not be silently ignored in favor of the default. With no
-   * preferred_location_id, behavior is unchanged from before the rules
-   * engine existed: the tenant's oldest warehouse location.
+   * which must resolve to a real, tenant-owned, type='warehouse' location
+   * or this throws outright (a routing decision that points at garbage
+   * should fail loudly, not be silently ignored), then every other
+   * warehouse location oldest-created-first as fallbacks. This method
+   * locks every (location, product) pair across ALL candidates before
+   * choosing, then walks the candidates in that priority order and
+   * allocates entirely against the first one with enough stock for every
+   * line -- the order still never splits across locations, and this does
+   * NOT do nearest-by-shipping-address or per-SKU routing (CLAUDE.md §8
+   * Phase 4 tracks both as separately-scoped, not-yet-built gaps). If no
+   * candidate has enough stock, the order backorders exactly as before.
    */
   private async allocateOrder(tenantId: string, orderId: string, expectedFromStatus: OrderStatus): Promise<OrderStatus> {
     const result = await withTenant(this.pool, tenantId, async (client) => {
@@ -503,39 +510,70 @@ export class OrderService {
         return { status: "allocated" as const, locationId: null };
       }
 
-      const locationId = await this.resolveAllocationLocation(client, tenantId, orderRow.preferred_location_id);
+      const candidateLocationIds = await this.resolveCandidateLocations(
+        client,
+        tenantId,
+        orderRow.preferred_location_id,
+      );
 
       // Sum requested quantity per product first (an order can have more
       // than one line for the same product) so each product's row is only
-      // locked once.
+      // locked once per location.
       const requestedByProduct = new Map<string, number>();
       for (const line of lines.rows) {
         requestedByProduct.set(line.product_id, (requestedByProduct.get(line.product_id) ?? 0) + line.quantity);
       }
+      const productIds = [...requestedByProduct.keys()];
 
-      // Lock rows in a stable order (sorted product_id) across every
-      // concurrent allocation attempt that might touch overlapping
-      // products, to avoid a lock-order deadlock between two orders that
-      // both span the same two SKUs in opposite order.
-      const availableByProduct = new Map<string, number>();
-      for (const productId of [...requestedByProduct.keys()].sort()) {
-        const levelResult = await client.query<{ available: number }>(
-          `SELECT available FROM inventory_levels WHERE product_id = $1 AND location_id = $2 FOR UPDATE`,
-          [productId, locationId],
-        );
-        availableByProduct.set(productId, levelResult.rows[0]?.available ?? 0);
+      // Lock every (location, product) pair this order might use, across
+      // ALL candidate locations, in one GLOBAL canonical order -- sorted by
+      // location_id then product_id, the SAME order regardless of this
+      // order's own preferred_location_id. Two concurrent allocation
+      // attempts can have opposite location preferences (order A prefers
+      // WH-1 then WH-2; order B prefers WH-2 then WH-1) with overlapping
+      // products -- locking in each order's own priority order could
+      // deadlock them against each other. Locking in one shared,
+      // order-independent order avoids that, while still gathering full
+      // availability data (across every candidate) before any location is
+      // chosen.
+      const sortedLocationIds = [...candidateLocationIds].sort();
+      const sortedProductIds = [...productIds].sort();
+      const availableByLocation = new Map<string, Map<string, number>>();
+      for (const locationId of sortedLocationIds) {
+        const availableByProduct = new Map<string, number>();
+        for (const productId of sortedProductIds) {
+          const levelResult = await client.query<{ available: number }>(
+            `SELECT available FROM inventory_levels WHERE product_id = $1 AND location_id = $2 FOR UPDATE`,
+            [productId, locationId],
+          );
+          availableByProduct.set(productId, levelResult.rows[0]?.available ?? 0);
+        }
+        availableByLocation.set(locationId, availableByProduct);
       }
 
-      const sufficient = [...requestedByProduct.entries()].every(
-        ([productId, quantity]) => (availableByProduct.get(productId) ?? 0) >= quantity,
-      );
+      // Now choose, in PRIORITY order (preferred first, then
+      // oldest-created fallbacks), the first candidate location where
+      // every product's available quantity -- from the data just gathered
+      // under lock above, not a fresh read -- covers what this order
+      // needs.
+      let chosenLocationId: string | null = null;
+      for (const locationId of candidateLocationIds) {
+        const availableByProduct = availableByLocation.get(locationId)!;
+        const sufficient = [...requestedByProduct.entries()].every(
+          ([productId, quantity]) => (availableByProduct.get(productId) ?? 0) >= quantity,
+        );
+        if (sufficient) {
+          chosenLocationId = locationId;
+          break;
+        }
+      }
 
-      if (!sufficient) {
+      if (!chosenLocationId) {
         await client.query(
           `UPDATE orders SET status = 'backordered', updated_at = now() WHERE id = $1 AND tenant_id = $2`,
           [orderId, tenantId],
         );
-        return { status: "backordered" as const, locationId };
+        return { status: "backordered" as const, locationId: null };
       }
 
       for (const line of lines.rows) {
@@ -546,7 +584,7 @@ export class OrderService {
           [
             tenantId,
             line.product_id,
-            locationId,
+            chosenLocationId,
             -line.quantity,
             orderId,
             `order-allocation:${orderId}:${line.id}`,
@@ -555,7 +593,7 @@ export class OrderService {
         await client.query(
           `UPDATE inventory_levels SET reserved = reserved + $1, updated_at = now()
              WHERE product_id = $2 AND location_id = $3`,
-          [line.quantity, line.product_id, locationId],
+          [line.quantity, line.product_id, chosenLocationId],
         );
       }
 
@@ -563,7 +601,7 @@ export class OrderService {
         `UPDATE orders SET status = 'allocated', updated_at = now() WHERE id = $1 AND tenant_id = $2`,
         [orderId, tenantId],
       );
-      return { status: "allocated" as const, locationId };
+      return { status: "allocated" as const, locationId: chosenLocationId };
     });
 
     if (result.status === "allocated") {
@@ -574,40 +612,50 @@ export class OrderService {
     return result.status;
   }
 
-  /** Resolves which location allocateOrder() reserves against. `preferredLocationId`
-   *  (from orders.preferred_location_id) wins when present and must be a
-   *  real, tenant-owned, type='warehouse' location -- throws otherwise
-   *  rather than silently falling back. With none set, falls back to the
-   *  original default: the tenant's oldest warehouse location. */
-  private async resolveAllocationLocation(
+  /** Resolves the ORDERED list of warehouse locations allocateOrder() may
+   *  reserve against, in priority order. `preferredLocationId` (from
+   *  orders.preferred_location_id) is tried first when present and must
+   *  resolve to a real, tenant-owned, type='warehouse' location -- throws
+   *  otherwise rather than silently falling back or silently excluding it
+   *  from the list. Every other tenant warehouse location follows,
+   *  oldest-created first (the original single-location default, now a
+   *  fallback rather than the only option) -- this is what lets
+   *  allocateOrder() try a second warehouse instead of backordering the
+   *  moment the preferred/default one is short. Throws if the tenant has
+   *  no warehouse location at all. */
+  private async resolveCandidateLocations(
     client: PoolClient,
     tenantId: string,
     preferredLocationId: string | null,
-  ): Promise<string> {
+  ): Promise<string[]> {
+    let preferred: string | null = null;
     if (preferredLocationId) {
-      const preferred = await client.query<{ id: string }>(
+      const preferredResult = await client.query<{ id: string }>(
         `SELECT id FROM locations WHERE id = $1 AND tenant_id = $2 AND type = 'warehouse'`,
         [preferredLocationId, tenantId],
       );
-      const preferredRow = preferred.rows[0];
+      const preferredRow = preferredResult.rows[0];
       if (!preferredRow) {
         throw new Error(
           `Order's preferred_location_id ${preferredLocationId} does not resolve to a real ` +
             `'warehouse' location for tenant ${tenantId} -- refusing to fall back silently`,
         );
       }
-      return preferredRow.id;
+      preferred = preferredRow.id;
     }
 
-    const location = await client.query<{ id: string }>(
-      `SELECT id FROM locations WHERE tenant_id = $1 AND type = 'warehouse' ORDER BY created_at ASC LIMIT 1`,
-      [tenantId],
+    const others = await client.query<{ id: string }>(
+      preferred
+        ? `SELECT id FROM locations WHERE tenant_id = $1 AND type = 'warehouse' AND id <> $2 ORDER BY created_at ASC`
+        : `SELECT id FROM locations WHERE tenant_id = $1 AND type = 'warehouse' ORDER BY created_at ASC`,
+      preferred ? [tenantId, preferred] : [tenantId],
     );
-    const locationRow = location.rows[0];
-    if (!locationRow) {
+
+    const candidates = preferred ? [preferred, ...others.rows.map((r) => r.id)] : others.rows.map((r) => r.id);
+    if (candidates.length === 0) {
       throw new Error(`Tenant ${tenantId} has no warehouse location to allocate against`);
     }
-    return locationRow.id;
+    return candidates;
   }
 
   /**
@@ -634,7 +682,7 @@ export class OrderService {
    * 'order.received' is published *before* the validated/allocated
    * transitions specifically so a routing rule (RulesEngine, subscribed to
    * OrderReceived) has a chance to set orders.preferred_location_id before
-   * allocateOrder() reads it -- see resolveAllocationLocation(). A
+   * allocateOrder() reads it -- see resolveCandidateLocations(). A
    * *different* kind of rule (RulesEngine's 'hold_order' action) can instead
    * move the order all the way to 'on_hold' during that same publish() call
    * (InProcessEventBus.publish() awaits every subscriber before returning,

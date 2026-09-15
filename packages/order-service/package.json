@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc --noEmit -p .",
-    "test": "node --import tsx --test test/persist-pulled-orders.test.ts test/allocation-concurrency.test.ts test/persist-and-allocate.test.ts test/pull-and-allocate-e2e.test.ts test/cancel-order.test.ts test/lifecycle-transitions.test.ts"
+    "test": "node --import tsx --test test/persist-pulled-orders.test.ts test/allocation-concurrency.test.ts test/multi-warehouse-allocation.test.ts test/persist-and-allocate.test.ts test/pull-and-allocate-e2e.test.ts test/cancel-order.test.ts test/lifecycle-transitions.test.ts"
   },
   "dependencies": {
     "@alltix/channel-connectors": "0.1.0",

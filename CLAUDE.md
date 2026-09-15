@@ -833,12 +833,32 @@ succeeded or failed."
   between two locations, §2.2's "Multi-location transfers") and the
   locations-management UI (`/locations` — create + rename a warehouse/3pl/fba/wfs
   location; no delete, `type` fixed after creation, see that page's own doc
-  comment) are now built; per-location fulfillment routing beyond what the rules
-  engine's `route_to_warehouse` action already does is still open. Returns
-  handling — **built**, see §2.2/§3. Rate-limit hardening, circuit breakers — **built**,
-  see §4.4. Observability dashboards still open — no external account (Sentry/Datadog)
-  provisioned yet, alerting today is still the `[ALERT]`-tagged log lines §4.4
-  describes.
+  comment) are now built. **Stock-aware multi-warehouse allocation — built**:
+  `OrderService.allocateOrder()` (`packages/order-service/src/index.ts`) no longer
+  checks only one location and backorders the instant it's short — it now tries
+  every one of the tenant's warehouse locations, in priority order
+  (`orders.preferred_location_id` first if a routing rule set one, same
+  fail-loudly-if-it-doesn't-resolve behavior as before; then every other
+  warehouse oldest-created-first), and allocates the whole order against the
+  first candidate with enough stock for every line. An order still never splits
+  across locations — it allocates entirely against one chosen location, just a
+  better-chosen one. Concurrency-safe: every (location, product) row this order
+  might touch, across ALL candidates, is locked (`SELECT ... FOR UPDATE`) in one
+  GLOBAL order (by `location_id` then `product_id` — not this order's own
+  priority order) before any location is chosen, specifically because two
+  concurrent orders can have opposite location preferences with overlapping
+  products, and locking in each order's own priority order could deadlock them
+  against each other (`packages/order-service/test/multi-warehouse-allocation.test.ts`,
+  plus the existing `allocation-concurrency.test.ts` "exactly 1 of 10" test still
+  passes unchanged). Two related, larger gaps remain explicitly open and were not
+  part of this change: nearest/cheapest-location-by-shipping-address routing (no
+  schema support at all yet) and per-SKU rule-based routing (blocked upstream —
+  `OrderReceivedPayload` carries no line-item data). Per-location fulfillment
+  routing beyond what the rules engine's `route_to_warehouse` action already does
+  is otherwise still open. Returns handling — **built**, see §2.2/§3. Rate-limit
+  hardening, circuit breakers — **built**, see §4.4. Observability dashboards
+  still open — no external account (Sentry/Datadog) provisioned yet, alerting
+  today is still the `[ALERT]`-tagged log lines §4.4 describes.
   - Open question for Arif: given the widened volume ceiling (§0: up to 50,000
     orders/month), whether the CDC-fed reporting store is worth moving earlier than
     Phase 4 — not a change to the phase order itself, just worth deciding deliberately
