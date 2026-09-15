@@ -340,17 +340,56 @@ received → validated → allocated → picking → packed → shipped → deli
 - **Design note**: build an internal `AmazonEventProcessor` that consumes the SQS
   queue and re-publishes normalized events onto your own internal bus — don't let
   downstream services depend on Amazon's raw notification shape.
+- **Outbound listing creation — built, narrower than Shopify's/Walmart's**
+  (`AmazonConnector.createListing()`, `buildCreateListingRequestBody()`,
+  `POST /api/channels/amazon/listings`, `/products` page): a tenant can attach a new
+  seller offer to an EXISTING Amazon catalog item, identified by ASIN, using
+  `PUT /listings/2021-08-01/items/{sellerId}/{sku}` with `requirements:
+  "LISTING_OFFER_ONLY"` + `productType: "PRODUCT"`. Not a full new-item listing —
+  that needs `requirements: "LISTING"` plus a category-specific attribute schema
+  fetched from Amazon's separate **Product Type Definitions API**, which is
+  **not built** (bigger scope, deliberately deferred; see the decision behind this
+  narrowing below). Genuinely synchronous (the outcome comes back in the same PUT
+  response, like `pushInventory()`'s PATCH above), so this is a separate,
+  connector-specific method — not `ChannelConnector.submitListing()`/
+  `getFeedStatus()`, the async pair that exists for Walmart's real feed submission —
+  same reasoning `ShopifyConnector.createListing()` already established. The new
+  `channel_listings` row lands as `listing_status = 'active'` immediately (no
+  `'pending'` state — unlike Walmart, there's nothing to poll for).
+  - **v1 scope, deliberately narrow, same spirit as Shopify's/Walmart's own
+    narrowing**: offer-only/ASIN-required (no brand-new-item path), condition fixed
+    to `"new_new"` server-side. Amazon's barcode-based matching alternative
+    (`externally_assigned_product_identifier`, the closer analog to Walmart's
+    GTIN-matching flow) was deliberately **not implemented** — only described in
+    prose during research, never confirmed against a literal example payload, and
+    this codebase's standing rule is not to submit an unconfirmed shape to a real
+    marketplace write.
+  - **UNVERIFIED, more so than anything else in this connector**: no live call has
+    been made against this exact PUT + `requirements=LISTING_OFFER_ONLY`
+    combination. This sandbox environment's outbound network policy blocks
+    `api.amazon.com` entirely (confirmed directly — a token-exchange `curl` to
+    `api.amazon.com` was rejected at the proxy level, independent of credentials
+    or code), on top of this connector's pre-existing "not run beyond the original
+    onboarding sandbox pass" status for everything else in this file. The request
+    shape itself was cross-confirmed from multiple independent real-world
+    `github.com/amzn/selling-partner-api-models` community examples (not a single
+    source) rather than official docs, since `developer-docs.amazon.com` could not
+    be fetched during this research pass (redirects to a domain outside this
+    session's fetchable provenance set).
 
-**Unverified until production**: two pieces of Amazon integration are implemented and
-confirmed to reach live SP-API infrastructure with a correct request shape, but can't
-be proven to actually succeed until run against a real seller account, not sandbox
-data —
+**Unverified until production**: three pieces of Amazon integration are implemented
+and confirmed to reach live SP-API infrastructure with a correct request shape (or,
+for `createListing()`, cross-confirmed from real community examples), but can't be
+proven to actually succeed until run against a real seller account —
 
 - The OAuth "Connect Amazon" redirect flow (Website Authorization Workflow) — see the
   detailed writeup above in this section.
 - `AmazonConnector.confirmShipment()` — the static sandbox has no matching test
   scenario for this operation on this account; see its doc comment in
   `packages/channel-connectors/src/amazon-connector.ts` for what was tried.
+- `AmazonConnector.createListing()` — this environment's network policy blocks
+  `api.amazon.com` outright, so not even a sandbox call has been possible; see the
+  bullet above.
 
 ### 4.2 Walmart Marketplace API (build second — structurally different, feed/poll-heavy)
 
@@ -638,8 +677,11 @@ succeeded or failed."
   deliberate, permanent split, not a gap: Shopify's `productSet` mutation is
   synchronous and doesn't fit submit-then-poll at all. Walmart's own outbound path
   (below, in §4.2) DOES now implement the shared interface for real — see that
-  section's "Outbound listing creation" paragraph. Amazon still has no outbound
-  listing-creation path at all. `subscribeToEvents` is still a deliberate no-op on the
+  section's "Outbound listing creation" paragraph. Amazon also has an outbound
+  listing-creation path now (`AmazonConnector.createListing()`, §4.1's own "Outbound
+  listing creation" paragraph) but, like Shopify's, it's a separate non-interface
+  method too, not the shared interface — its underlying write is synchronous, same
+  reasoning as Shopify's. `subscribeToEvents` is still a deliberate no-op on the
   connector itself — real-time webhooks are wired in as
   application/web-layer infrastructure instead, see the paragraph below.
 - **Wired into the app** (migration `0019_channel_connections_shopify.sql`): a

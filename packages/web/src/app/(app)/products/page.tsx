@@ -19,6 +19,9 @@ interface ProductRow {
   walmart_listing_status: string | null;
   walmart_list_price: string | null;
   walmart_raw_payload: { feedId?: string; error?: string | null } | null;
+  amazon_listing_status: string | null;
+  amazon_list_price: string | null;
+  amazon_raw_payload: { asin?: string } | null;
 }
 
 interface ProductsPageProps {
@@ -29,6 +32,7 @@ interface ProductsPageProps {
     walmart_listing_submitted?: string;
     walmart_listing_still_processing?: string;
     walmart_listing_status_checked?: string;
+    amazon_listing_created?: string;
   }>;
 }
 
@@ -61,6 +65,7 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
     walmart_listing_submitted: walmartListingSubmitted,
     walmart_listing_still_processing: walmartListingStillProcessing,
     walmart_listing_status_checked: walmartListingStatusChecked,
+    amazon_listing_created: amazonListingCreated,
   } = await searchParams;
 
   if (!tenantId) {
@@ -72,10 +77,8 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
     );
   }
 
-  const { products, hasActiveShopifyConnection, hasActiveWalmartConnection } = await withTenant(
-    pool,
-    tenantId,
-    async (client) => {
+  const { products, hasActiveShopifyConnection, hasActiveWalmartConnection, hasActiveAmazonConnection } =
+    await withTenant(pool, tenantId, async (client) => {
       const productsResult = await client.query<ProductRow>(
         `SELECT p.id, p.internal_sku, p.name,
                 cl.listing_status AS shopify_listing_status,
@@ -84,12 +87,17 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
                 cw.id AS walmart_listing_id,
                 cw.listing_status AS walmart_listing_status,
                 cw.list_price AS walmart_list_price,
-                cw.raw_payload AS walmart_raw_payload
+                cw.raw_payload AS walmart_raw_payload,
+                ca.listing_status AS amazon_listing_status,
+                ca.list_price AS amazon_list_price,
+                ca.raw_payload AS amazon_raw_payload
            FROM products p
            LEFT JOIN channel_listings cl
              ON cl.product_id = p.id AND cl.tenant_id = p.tenant_id AND cl.channel = 'shopify'
            LEFT JOIN channel_listings cw
              ON cw.product_id = p.id AND cw.tenant_id = p.tenant_id AND cw.channel = 'walmart'
+           LEFT JOIN channel_listings ca
+             ON ca.product_id = p.id AND ca.tenant_id = p.tenant_id AND ca.channel = 'amazon'
           ORDER BY p.internal_sku`,
       );
       const shopifyConnectionResult = await client.query(
@@ -98,13 +106,16 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
       const walmartConnectionResult = await client.query(
         `SELECT 1 FROM channel_connections WHERE channel = 'walmart' AND status = 'active' LIMIT 1`,
       );
+      const amazonConnectionResult = await client.query(
+        `SELECT 1 FROM channel_connections WHERE channel = 'amazon' AND status = 'active' LIMIT 1`,
+      );
       return {
         products: productsResult.rows,
         hasActiveShopifyConnection: shopifyConnectionResult.rows.length > 0,
         hasActiveWalmartConnection: walmartConnectionResult.rows.length > 0,
+        hasActiveAmazonConnection: amazonConnectionResult.rows.length > 0,
       };
-    },
-  );
+    });
 
   return (
     <main className="page">
@@ -132,6 +143,13 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
         <div className="alert alert-info">Walmart is still processing this feed — check back again shortly.</div>
       )}
       {walmartListingStatusChecked === "1" && <div className="alert alert-success">Walmart listing status updated.</div>}
+      {amazonListingCreated === "1" && (
+        <div className="alert alert-success">
+          Offer attached to the given ASIN and live on Amazon (this call is synchronous, unlike Walmart&apos;s feed —
+          no &quot;check status&quot; step needed). Starting stock was synced from your current available-to-sell
+          quantity.
+        </div>
+      )}
       {error && <div className="alert alert-danger">{describeError(error)}</div>}
 
       <details className="stack" style={{ marginBottom: 16 }}>
@@ -158,6 +176,12 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
           <a href="/settings/channels">Channels settings page</a> before submitting an offer.
         </div>
       )}
+      {!hasActiveAmazonConnection && (
+        <div className="alert alert-info">
+          No active Amazon connection — connect one on the{" "}
+          <a href="/settings/channels">Channels settings page</a> before attaching an offer to an ASIN.
+        </div>
+      )}
 
       {products.length === 0 ? (
         <p className="empty">No products yet.</p>
@@ -170,6 +194,7 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
                 <th>Name</th>
                 <th>Shopify</th>
                 <th>Walmart</th>
+                <th>Amazon</th>
               </tr>
             </thead>
             <tbody>
@@ -230,6 +255,24 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
                       <span className="muted">not listed</span>
                     )}
                   </td>
+                  <td>
+                    {product.amazon_listing_status ? (
+                      <div className="stack">
+                        <span className={product.amazon_listing_status === "active" ? "badge badge-success" : "badge"}>
+                          {product.amazon_listing_status}
+                        </span>
+                        <span className="muted">
+                          sku {product.internal_sku}
+                          {product.amazon_list_price ? ` · $${product.amazon_list_price}` : ""}
+                          {product.amazon_raw_payload?.asin ? ` · asin ${product.amazon_raw_payload.asin}` : ""}
+                        </span>
+                      </div>
+                    ) : hasActiveAmazonConnection ? (
+                      <CreateAmazonListingForm productId={product.id} />
+                    ) : (
+                      <span className="muted">not listed</span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -270,6 +313,25 @@ function CreateWalmartListingForm({ productId }: { productId: string }): ReactEl
       <input type="text" name="shippingWeightLbs" placeholder="weight (lb)" required style={{ width: 100 }} />
       <input type="text" name="productCategory" placeholder="category" required style={{ width: 120 }} />
       <button type="submit">Submit offer to Walmart</button>
+    </form>
+  );
+}
+
+/** Plain HTML form, no client JS -- see CreateListingForm's own comment for
+ *  why. Unlike Shopify's/Walmart's forms, this one needs an ASIN, not a SKU
+ *  or GTIN: AmazonConnector.createListing() is offer-only (v1 scope) -- it
+ *  attaches a new seller offer to an EXISTING Amazon catalog item identified
+ *  by ASIN, rather than creating a brand-new item the way Shopify's flow
+ *  does or matching by barcode the way Walmart's flow does. Condition is
+ *  fixed to "new_new" server-side, no field for it here -- see
+ *  AmazonConnector.createListing()'s own doc comment. */
+function CreateAmazonListingForm({ productId }: { productId: string }): ReactElement {
+  return (
+    <form action="/api/channels/amazon/listings" method="POST" className="row" style={{ gap: 6 }}>
+      <input type="hidden" name="productId" value={productId} />
+      <input type="text" name="asin" placeholder="ASIN" required style={{ width: 110 }} />
+      <input type="text" name="price" placeholder="19.99" required style={{ width: 80 }} />
+      <button type="submit">Attach Amazon offer</button>
     </form>
   );
 }
@@ -316,6 +378,22 @@ function describeError(error: string): string {
   }
   if (error.startsWith("walmart_listing_status_check_failed:")) {
     return `Could not check Walmart feed status: ${error.slice("walmart_listing_status_check_failed:".length)}`;
+  }
+  if (error === "amazon_listing_missing_fields") return "Enter an ASIN and a price before submitting.";
+  if (error === "amazon_listing_invalid_price") return "Price must look like 19.99 (up to two decimal places).";
+  if (error === "amazon_listing_product_not_found") return "That product could not be found.";
+  if (error === "amazon_listing_already_exists") return "This product already has an Amazon listing.";
+  if (error.startsWith("amazon_listing_no_connection:")) {
+    return `No active Amazon connection (${error.slice("amazon_listing_no_connection:".length)}).`;
+  }
+  if (error.startsWith("amazon_listing_create_failed:")) {
+    return `Amazon rejected the offer submission: ${error.slice("amazon_listing_create_failed:".length)}`;
+  }
+  if (error.startsWith("amazon_listing_created_but_not_recorded:")) {
+    return (
+      `The offer was created on Amazon (asin ${error.slice("amazon_listing_created_but_not_recorded:".length)}) ` +
+      "but saving it here failed — check server logs; avoid creating it again from this page."
+    );
   }
   return error;
 }

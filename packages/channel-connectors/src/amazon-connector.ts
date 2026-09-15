@@ -155,13 +155,106 @@ interface GetOrderItemsResponse {
   errors?: Array<{ code: string; message: string; details?: string }>;
 }
 
-/** Response shape of PATCH /listings/2021-08-01/items/{sellerId}/{sku}. */
+/** Response shape of PATCH/PUT /listings/2021-08-01/items/{sellerId}/{sku} --
+ *  both operations return the same ListingsItemSubmissionResponse shape
+ *  (confirmed from the API's own OpenAPI model, which references this one
+ *  schema from both operations); reused for {@link AmazonConnector.createListing}
+ *  below rather than declaring a second, identical type. */
 interface ListingsPatchResponse {
   sku: string;
   status: string; // 'ACCEPTED' (normal request) | 'VALID' | 'INVALID' (mode=VALIDATION_PREVIEW)
   submissionId?: string;
   issues?: Array<{ code: string; message: string; severity: string }>;
   errors?: Array<{ code: string; message: string; details?: string }>;
+}
+
+/** Input for {@link AmazonConnector.createListing} -- the minimum data
+ *  needed to attach a new seller offer to an EXISTING Amazon catalog item.
+ *  Deliberately narrower than a full new-item listing, same "v1 scope" spirit
+ *  as {@link ShopifyListingSubmission}/Walmart's GTIN-only Offer-Setup-by-Match
+ *  scope -- see createListing()'s own doc comment for exactly why. */
+export interface AmazonListingSubmission {
+  /** The existing Amazon catalog item this offer attaches to. Confirmed
+   *  (via a real code example found during this pass, not just prose) as
+   *  the `merchant_suggested_asin` attribute -- Amazon's alternative,
+   *  barcode-based matching (`externally_assigned_product_identifier`,
+   *  the closer analog to Walmart's GTIN-matching flow) was only described
+   *  in prose, never in a literal confirmed payload, so it isn't
+   *  implemented here; a tenant must already know the ASIN. */
+  asin: string;
+  /** The seller's own SKU for this offer -- the path segment AND the
+   *  `sku` this listing is created/found under, same "channel only knows
+   *  its own SKU" convention `pushInventory()`'s own doc comment already
+   *  documents for this connector. */
+  sellerSku: string;
+  /** Money-scalar-compatible string, e.g. "19.99" -- same convention
+   *  NormalizedOrderLine.unitPrice/ShopifyListingSubmission.price already
+   *  use. Submitted as `purchasable_offer`, priced in USD only (v1
+   *  simplification -- this connector's `marketplaceIds` isn't threaded
+   *  through to a matching currency code yet; only correct for a
+   *  USD-priced US-marketplace listing). */
+  price: string;
+  /** Starting stock for the `fulfillment_availability` attribute --
+   *  merchant-fulfilled (MFN) only, same "fulfillment_channel_code:
+   *  'DEFAULT'" scope `pushInventory()` already documents; FBA/AFN
+   *  inventory isn't set through this call. */
+  quantity: number;
+  /** Amazon's own `condition_type` attribute value, e.g. "new_new" --
+   *  confirmed literal value from a real code example found during this
+   *  pass. Defaults to "new_new" when omitted -- new-condition-only is
+   *  this codebase's v1 scope everywhere outbound listing creation
+   *  appears (Shopify/Walmart included). */
+  conditionType?: string;
+}
+
+export interface AmazonListingResult {
+  success: boolean;
+  sku: string | null;
+  error: string | null;
+}
+
+/** The PUT /listings/2021-08-01/items/{sellerId}/{sku} request body shape --
+ *  only the fields {@link buildCreateListingRequestBody} actually sets are
+ *  declared. */
+export interface CreateListingRequestBody {
+  productType: "PRODUCT";
+  requirements: "LISTING_OFFER_ONLY";
+  attributes: {
+    merchant_suggested_asin: Array<{ value: string; marketplace_id: string }>;
+    condition_type: Array<{ value: string; marketplace_id: string }>;
+    purchasable_offer: Array<{
+      marketplace_id: string;
+      currency: string;
+      our_price: Array<{ schedule: Array<{ value_with_tax: number }> }>;
+    }>;
+    fulfillment_availability: Array<{ fulfillment_channel_code: string; quantity: number }>;
+  };
+}
+
+/** Pure request-body builder for {@link AmazonConnector.createListing}, split
+ *  out the same way WalmartConnector's buildMpItemMatchFeedPayload is --
+ *  provable without a live/mocked network call. See createListing()'s own
+ *  doc comment for where each attribute shape was confirmed from. */
+export function buildCreateListingRequestBody(
+  input: AmazonListingSubmission,
+  marketplaceId: string,
+): CreateListingRequestBody {
+  return {
+    productType: "PRODUCT",
+    requirements: "LISTING_OFFER_ONLY",
+    attributes: {
+      merchant_suggested_asin: [{ value: input.asin, marketplace_id: marketplaceId }],
+      condition_type: [{ value: input.conditionType ?? "new_new", marketplace_id: marketplaceId }],
+      purchasable_offer: [
+        {
+          marketplace_id: marketplaceId,
+          currency: "USD",
+          our_price: [{ schedule: [{ value_with_tax: Number(input.price) }] }],
+        },
+      ],
+      fulfillment_availability: [{ fulfillment_channel_code: "DEFAULT", quantity: input.quantity }],
+    },
+  };
 }
 
 function readRequiredEnv(name: string): string {
@@ -260,9 +353,14 @@ export async function createAmazonConnectorFromChannelConnection(
 /**
  * Amazon SP-API connector -- implements authenticate(), the
  * getMarketplaceParticipations sandbox smoke-test call, pullOrders(),
- * pushInventory(), and confirmShipment(). Does NOT implement the full
- * ChannelConnector interface yet; submitListing()/getFeedStatus() are
- * separate, later work.
+ * pushInventory(), createListing(), and confirmShipment(). Does NOT
+ * implement the full ChannelConnector interface; submitListing()/
+ * getFeedStatus() (the async submit-then-poll pair Walmart's connector
+ * implements for real) don't fit this class at all -- Amazon's own
+ * outbound listing write (createListing(), below) is genuinely synchronous,
+ * so it's a separate, non-interface method instead, the same shape
+ * decision ShopifyConnector.createListing() already made for the same
+ * reason.
  *
  * Credentials come either from process.env (the default, via
  * {@link loadAmazonSandboxCredentialsFromEnv}, used by
@@ -534,6 +632,86 @@ export class AmazonConnector {
     }
 
     return { success: true, externalId: data.sku };
+  }
+
+  /**
+   * PUT /listings/2021-08-01/items/{sellerId}/{sku} -- outbound listing
+   * creation, closing (in part) the "Amazon still has no outbound
+   * listing-creation path at all" gap CLAUDE.md flagged once Shopify's
+   * createListing() and Walmart's real submitListing() existed. `requirements:
+   * "LISTING_OFFER_ONLY"` + `productType: "PRODUCT"` attaches a new seller
+   * offer (price/quantity/condition) to an EXISTING Amazon catalog item
+   * identified by ASIN, rather than creating a brand-new catalog item from
+   * scratch.
+   *
+   * DELIBERATELY NARROW, same spirit as ShopifyConnector.createListing()'s
+   * single-variant-only scope and WalmartConnector.submitListing()'s
+   * GTIN-only scope: a full new-item listing (`requirements: "LISTING"`)
+   * needs a category-specific attribute schema -- item_name, bullet_points,
+   * images, and more, all varying by `productType` -- fetched from Amazon's
+   * separate Product Type Definitions API first. Not built here; see
+   * CLAUDE.md's own note on this scope decision.
+   *
+   * Same-shape, non-interface method as ShopifyConnector.createListing() --
+   * NOT ChannelConnector.submitListing()/getFeedStatus() -- because this
+   * call is genuinely synchronous (the outcome comes back in the same HTTP
+   * response, exactly like pushInventory()'s PATCH call above), unlike
+   * Walmart's real async feed submission that interface pair exists for.
+   *
+   * Attribute shapes below (merchant_suggested_asin, condition_type,
+   * purchasable_offer, fulfillment_availability) are confirmed from real,
+   * literal example payloads found in Amazon SP-API community discussions
+   * (github.com/amzn/selling-partner-api-models) during this pass --
+   * fulfillment_availability's shape is additionally already live-confirmed
+   * in THIS codebase by pushInventory() above. UNVERIFIED AS A WHOLE
+   * REQUEST, same status as everything else in this class: no live call has
+   * been made against this exact PUT + requirements=LISTING_OFFER_ONLY
+   * combination -- this environment's outbound network policy blocks
+   * api.amazon.com entirely (confirmed while researching this feature), on
+   * top of this class's pre-existing "not run against a real account"
+   * status for anything beyond the original sandbox pass.
+   */
+  async createListing(input: AmazonListingSubmission): Promise<AmazonListingResult> {
+    const { accessToken } = await this.authenticate();
+    // this.marketplaceIds always has at least one entry -- both the
+    // constructor's own default and createAmazonConnectorFromChannelConnection's
+    // default supply a one-element array, and nothing in this class ever
+    // empties it -- but noUncheckedIndexedAccess still types index access as
+    // possibly-undefined, so fail loudly rather than silently sending
+    // marketplace_id: undefined to a real marketplace write if that
+    // invariant is ever violated.
+    const marketplaceId = this.marketplaceIds[0];
+    if (!marketplaceId) {
+      return { success: false, sku: null, error: "AmazonConnector has no configured marketplaceIds" };
+    }
+
+    const response = await fetchWithBackoff(
+      `${this.baseUrl}/listings/2021-08-01/items/${encodeURIComponent(this.sellerId)}/${encodeURIComponent(input.sellerSku)}` +
+        `?marketplaceIds=${this.marketplaceIds.join(",")}`,
+      {
+        method: "PUT",
+        headers: {
+          "x-amz-access-token": accessToken,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(buildCreateListingRequestBody(input, marketplaceId)),
+      },
+    );
+
+    const data = (await response.json()) as ListingsPatchResponse;
+
+    if (!response.ok) {
+      const message = data.errors?.map((e) => `${e.code}: ${e.message}`).join("; ") ?? response.statusText;
+      return { success: false, sku: null, error: `SP-API listings create failed: ${response.status} ${message}` };
+    }
+
+    if (data.status !== "ACCEPTED" && data.status !== "VALID") {
+      const message =
+        data.issues?.map((i) => `${i.code}: ${i.message}`).join("; ") ?? `unexpected status '${data.status}'`;
+      return { success: false, sku: data.sku ?? null, error: message };
+    }
+
+    return { success: true, sku: data.sku ?? input.sellerSku, error: null };
   }
 
   /**
