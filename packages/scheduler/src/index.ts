@@ -46,6 +46,137 @@ export interface TenantSyncResult {
   error: string | null;
 }
 
+/** Consecutive failed sync runs past which a channel_connections row's
+ *  status flips from 'active' to 'error' -- see recordSyncFailure()'s doc
+ *  comment for the full reasoning. Three, not one: a single transient
+ *  network blip or a marketplace's momentary 503 shouldn't flip a healthy
+ *  tenant to 'error' on the very next cron tick; three in a row is a much
+ *  stronger signal of a genuinely dead credential/token than one. */
+export const CONSECUTIVE_FAILURE_ERROR_THRESHOLD = 3;
+
+/**
+ * Records a failed sync attempt against the tenant's active channel_connections
+ * row for this channel: increments consecutive_failures, stamps
+ * last_failure_at/last_failure_message, and -- once
+ * CONSECUTIVE_FAILURE_ERROR_THRESHOLD is reached -- flips `status` from
+ * 'active' to 'error' in the same statement. This is the fix for the
+ * "KNOWN GAP" every syncXTenant() catch block used to document (a dead
+ * connection failing silently forever, with only per-run log lines and no
+ * cross-run signal anywhere); it's a single shared helper rather than
+ * three near-copies because the tracking logic itself -- increment a
+ * counter, stamp a timestamp/message, threshold-flip a status -- is
+ * identical across channels, unlike the sync functions themselves (which
+ * differ in real, connector-specific ways: Amazon's isSandbox() lookback
+ * branch has no Shopify/Walmart equivalent, see syncShopifyOrders's doc
+ * comment).
+ *
+ * WHERE status = 'active' is deliberate, not incidental: once a row has
+ * already been flipped to 'error' (by a prior call crossing the
+ * threshold), this UPDATE matches zero rows and consecutive_failures stops
+ * climbing -- an 'error' row is a fixed historical marker, not a counter
+ * that keeps incrementing forever. It also means an 'error' row
+ * self-removes from every syncXOrders() discovery query's own
+ * `WHERE status = 'active'` filter, so a tenant that's been failing for
+ * CONSECUTIVE_FAILURE_ERROR_THRESHOLD runs in a row stops being retried on
+ * every subsequent cron tick -- retrying a connection that's this
+ * consistently broken wastes calls against a marketplace that may itself
+ * be rate-limiting/circuit-breaking the tenant (CLAUDE.md §4.4), and
+ * fixes nothing a human reconnecting the credential wouldn't also
+ * require. Recovery today is the tenant using the Reconnect form
+ * (ChannelConnectForm et al. already verify live before writing
+ * status = 'active' again -- see the connect routes) -- nothing here
+ * auto-retries an 'error' row; an explicit "retry now" action is future
+ * work, not attempted here.
+ *
+ * Alerting is log-based only, deliberately -- no email/Slack/notification
+ * infra exists anywhere in this codebase (CLAUDE.md §5's Observability row
+ * names Datadog/Sentry, not a notification service). The distinctly
+ * "[ALERT]"-tagged console.error below fires exactly once per incident --
+ * on the run that *crosses* the threshold, not on every failed run after
+ * (the row leaves the 'active' pool at that point, so there is no "after"
+ * to log) -- so a log-based alert (a Sentry issue, a Datadog log monitor
+ * matching "[ALERT]") fires once, not once per cron tick for as long as
+ * the tenant stays broken. The caller's own per-run console.error is
+ * unchanged and still fires every time.
+ *
+ * Exported (along with {@link recordSyncSuccess} and
+ * {@link CONSECUTIVE_FAILURE_ERROR_THRESHOLD}) purely so
+ * test/sync-failure-tracking.test.ts can exercise this DB logic directly
+ * against a real local Postgres, the same "exported for testability"
+ * treatment walmart-connector.ts already gives its own pure mapping
+ * functions -- callers inside this file should keep going through
+ * syncTenant()/syncShopifyTenant()/syncWalmartTenant(), not call this
+ * directly.
+ */
+export async function recordSyncFailure(
+  appPool: Pool,
+  tenantId: string,
+  channel: "amazon" | "shopify" | "walmart",
+  message: string,
+): Promise<void> {
+  await withTenant(appPool, tenantId, async (client) => {
+    const updated = await client.query<{ consecutive_failures: number; status: string }>(
+      `UPDATE channel_connections
+          SET consecutive_failures = consecutive_failures + 1,
+              last_failure_at = now(),
+              last_failure_message = $1,
+              status = CASE WHEN consecutive_failures + 1 >= $2 THEN 'error' ELSE status END,
+              updated_at = now()
+        WHERE tenant_id = $3 AND channel = $4 AND status = 'active'
+        RETURNING consecutive_failures, status`,
+      // Truncated defensively -- last_failure_message is TEXT (unbounded),
+      // but an unbounded connector error string (a raw provider response
+      // body, say) has no business growing this row without limit.
+      [message.slice(0, 2000), CONSECUTIVE_FAILURE_ERROR_THRESHOLD, tenantId, channel],
+    );
+
+    const row = updated.rows[0];
+    if (row?.status === "error" && row.consecutive_failures === CONSECUTIVE_FAILURE_ERROR_THRESHOLD) {
+      console.error(
+        `[ALERT] ${channel} channel_connections for tenant ${tenantId} has failed ${row.consecutive_failures} ` +
+          `consecutive sync runs and is now status='error' -- it will NOT be retried automatically until ` +
+          `reconnected via /settings/channels. Last error: ${message}`,
+      );
+    }
+  });
+}
+
+/**
+ * Records a successful sync attempt, resetting consecutive_failures back to
+ * 0 -- the counterpart to recordSyncFailure(), called from every
+ * syncXTenant()'s success path. Deliberately does NOT clear
+ * last_failure_at/last_failure_message on success -- see the migration's
+ * own comment (0021_channel_connections_failure_tracking.sql): a past
+ * incident stays visible even once resolved, rather than being erased the
+ * moment things recover.
+ *
+ * `AND consecutive_failures > 0` is a pure optimization, not a correctness
+ * requirement -- without it, every single successful run of a healthy
+ * connection (the overwhelmingly common case) would still issue a no-op
+ * UPDATE and bump updated_at for no reason.
+ *
+ * Matches only status = 'active' rows -- a row already flipped to 'error'
+ * is not auto-recovered by this. That's dead code for the 'error' case as
+ * things stand today (nothing calls pullOrders() for an 'error' row's
+ * tenant in the first place -- see recordSyncFailure()'s doc comment on
+ * why an 'error' row self-removes from every discovery query), kept only
+ * as a safety net should that invariant ever change.
+ */
+export async function recordSyncSuccess(
+  appPool: Pool,
+  tenantId: string,
+  channel: "amazon" | "shopify" | "walmart",
+): Promise<void> {
+  await withTenant(appPool, tenantId, (client) =>
+    client.query(
+      `UPDATE channel_connections
+          SET consecutive_failures = 0, updated_at = now()
+        WHERE tenant_id = $1 AND channel = $2 AND status = 'active' AND consecutive_failures > 0`,
+      [tenantId, channel],
+    ),
+  );
+}
+
 export interface SyncAmazonOrdersParams {
   /** The least-privilege `app_user` pool -- every actual read/write for a
    *  discovered tenant goes through this, RLS-scoped via withTenant(), same
@@ -159,24 +290,17 @@ async function syncTenant(appPool: Pool, orderService: OrderService, tenantId: s
         [syncStartedAt.toISOString(), tenantId],
       ),
     );
+    await recordSyncSuccess(appPool, tenantId, "amazon");
 
     return { tenantId, success: true, ...persisted, error: null };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Amazon order sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
-    // KNOWN GAP, flagged rather than built (same treatment as this
-    // session's other documented gaps -- kitting/bundling, short-pick
-    // backorder handling): v1 has no cross-run failure tracking or
-    // alerting. This logs once, per run, and nothing more -- a tenant
-    // whose token expired or whose SP-API authorization was revoked fails
-    // silently on every subsequent run with no signal anywhere that a
-    // pattern exists, only individual log lines. The actual production
-    // risk this leaves open is a tenant going dark for an extended period
-    // with zero visibility (no orders syncing, no alert, nothing in a
-    // dashboard) until a seller notices and complains. Building real
-    // tracking (e.g. a consecutive-failure counter on channel_connections,
-    // or transitioning `status` to 'error' past a threshold, with actual
-    // alerting) is the trigger for revisiting this -- not attempted here.
+    // Cross-run failure tracking/alerting -- see recordSyncFailure()'s doc
+    // comment. This used to be a KNOWN GAP (a dead connection failing
+    // silently forever, no signal anywhere beyond this one log line); it
+    // no longer is.
+    await recordSyncFailure(appPool, tenantId, "amazon", message);
     return { tenantId, success: false, insertedOrderIds: [], skippedExternalOrderIds: [], error: message };
   }
 }
@@ -251,13 +375,15 @@ async function syncShopifyTenant(appPool: Pool, orderService: OrderService, tena
         [syncStartedAt.toISOString(), tenantId],
       ),
     );
+    await recordSyncSuccess(appPool, tenantId, "shopify");
 
     return { tenantId, success: true, ...persisted, error: null };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Shopify order sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
-    // Same documented gap as syncTenant() -- no cross-run failure tracking
-    // or alerting yet, see that function's comment.
+    // Same cross-run failure tracking as syncTenant() -- see
+    // recordSyncFailure()'s doc comment.
+    await recordSyncFailure(appPool, tenantId, "shopify", message);
     return { tenantId, success: false, insertedOrderIds: [], skippedExternalOrderIds: [], error: message };
   }
 }
@@ -340,15 +466,20 @@ async function syncWalmartTenant(appPool: Pool, orderService: OrderService, tena
         [syncStartedAt.toISOString(), tenantId],
       ),
     );
+    await recordSyncSuccess(appPool, tenantId, "walmart");
 
     return { tenantId, success: true, ...persisted, error: null };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Walmart order sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
-    // Same documented gap as syncTenant()/syncShopifyTenant() -- no
-    // cross-run failure tracking or alerting yet, see syncTenant()'s
-    // comment. Doubly expected to fire for every Walmart-connected tenant
-    // right now, given the UNVERIFIED status above.
+    // Same cross-run failure tracking as syncTenant()/syncShopifyTenant()
+    // -- see recordSyncFailure()'s doc comment. Doubly expected to fire
+    // (and to flip status to 'error' within CONSECUTIVE_FAILURE_ERROR_THRESHOLD
+    // runs) for every Walmart-connected tenant right now, given the
+    // UNVERIFIED status above -- that's the correct, intended behavior,
+    // not a bug: an unverified connection that's actually broken SHOULD
+    // end up visibly in 'error' rather than failing invisibly forever.
+    await recordSyncFailure(appPool, tenantId, "walmart", message);
     return { tenantId, success: false, insertedOrderIds: [], skippedExternalOrderIds: [], error: message };
   }
 }
@@ -450,6 +581,19 @@ async function syncShopifyCatalogForTenant(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Shopify catalog sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
+    // Deliberately NOT wired into recordSyncFailure()/the shared
+    // consecutive_failures counter that syncTenant()/syncShopifyTenant()/
+    // syncWalmartTenant() now use (see recordSyncFailure()'s doc comment)
+    // -- catalog sync and order sync are genuinely different operations
+    // sharing the same channel_connections row (this function's own doc
+    // comment above already makes that "different failure/idempotency
+    // shapes" point), and pullProductCatalog() failing for reasons that
+    // have nothing to do with pullOrders() (e.g. a GraphQL-only schema
+    // quirk) should never flip a tenant's connection to 'error' and cut
+    // off order sync, which may be working perfectly. This still logs
+    // every failure, same as before -- it's cross-run tracking/alerting
+    // specifically that's still an open gap here, deliberately, not
+    // fixed by this change.
     return { tenantId, success: false, variantsUpserted: 0, error: message };
   }
 

@@ -307,6 +307,11 @@ tbody tr:last-child td {
   color: var(--text-muted);
 }
 
+.alert-warning {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
 /* --- forms / buttons --- */
 button,
 .btn {

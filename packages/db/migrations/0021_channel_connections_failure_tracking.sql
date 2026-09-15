@@ -1,0 +1,33 @@
+-- Closes the "KNOWN GAP" documented in every syncXTenant() catch block in
+-- packages/scheduler/src/index.ts (syncTenant/syncShopifyTenant/
+-- syncWalmartTenant): today a tenant's Amazon/Shopify/Walmart connection can
+-- fail on every single sync run, forever, with nothing but an individual
+-- log line each time -- no signal anywhere (not the DB, not the UI) that a
+-- pattern exists, until a seller notices no orders are coming in and
+-- complains. These columns are the storage this project's own comment
+-- called for: "a consecutive-failure counter on channel_connections, or
+-- transitioning `status` to 'error' past a threshold."
+--
+-- consecutive_failures: how many sync runs in a row have failed for this
+-- connection. Reset to 0 on a successful run (see
+-- packages/scheduler/src/index.ts's recordSyncSuccess()); incremented on
+-- each failed run (see recordSyncFailure()) until it crosses a threshold,
+-- at which point that same function flips `status` (already present, see
+-- 0012's CHECK constraint -- 'error' has been a legal value since day one,
+-- just never written by anything) from 'active' to 'error'. NOT NULL
+-- DEFAULT 0: every existing row in production today has a clean slate, not
+-- an unknown failure history.
+--
+-- last_failure_at / last_failure_message: when the most recent failure
+-- happened and what it said. Deliberately NOT cleared back to NULL by a
+-- later successful run (only consecutive_failures resets) -- "this
+-- connection failed as recently as <time>, currently healthy" is more
+-- useful in the /settings/channels UI than erasing all trace of a past
+-- incident the moment it resolves. Both nullable: a connection that has
+-- never failed has nothing to record here.
+--
+-- Expand-only per CLAUDE.md §9: three new nullable-or-defaulted columns,
+-- no existing column touched, no existing row's shape changes.
+ALTER TABLE channel_connections ADD COLUMN consecutive_failures INT NOT NULL DEFAULT 0;
+ALTER TABLE channel_connections ADD COLUMN last_failure_at TIMESTAMPTZ;
+ALTER TABLE channel_connections ADD COLUMN last_failure_message TEXT;

@@ -8,7 +8,18 @@ import { resolveTenantId } from "@/lib/with-tenant-auth";
 
 export const dynamic = "force-dynamic";
 
-interface ChannelConnectionRow {
+/** consecutive_failures/last_failure_at/last_failure_message added by
+ *  migrations/0021_channel_connections_failure_tracking.sql -- see that
+ *  migration and packages/scheduler/src/index.ts's recordSyncFailure()/
+ *  recordSyncSuccess() for how they're written. Present on every channel's
+ *  row (all three interfaces below), never just Amazon's. */
+interface FailureTrackingColumns {
+  consecutive_failures: number;
+  last_failure_at: string | null;
+  last_failure_message: string | null;
+}
+
+interface ChannelConnectionRow extends FailureTrackingColumns {
   external_account_id: string;
   marketplace: string;
   status: string;
@@ -24,7 +35,7 @@ interface ChannelConnectionRow {
  *  never the decrypted value itself, just whether real-time webhooks
  *  (see /api/webhooks/shopify) can possibly be verified for this
  *  connection or whether it's cron-only for now. */
-interface ShopifyConnectionRow {
+interface ShopifyConnectionRow extends FailureTrackingColumns {
   external_account_id: string;
   status: string;
   created_at: string;
@@ -37,7 +48,7 @@ interface ShopifyConnectionRow {
  *  doc comment in walmart-connector.ts). external_account_id is the
  *  tenant's own Walmart clientId, not an independent seller id -- see the
  *  connect route's comment for why that reuse is deliberate. */
-interface WalmartConnectionRow {
+interface WalmartConnectionRow extends FailureTrackingColumns {
   external_account_id: string;
   status: string;
   created_at: string;
@@ -53,6 +64,57 @@ function classifyEnvironment(lwaClientId: string): "Sandbox" | "Production" | "U
   if (lwaClientId === process.env.AMAZON_SANDBOX_CLIENT_ID) return "Sandbox";
   if (lwaClientId === process.env.AMAZON_PRODUCTION_CLIENT_ID) return "Production";
   return "Unknown";
+}
+
+/**
+ * Renders the sync-failure-tracking banner shared by all three channel
+ * cards -- see migrations/0021_channel_connections_failure_tracking.sql
+ * and recordSyncFailure()/recordSyncSuccess() in
+ * packages/scheduler/src/index.ts for where these columns come from. Two
+ * distinct states worth surfacing, one function so all three cards render
+ * them identically:
+ *
+ *  - status === 'error': the connection has failed
+ *    CONSECUTIVE_FAILURE_ERROR_THRESHOLD runs in a row and the scheduler has
+ *    stopped retrying it automatically (see recordSyncFailure()'s doc
+ *    comment) -- this is the "go reconnect this" case, shown as a danger
+ *    alert with the last error message so a tenant doesn't have to guess
+ *    what to fix.
+ *  - status === 'active' but consecutive_failures > 0: currently healthy,
+ *    but has failed at least once recently and hasn't yet failed enough
+ *    times in a row to trip the threshold -- worth a quieter heads-up
+ *    rather than silence, since a tenant one failure away from 'error' is
+ *    useful to know about before it gets there.
+ *
+ * Returns null (renders nothing) for a healthy connection with no failure
+ * history -- the common case shouldn't get a banner at all.
+ */
+function SyncFailureBanner({
+  status,
+  consecutive_failures: consecutiveFailures,
+  last_failure_at: lastFailureAt,
+  last_failure_message: lastFailureMessage,
+}: FailureTrackingColumns & { status: string }): ReactElement | null {
+  if (status === "error") {
+    return (
+      <div className="alert alert-danger" style={{ marginTop: 8, marginBottom: 0 }}>
+        Sync stopped after {consecutiveFailures} consecutive failed runs
+        {lastFailureAt && ` (last failure ${new Date(lastFailureAt).toISOString()})`}
+        {lastFailureMessage && `: ${lastFailureMessage}`}. This connection will not be retried automatically --
+        reconnect below once the underlying issue is fixed.
+      </div>
+    );
+  }
+  if (consecutiveFailures > 0) {
+    return (
+      <div className="alert alert-warning" style={{ marginTop: 8, marginBottom: 0 }}>
+        {consecutiveFailures} sync failure{consecutiveFailures === 1 ? "" : "s"} in a row so far
+        {lastFailureAt && ` (most recently ${new Date(lastFailureAt).toISOString()})`}
+        {lastFailureMessage && `: ${lastFailureMessage}`}. Still syncing -- this is just a heads-up.
+      </div>
+    );
+  }
+  return null;
 }
 
 interface ChannelsSettingsPageProps {
@@ -89,7 +151,8 @@ export default async function ChannelsSettingsPage({
 
   const { connection, shopifyConnection, walmartConnection } = await withTenant(pool, tenantId, async (client) => {
     const amazonResult = await client.query<ChannelConnectionRow>(
-      `SELECT external_account_id, marketplace, status, created_at, last_order_sync_at, lwa_client_id
+      `SELECT external_account_id, marketplace, status, created_at, last_order_sync_at, lwa_client_id,
+              consecutive_failures, last_failure_at, last_failure_message
          FROM channel_connections
         WHERE channel = 'amazon'
         ORDER BY created_at DESC
@@ -97,14 +160,16 @@ export default async function ChannelsSettingsPage({
     );
     const shopifyResult = await client.query<ShopifyConnectionRow>(
       `SELECT external_account_id, status, created_at, last_order_sync_at,
-              (encrypted_client_secret IS NOT NULL) AS has_webhook_secret
+              (encrypted_client_secret IS NOT NULL) AS has_webhook_secret,
+              consecutive_failures, last_failure_at, last_failure_message
          FROM channel_connections
         WHERE channel = 'shopify'
         ORDER BY created_at DESC
         LIMIT 1`,
     );
     const walmartResult = await client.query<WalmartConnectionRow>(
-      `SELECT external_account_id, status, created_at, last_order_sync_at
+      `SELECT external_account_id, status, created_at, last_order_sync_at,
+              consecutive_failures, last_failure_at, last_failure_message
          FROM channel_connections
         WHERE channel = 'walmart'
         ORDER BY created_at DESC
@@ -166,6 +231,12 @@ export default async function ChannelsSettingsPage({
               Last order sync:{" "}
               {connection.last_order_sync_at ? new Date(connection.last_order_sync_at).toISOString() : "never synced yet"}
             </div>
+            <SyncFailureBanner
+              status={connection.status}
+              consecutive_failures={connection.consecutive_failures}
+              last_failure_at={connection.last_failure_at}
+              last_failure_message={connection.last_failure_message}
+            />
             {environment === "Production" && (
               <div className="alert alert-info" style={{ marginTop: 8, marginBottom: 0 }}>
                 Production inventory/listing pushes are not enabled in this UI yet — pending Amazon&apos;s SP-API
@@ -202,6 +273,12 @@ export default async function ChannelsSettingsPage({
                 ? "Real-time webhooks: signing secret on file (see /api/webhooks/shopify) -- orders/create, orders/cancelled, and app/uninstalled sync near-instantly; the daily cron still runs as a fallback."
                 : "Real-time webhooks: not enabled -- no signing secret on file yet, syncing via the daily cron only. Enter the custom app's API secret key below to enable them."}
             </div>
+            <SyncFailureBanner
+              status={shopifyConnection.status}
+              consecutive_failures={shopifyConnection.consecutive_failures}
+              last_failure_at={shopifyConnection.last_failure_at}
+              last_failure_message={shopifyConnection.last_failure_message}
+            />
             {/* No OAuth reconnect redirect for Shopify (see the connect
                 route's own doc comment) -- reconnecting means re-submitting
                 the form below with a fresh token, so it's always shown
@@ -233,9 +310,15 @@ export default async function ChannelsSettingsPage({
             <div className="alert alert-info" style={{ marginTop: 8, marginBottom: 0 }}>
               UNVERIFIED against real Walmart infrastructure — this connection is wired the same way Amazon/Shopify
               are, but nothing has actually round-tripped against Walmart&apos;s live API yet (no self-serve
-              sandbox exists to test against ahead of an approved seller account). Order sync will fail silently
-              into this connection&apos;s error state until that&apos;s proven.
+              sandbox exists to test against ahead of an approved seller account). Order sync failures are no
+              longer silent, though — see below if this connection has started failing.
             </div>
+            <SyncFailureBanner
+              status={walmartConnection.status}
+              consecutive_failures={walmartConnection.consecutive_failures}
+              last_failure_at={walmartConnection.last_failure_at}
+              last_failure_message={walmartConnection.last_failure_message}
+            />
             {/* No OAuth reconnect redirect (same reasoning as Shopify's own
                 form here) -- reconnecting means re-submitting this form with
                 a fresh/corrected clientId+clientSecret pair. */}

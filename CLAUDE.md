@@ -408,6 +408,28 @@ succeeded or failed."
   automatically on 503s rather than risking account-level suspension.
 - **Idempotency keys** on every write and every event handler — both Amazon and
   Walmart will redeliver; handlers must be safe to run twice.
+- **Cross-run sync failure tracking/alerting — built** (`migrations/
+  0021_channel_connections_failure_tracking.sql`, `packages/scheduler/src/index.ts`'s
+  `recordSyncFailure()`/`recordSyncSuccess()`): `channel_connections` now carries
+  `consecutive_failures`/`last_failure_at`/`last_failure_message`. Every failed
+  order-sync run for Amazon/Shopify/Walmart increments the counter and stamps the
+  timestamp/message; a successful run resets the counter to 0 (but deliberately
+  leaves the last-failure timestamp/message in place — a resolved incident stays
+  visible in `/settings/channels` rather than being erased). Three consecutive
+  failures flips `status` from `active` to `error` in the same statement, which
+  also self-removes that connection from every sync job's `WHERE status = 'active'`
+  discovery query — a dead connection stops being retried on every cron tick
+  instead of failing forever with only a log line each time. A single
+  `[ALERT]`-tagged `console.error` fires exactly once, on the run that crosses the
+  threshold (log-based alerting only — no email/Slack/notification infra exists in
+  this codebase, see §5's Observability row). Recovery is manual today: the tenant
+  reconnects via `/settings/channels`, which re-verifies live before writing
+  `status = 'active'` again; nothing auto-retries an `error` row. Deliberately NOT
+  wired into `syncShopifyCatalogForTenant` — catalog sync and order sync are
+  different operations sharing one `channel_connections` row, and a catalog-only
+  failure (e.g. a GraphQL schema quirk) shouldn't be able to flip a tenant to
+  `error` and cut off order sync, which may be working fine; that gap stays open,
+  flagged in that function's own comment.
 
 ### 4.5 Shopify Admin API (build third — channel #3, GraphQL, verified live)
 
