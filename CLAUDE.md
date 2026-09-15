@@ -696,14 +696,21 @@ succeeded or failed."
     exception `packages/scheduler`'s tenant-enumeration queries already use — every
     subsequent read/write for the resolved tenant goes through the normal `app_user` +
     `withTenant()` path.
-  - **Known gap, documented not solved**: an `orders/cancelled` delivery that arrives
-    before the corresponding order has ever been created locally (out-of-order delivery,
-    or a tenant enabling webhooks after an order was already placed *and* cancelled on
-    Shopify) has nothing to cancel yet — logged and acknowledged, but a later
-    cron/`orders/create` delivery for the same order will still insert it as a normal
-    `'received'` order and allocate against it as if it were never cancelled. Closing
-    this needs either re-reading Shopify's current order state instead of trusting
-    delivery order, or a small "seen but not yet local" staging table — neither built.
+  - **Out-of-order `orders/cancelled` gap — built, narrowed not fully closed**
+    (migration `0025_early_channel_cancellations.sql`): an `orders/cancelled` delivery
+    that arrives before the corresponding order has ever been created locally
+    (out-of-order delivery, or a tenant enabling webhooks after an order was already
+    placed *and* cancelled on Shopify) used to just be logged and dropped, letting a
+    later cron/`orders/create` delivery insert the order as normal and allocate real
+    stock against it as if it were never cancelled. Now stages the cancellation in
+    `early_channel_cancellations` (keyed like `orders`' own `(tenant_id, channel,
+    external_order_id)` uniqueness), and `OrderService.persistPulledOrders()` — the
+    shared insert path both the webhook's `orders/create` handler and the cron pull go
+    through — deletes-and-consumes the matching row the instant it inserts that order
+    for the first time, landing it straight in `'cancelled'` instead of walking it
+    through validate/allocate. Closes the common sequential-arrival case (either
+    order); a genuine race between two *concurrent* deliveries is still possible and
+    isn't what this closes — documented in both call sites' own doc comments.
   - **Confirmed against a real dev store**: registration succeeded 3/3 topics from the
     `/settings/channels` "Connect Shopify" flow, and the full round trip was proven — a
     genuinely new order placed after registration reached `POST /api/webhooks/shopify`

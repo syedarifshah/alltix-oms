@@ -183,18 +183,25 @@ async function handleOrderCreate(appPool: Pool, tenantId: string, rawBody: strin
  * reservation"), the identical mechanism /api/orders/[id]/cancel already
  * uses for a human-initiated cancellation.
  *
- * KNOWN GAP (documented, not solved here): if this delivery arrives before
- * this order has ever been created locally -- genuinely out-of-order
- * delivery, or a tenant enabling webhooks after an order was already placed
- * *and* cancelled on Shopify before the first cron catch-up ran -- there is
- * nothing here to cancel yet. This logs and acknowledges rather than
- * failing, but a later cron/orders/create delivery for the same order will
- * still insert it as a normal 'received' order that goes through allocation
- * as if it were never cancelled (persistPulledOrders() doesn't consult the
- * channel's own status -- see its own doc comment). Closing this for real
- * needs either re-reading Shopify's current order state instead of trusting
- * delivery order, or a small "seen but not yet local" staging table --
- * neither built for this pass.
+ * ORDERING GAP -- narrowed, not fully closed (migration
+ * 0025_early_channel_cancellations): if this delivery arrives before this
+ * order has ever been created locally -- genuinely out-of-order delivery, or
+ * a tenant enabling webhooks after an order was already placed *and*
+ * cancelled on Shopify before the first cron catch-up ran -- there is
+ * nothing here to cancel yet. Instead of just logging and dropping it (the
+ * old behavior, which let a later orders/create delivery or cron pull insert
+ * the order as normal and allocate real stock against it as if it were
+ * never cancelled), this now records the cancellation in
+ * early_channel_cancellations, keyed by the same (tenant_id, channel,
+ * external_order_id) triple orders' own uniqueness uses.
+ * OrderService.persistPulledOrders() -- the shared insert path both
+ * handleOrderCreate below and packages/scheduler's cron pull go through --
+ * consumes that row the moment it inserts this same order for the first
+ * time, landing it straight in 'cancelled' instead of walking it through
+ * validate/allocate (see persistPulledOrders()'s own doc comment for the
+ * full mechanics). This closes the common case of the two deliveries
+ * arriving sequentially, in either order; a genuine race between two
+ * *concurrent* deliveries is still possible and is not what this closes.
  */
 async function handleOrderCancelled(appPool: Pool, tenantId: string, rawBody: string): Promise<Response> {
   const payload = JSON.parse(rawBody) as ShopifyOrderWebhookPayload;
@@ -208,10 +215,18 @@ async function handleOrderCancelled(appPool: Pool, tenantId: string, rawBody: st
   );
   const orderRow = existing.rows[0];
   if (!orderRow) {
-    console.warn(
-      `Shopify orders/cancelled webhook for tenant ${tenantId}: order ${externalOrderId} not found locally yet -- nothing to cancel (see handleOrderCancelled's own doc comment for the known ordering gap this can hit).`,
+    await withTenant(appPool, tenantId, (client) =>
+      client.query(
+        `INSERT INTO early_channel_cancellations (tenant_id, channel, external_order_id)
+         VALUES ($1, 'shopify', $2)
+         ON CONFLICT (tenant_id, channel, external_order_id) DO NOTHING`,
+        [tenantId, externalOrderId],
+      ),
     );
-    return NextResponse.json({ status: "ignored", reason: "order not found locally" });
+    console.warn(
+      `Shopify orders/cancelled webhook for tenant ${tenantId}: order ${externalOrderId} not found locally yet -- staged in early_channel_cancellations so the order lands pre-cancelled once it's created (see handleOrderCancelled's own doc comment).`,
+    );
+    return NextResponse.json({ status: "ok", note: "order not found locally yet -- cancellation staged" });
   }
 
   if (orderRow.status === "cancelled") {

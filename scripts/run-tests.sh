@@ -6,7 +6,11 @@
 # themselves rather than contending with other test files' pools.
 #
 # Default: every test that only needs Postgres. None of these ever touch
-# the network.
+# the network. (Several test files existed on disk but were missing from
+# this list -- meaning `npm test`/CI silently never ran them even though
+# `npm run test --workspace=<pkg>` did locally. Add every new test file
+# here, not just to its package's own test script, or it's effectively
+# untested in CI.)
 #
 # --amazon-sandbox: the 4 tests that need a real Amazon sandbox app and
 # real outbound network access to Amazon's endpoints (AMAZON_SANDBOX_* in
@@ -22,9 +26,15 @@ SAFE_TESTS=(
   "packages/web/test/tenant-isolation.e2e.test.ts"
   "packages/warehouse-service/test/generate-and-pick.test.ts"
   "packages/warehouse-service/test/assign-picklist-concurrency.test.ts"
+  "packages/warehouse-service/test/short-pick-backorder-split.test.ts"
+  "packages/warehouse-service/test/sale-consumption.test.ts"
   "packages/inventory-service/test/record-inventory-event.test.ts"
+  "packages/inventory-service/test/transfer-stock.test.ts"
+  "packages/inventory-service/test/transfer-stock-concurrency.test.ts"
   "packages/channel-connectors/test/amazon-connector.test.ts"
   "packages/channel-connectors/test/shopify-connector.test.ts"
+  "packages/channel-connectors/test/walmart-connector.test.ts"
+  "packages/channel-connectors/test/retry.test.ts"
   "packages/db/test/channel-connections-rls.test.ts"
   "packages/rules-engine/test/evaluate-golden.test.ts"
   "packages/rules-engine/test/resolve-actions-priority.test.ts"
@@ -32,8 +42,12 @@ SAFE_TESTS=(
   "packages/rules-engine/test/hold-order-integration.test.ts"
   "packages/order-service/test/persist-and-allocate.test.ts"
   "packages/order-service/test/allocation-concurrency.test.ts"
+  "packages/order-service/test/multi-warehouse-allocation.test.ts"
+  "packages/order-service/test/early-cancellation.test.ts"
   "packages/order-service/test/cancel-order.test.ts"
   "packages/order-service/test/lifecycle-transitions.test.ts"
+  "packages/scheduler/test/sync-failure-tracking.test.ts"
+  "packages/scheduler/test/rate-limit-cooldown.test.ts"
 )
 
 # Each needs AMAZON_SANDBOX_CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN/SELLER_ID

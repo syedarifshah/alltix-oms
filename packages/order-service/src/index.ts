@@ -693,43 +693,96 @@ export class OrderService {
    * UPDATE would match zero rows and throw, and since nothing here catches
    * per-order errors, an uncaught throw would abort the rest of this whole
    * batch, not just this one order.
+   *
+   * EARLY-CANCELLATION STAGING (migration 0025_early_channel_cancellations,
+   * closes the gap api/webhooks/shopify/route.ts's handleOrderCancelled used
+   * to just log and drop): right after each order's INSERT above succeeds --
+   * same transaction, same client, before that row is even visible to any
+   * other connection -- this deletes-and-consumes any matching
+   * early_channel_cancellations row for (tenant_id, channel,
+   * external_order_id). A match means this exact order was reported
+   * cancelled by its channel before we ever created it locally (a Shopify
+   * orders/cancelled webhook that raced ahead of orders/create, or of this
+   * very cron pull). That order is landed straight in 'cancelled' -- via a
+   * plain inline UPDATE on this same client, NOT a second call to
+   * transition()/cancelOrder(), which opens its own withTenant() on a
+   * *different* pooled connection and couldn't yet see this transaction's
+   * uncommitted insert -- instead of publishing 'order.received' and
+   * walking it through validate/allocate: there's nothing to validate or
+   * allocate for an order that's already dead on the channel it came from,
+   * and running it through the normal chain would silently un-cancel it,
+   * which is the exact bug this closes. OrderCancelled still publishes for
+   * it, just after commit, alongside (not instead of) the normal loop below
+   * -- see the first loop beneath the transaction.
+   *
+   * This can't close the gap for a genuine race between two *concurrent*
+   * deliveries (the cancellation webhook's INSERT and this method's own
+   * transaction both in flight at the same instant, neither able to see the
+   * other's uncommitted row) -- only the far more common case of the two
+   * arriving sequentially, in either order. That residual window is
+   * documented, not solved, same as the gap originally was.
    */
   async persistPulledOrders(tenantId: string, orders: NormalizedOrder[]): Promise<PersistPulledOrdersResult> {
-    const { insertedOrders, skippedExternalOrderIds } = await withTenant(this.pool, tenantId, async (client) => {
-      const insertedOrders: Array<{ id: string; order: NormalizedOrder }> = [];
-      const skippedExternalOrderIds: string[] = [];
+    const { insertedOrders, earlyCancelledOrderIds, skippedExternalOrderIds } = await withTenant(
+      this.pool,
+      tenantId,
+      async (client) => {
+        const insertedOrders: Array<{ id: string; order: NormalizedOrder }> = [];
+        const earlyCancelledOrderIds: string[] = [];
+        const skippedExternalOrderIds: string[] = [];
 
-      for (const order of orders) {
-        const inserted = await client.query<{ id: string }>(
-          `INSERT INTO orders
-             (tenant_id, channel, external_order_id, status, customer, shipping_address, placed_at, raw_payload)
-           VALUES ($1, $2, $3, 'received', $4, $5, $6, $7)
-           ON CONFLICT (tenant_id, channel, external_order_id) DO NOTHING
-           RETURNING id`,
-          [
-            tenantId,
-            order.channel,
-            order.externalOrderId,
-            JSON.stringify(order.customer),
-            JSON.stringify(order.shippingAddress),
-            order.placedAt,
-            JSON.stringify(order.rawPayload),
-          ],
-        );
+        for (const order of orders) {
+          const inserted = await client.query<{ id: string }>(
+            `INSERT INTO orders
+               (tenant_id, channel, external_order_id, status, customer, shipping_address, placed_at, raw_payload)
+             VALUES ($1, $2, $3, 'received', $4, $5, $6, $7)
+             ON CONFLICT (tenant_id, channel, external_order_id) DO NOTHING
+             RETURNING id`,
+            [
+              tenantId,
+              order.channel,
+              order.externalOrderId,
+              JSON.stringify(order.customer),
+              JSON.stringify(order.shippingAddress),
+              order.placedAt,
+              JSON.stringify(order.rawPayload),
+            ],
+          );
 
-        const orderRow = inserted.rows[0];
-        if (!orderRow) {
-          skippedExternalOrderIds.push(order.externalOrderId);
-          continue;
+          const orderRow = inserted.rows[0];
+          if (!orderRow) {
+            skippedExternalOrderIds.push(order.externalOrderId);
+            continue;
+          }
+
+          await insertOrderLines(client, tenantId, orderRow.id, order);
+          await incrementOrdersProcessedUsage(client, tenantId);
+
+          const earlyCancellation = await client.query<{ id: string }>(
+            `DELETE FROM early_channel_cancellations
+             WHERE tenant_id = $1 AND channel = $2 AND external_order_id = $3
+             RETURNING id`,
+            [tenantId, order.channel, order.externalOrderId],
+          );
+          if (earlyCancellation.rows.length > 0) {
+            await client.query(
+              `UPDATE orders SET status = 'cancelled', updated_at = now() WHERE id = $1 AND tenant_id = $2`,
+              [orderRow.id, tenantId],
+            );
+            earlyCancelledOrderIds.push(orderRow.id);
+            continue;
+          }
+
+          insertedOrders.push({ id: orderRow.id, order });
         }
 
-        insertedOrders.push({ id: orderRow.id, order });
-        await insertOrderLines(client, tenantId, orderRow.id, order);
-        await incrementOrdersProcessedUsage(client, tenantId);
-      }
+        return { insertedOrders, earlyCancelledOrderIds, skippedExternalOrderIds };
+      },
+    );
 
-      return { insertedOrders, skippedExternalOrderIds };
-    });
+    for (const orderId of earlyCancelledOrderIds) {
+      await this.publish(tenantId, DomainEvent.OrderCancelled, { orderId });
+    }
 
     for (const { id: orderId, order } of insertedOrders) {
       const payload: OrderReceivedPayload = {
@@ -750,7 +803,10 @@ export class OrderService {
       await this.transition(tenantId, orderId, "validated", "allocated");
     }
 
-    return { insertedOrderIds: insertedOrders.map((o) => o.id), skippedExternalOrderIds };
+    return {
+      insertedOrderIds: [...insertedOrders.map((o) => o.id), ...earlyCancelledOrderIds],
+      skippedExternalOrderIds,
+    };
   }
 }
 
