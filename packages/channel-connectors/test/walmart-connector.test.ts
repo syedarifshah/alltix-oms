@@ -15,13 +15,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildMpItemMatchFeedPayload,
   mapShipNodeTypeToFulfillmentType,
   normalizeWalmartOrder,
   normalizeWalmartOrderLine,
+  WalmartConnector,
   type WalmartOrder,
   type WalmartOrderLine,
   type WalmartShipNodeType,
 } from "../src/walmart-connector.js";
+import type { NormalizedListing } from "../src/connector.js";
 
 test("mapShipNodeTypeToFulfillmentType maps SellerFulfilled to seller_fulfilled", () => {
   assert.equal(mapShipNodeTypeToFulfillmentType("SellerFulfilled"), "seller_fulfilled");
@@ -161,4 +164,80 @@ test("normalizeWalmartOrder preserves the raw order as rawPayload for debugging/
   const order = makeWalmartOrder();
   const normalized = normalizeWalmartOrder(order, "SellerFulfilled");
   assert.deepEqual(normalized.rawPayload, order);
+});
+
+function makeListing(overrides: Partial<NormalizedListing> = {}): NormalizedListing {
+  return {
+    productId: "product-1",
+    channel: "walmart",
+    channelMarketplace: "",
+    externalSku: "SKU-001",
+    price: "149.90",
+    productIdentifier: { productIdType: "GTIN", productId: "00622356000000" },
+    shippingWeightLbs: 6.94,
+    productCategory: "Large Appliances",
+    ...overrides,
+  };
+}
+
+test("buildMpItemMatchFeedPayload builds the confirmed MPItemFeedHeader/MPItem envelope shape", () => {
+  const body = buildMpItemMatchFeedPayload(makeListing());
+  assert.deepEqual(body, {
+    MPItemFeedHeader: {
+      processMode: "REPLACE",
+      subset: "EXTERNAL",
+      locale: "en",
+      sellingChannel: "mpsetupbymatch",
+      version: "4.2",
+    },
+    MPItem: [
+      {
+        Item: {
+          sku: "SKU-001",
+          productIdentifiers: { productIdType: "GTIN", productId: "00622356000000" },
+          ShippingWeight: 6.94,
+          price: 149.9,
+          condition: "New",
+          productCategory: "Large Appliances",
+        },
+      },
+    ],
+  });
+});
+
+test("buildMpItemMatchFeedPayload defaults condition to 'New' when not supplied", () => {
+  const body = buildMpItemMatchFeedPayload(makeListing({ condition: undefined }));
+  assert.equal(body.MPItem[0]!.Item.condition, "New");
+});
+
+test("buildMpItemMatchFeedPayload honors an explicitly supplied condition", () => {
+  const body = buildMpItemMatchFeedPayload(makeListing({ condition: "Remanufactured" }));
+  assert.equal(body.MPItem[0]!.Item.condition, "Remanufactured");
+});
+
+test("buildMpItemMatchFeedPayload coerces the string price to a number", () => {
+  const body = buildMpItemMatchFeedPayload(makeListing({ price: "19.99" }));
+  assert.equal(body.MPItem[0]!.Item.price, 19.99);
+  assert.equal(typeof body.MPItem[0]!.Item.price, "number");
+});
+
+test("buildMpItemMatchFeedPayload throws if called with a required field missing (caller's job to validate first)", () => {
+  assert.throws(() => buildMpItemMatchFeedPayload(makeListing({ price: undefined })));
+  assert.throws(() => buildMpItemMatchFeedPayload(makeListing({ productIdentifier: undefined })));
+  assert.throws(() => buildMpItemMatchFeedPayload(makeListing({ shippingWeightLbs: undefined })));
+  assert.throws(() => buildMpItemMatchFeedPayload(makeListing({ productCategory: undefined })));
+});
+
+test("WalmartConnector.submitListing rejects a listing missing required fields, naming exactly what's missing", async () => {
+  const connector = new WalmartConnector({ clientId: "id", clientSecret: "secret" }, "https://example.invalid");
+  await assert.rejects(
+    () => connector.submitListing(makeListing({ price: undefined, productCategory: undefined })),
+    (err: Error) => {
+      assert.match(err.message, /price/);
+      assert.match(err.message, /productCategory/);
+      assert.doesNotMatch(err.message, /productIdentifier/);
+      assert.doesNotMatch(err.message, /shippingWeightLbs/);
+      return true;
+    },
+  );
 });

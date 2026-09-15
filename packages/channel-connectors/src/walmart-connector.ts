@@ -299,6 +299,77 @@ export function normalizeWalmartOrder(order: WalmartOrder, shipNodeType: Walmart
   };
 }
 
+/** The MP_ITEM_MATCH feed envelope -- confirmed shape from a live fetch of
+ *  developer.walmart.com/us-marketplace/docs/create-an-offer-for-an-existing-
+ *  walmart-item's literal JSON example (2026-09; see submitListing()'s own
+ *  doc comment). `sellingChannel: "mpsetupbymatch"` is what tells Walmart
+ *  this is a match against an existing catalog item, not a new-item feed. */
+export interface MPItemMatchFeedBody {
+  MPItemFeedHeader: {
+    processMode: "REPLACE";
+    subset: "EXTERNAL";
+    locale: "en";
+    sellingChannel: "mpsetupbymatch";
+    version: "4.2";
+  };
+  MPItem: Array<{
+    Item: {
+      sku: string;
+      productIdentifiers: { productIdType: string; productId: string };
+      ShippingWeight: number;
+      price: number;
+      condition: string;
+      productCategory: string;
+    };
+  }>;
+}
+
+/**
+ * Builds a single-item MP_ITEM_MATCH feed body from a NormalizedListing.
+ * Exported for unit testing (test/walmart-connector.test.ts), same "pure
+ * mapping function, no network" precedent normalizeWalmartOrder/
+ * mapShipNodeTypeToFulfillmentType above already set.
+ *
+ * Caller (submitListing) has already validated price/productIdentifier/
+ * shippingWeightLbs/productCategory are present -- this throws instead of
+ * silently coercing `undefined` into the payload if it's ever called
+ * without that check happening first, same "fail loudly rather than
+ * submit bad data to a real marketplace" reasoning submitListing()'s own
+ * doc comment gives. `condition` alone defaults to "New" when absent --
+ * the only condition this codebase's outbound flow (v1, deliberately
+ * narrow like ShopifyConnector.createListing()'s own single-variant scope)
+ * ever submits.
+ */
+export function buildMpItemMatchFeedPayload(listing: NormalizedListing): MPItemMatchFeedBody {
+  if (!listing.price || !listing.productIdentifier || !listing.shippingWeightLbs || !listing.productCategory) {
+    throw new Error(
+      "buildMpItemMatchFeedPayload: price/productIdentifier/shippingWeightLbs/productCategory must all be " +
+        "present -- the caller (submitListing) is expected to validate this before calling.",
+    );
+  }
+  return {
+    MPItemFeedHeader: {
+      processMode: "REPLACE",
+      subset: "EXTERNAL",
+      locale: "en",
+      sellingChannel: "mpsetupbymatch",
+      version: "4.2",
+    },
+    MPItem: [
+      {
+        Item: {
+          sku: listing.externalSku,
+          productIdentifiers: listing.productIdentifier,
+          ShippingWeight: listing.shippingWeightLbs,
+          price: Number(listing.price),
+          condition: listing.condition ?? "New",
+          productCategory: listing.productCategory,
+        },
+      },
+    ],
+  };
+}
+
 /**
  * Walmart Marketplace API connector. Implements the full ChannelConnector
  * interface (unlike AmazonConnector) as the interface's first real stress
@@ -476,21 +547,44 @@ export class WalmartConnector implements ChannelConnector {
    * https://developer.walmart.com/us-marketplace/docs/create-an-offer-for-an-existing-walmart-item
    * https://developer.walmart.com/us-marketplace/docs/list-all-feed-statuses
    *
-   * REMAINING MISMATCH: NormalizedListing ({productId, channel,
-   * channelMarketplace, externalSku}) doesn't carry the fields Walmart's
-   * match-feed payload actually requires (price, productIdentifiers,
-   * condition, shippingWeight -- see the doc page above). Rather than
-   * fabricate placeholder values for a real marketplace write, this
-   * throws naming the missing fields instead of submitting bad data.
-   * NormalizedListing needs to grow those fields (optional,
-   * channel-specific) before this can submit anything real.
+   * Real implementation now (NormalizedListing grew the needed optional
+   * fields -- see its own doc comment): validates every field
+   * {@link buildMpItemMatchFeedPayload} needs is present, naming exactly
+   * what's missing rather than submitting a real marketplace write with
+   * fabricated placeholder values, then submits the feed inline as JSON
+   * (the "Option 2" path the fetched doc page describes -- simpler than
+   * the multipart/form-data file-upload alternative and equally supported).
+   *
+   * UNVERIFIED, same as every other method on this class (see the class
+   * doc comment): the feed envelope/field shapes below are transcribed
+   * from a live fetch of the doc page above, not exercised against a real
+   * feed submission -- no Walmart sandbox/production credentials exist in
+   * this codebase yet.
    */
   async submitListing(listing: NormalizedListing): Promise<{ feedId: string }> {
-    throw new Error(
-      `WalmartConnector.submitListing: NormalizedListing is missing fields Walmart's Offer-Setup-by-Match feed ` +
-        `requires (price, productIdentifiers, condition, shippingWeight) for sku=${listing.externalSku}. ` +
-        `NormalizedListing needs to grow these before this can submit a real feed.`,
+    const missingFields: string[] = [];
+    if (!listing.price) missingFields.push("price");
+    if (!listing.productIdentifier) missingFields.push("productIdentifier");
+    if (!listing.shippingWeightLbs) missingFields.push("shippingWeightLbs");
+    if (!listing.productCategory) missingFields.push("productCategory");
+    if (missingFields.length > 0) {
+      throw new Error(
+        `WalmartConnector.submitListing: NormalizedListing is missing fields Walmart's Offer-Setup-by-Match feed ` +
+          `requires for sku=${listing.externalSku}: ${missingFields.join(", ")}.`,
+      );
+    }
+
+    const feedBody = buildMpItemMatchFeedPayload(listing);
+    const { ok, status, data } = await this.request<{ feedId?: string } & WalmartErrorResponse>(
+      `/v3/feeds?feedType=MP_ITEM_MATCH`,
+      { method: "POST", body: JSON.stringify(feedBody) },
     );
+
+    if (!ok || !data.feedId) {
+      throw new Error(`Walmart offer submission failed: ${status} ${this.formatError(data, "unknown error")}`);
+    }
+
+    return { feedId: data.feedId };
   }
 
   /**

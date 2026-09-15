@@ -15,10 +15,21 @@ interface ProductRow {
   shopify_listing_status: string | null;
   shopify_list_price: string | null;
   shopify_external_sku: string | null;
+  walmart_listing_id: string | null;
+  walmart_listing_status: string | null;
+  walmart_list_price: string | null;
+  walmart_raw_payload: { feedId?: string; error?: string | null } | null;
 }
 
 interface ProductsPageProps {
-  searchParams: Promise<{ error?: string; shopify_listing_created?: string; product_created?: string }>;
+  searchParams: Promise<{
+    error?: string;
+    shopify_listing_created?: string;
+    product_created?: string;
+    walmart_listing_submitted?: string;
+    walmart_listing_still_processing?: string;
+    walmart_listing_status_checked?: string;
+  }>;
 }
 
 /**
@@ -43,7 +54,14 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
 
   const pool = getAppPool();
   const tenantId = await resolveTenantId(pool, authContext.clerkUserId);
-  const { error, shopify_listing_created: shopifyListingCreated, product_created: productCreated } = await searchParams;
+  const {
+    error,
+    shopify_listing_created: shopifyListingCreated,
+    product_created: productCreated,
+    walmart_listing_submitted: walmartListingSubmitted,
+    walmart_listing_still_processing: walmartListingStillProcessing,
+    walmart_listing_status_checked: walmartListingStatusChecked,
+  } = await searchParams;
 
   if (!tenantId) {
     return (
@@ -54,22 +72,39 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
     );
   }
 
-  const { products, hasActiveShopifyConnection } = await withTenant(pool, tenantId, async (client) => {
-    const productsResult = await client.query<ProductRow>(
-      `SELECT p.id, p.internal_sku, p.name,
-              cl.listing_status AS shopify_listing_status,
-              cl.list_price AS shopify_list_price,
-              cl.external_sku AS shopify_external_sku
-         FROM products p
-         LEFT JOIN channel_listings cl
-           ON cl.product_id = p.id AND cl.tenant_id = p.tenant_id AND cl.channel = 'shopify'
-        ORDER BY p.internal_sku`,
-    );
-    const connectionResult = await client.query(
-      `SELECT 1 FROM channel_connections WHERE channel = 'shopify' AND status = 'active' LIMIT 1`,
-    );
-    return { products: productsResult.rows, hasActiveShopifyConnection: connectionResult.rows.length > 0 };
-  });
+  const { products, hasActiveShopifyConnection, hasActiveWalmartConnection } = await withTenant(
+    pool,
+    tenantId,
+    async (client) => {
+      const productsResult = await client.query<ProductRow>(
+        `SELECT p.id, p.internal_sku, p.name,
+                cl.listing_status AS shopify_listing_status,
+                cl.list_price AS shopify_list_price,
+                cl.external_sku AS shopify_external_sku,
+                cw.id AS walmart_listing_id,
+                cw.listing_status AS walmart_listing_status,
+                cw.list_price AS walmart_list_price,
+                cw.raw_payload AS walmart_raw_payload
+           FROM products p
+           LEFT JOIN channel_listings cl
+             ON cl.product_id = p.id AND cl.tenant_id = p.tenant_id AND cl.channel = 'shopify'
+           LEFT JOIN channel_listings cw
+             ON cw.product_id = p.id AND cw.tenant_id = p.tenant_id AND cw.channel = 'walmart'
+          ORDER BY p.internal_sku`,
+      );
+      const shopifyConnectionResult = await client.query(
+        `SELECT 1 FROM channel_connections WHERE channel = 'shopify' AND status = 'active' LIMIT 1`,
+      );
+      const walmartConnectionResult = await client.query(
+        `SELECT 1 FROM channel_connections WHERE channel = 'walmart' AND status = 'active' LIMIT 1`,
+      );
+      return {
+        products: productsResult.rows,
+        hasActiveShopifyConnection: shopifyConnectionResult.rows.length > 0,
+        hasActiveWalmartConnection: walmartConnectionResult.rows.length > 0,
+      };
+    },
+  );
 
   return (
     <main className="page">
@@ -87,6 +122,16 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
         </div>
       )}
       {productCreated === "1" && <div className="alert alert-success">Product added to your catalog.</div>}
+      {walmartListingSubmitted === "1" && (
+        <div className="alert alert-success">
+          Offer submitted to Walmart (status: pending). Walmart processes feeds asynchronously — use the &quot;Check
+          status&quot; button once you&apos;ve given it a few minutes to see whether it was accepted.
+        </div>
+      )}
+      {walmartListingStillProcessing === "1" && (
+        <div className="alert alert-info">Walmart is still processing this feed — check back again shortly.</div>
+      )}
+      {walmartListingStatusChecked === "1" && <div className="alert alert-success">Walmart listing status updated.</div>}
       {error && <div className="alert alert-danger">{describeError(error)}</div>}
 
       <details className="stack" style={{ marginBottom: 16 }}>
@@ -107,6 +152,12 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
           <a href="/settings/channels">Channels settings page</a> before creating a listing.
         </div>
       )}
+      {!hasActiveWalmartConnection && (
+        <div className="alert alert-info">
+          No active Walmart connection — connect one on the{" "}
+          <a href="/settings/channels">Channels settings page</a> before submitting an offer.
+        </div>
+      )}
 
       {products.length === 0 ? (
         <p className="empty">No products yet.</p>
@@ -118,6 +169,7 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
                 <th>SKU</th>
                 <th>Name</th>
                 <th>Shopify</th>
+                <th>Walmart</th>
               </tr>
             </thead>
             <tbody>
@@ -138,6 +190,42 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
                       </div>
                     ) : hasActiveShopifyConnection ? (
                       <CreateListingForm productId={product.id} />
+                    ) : (
+                      <span className="muted">not listed</span>
+                    )}
+                  </td>
+                  <td>
+                    {product.walmart_listing_status ? (
+                      <div className="stack">
+                        <span
+                          className={
+                            product.walmart_listing_status === "active"
+                              ? "badge badge-success"
+                              : product.walmart_listing_status === "error"
+                                ? "badge badge-danger"
+                                : "badge"
+                          }
+                        >
+                          {product.walmart_listing_status}
+                        </span>
+                        <span className="muted">
+                          sku {product.internal_sku}
+                          {product.walmart_list_price ? ` · $${product.walmart_list_price}` : ""}
+                        </span>
+                        {product.walmart_listing_status === "error" && product.walmart_raw_payload?.error && (
+                          <span className="muted">{product.walmart_raw_payload.error}</span>
+                        )}
+                        {product.walmart_listing_status === "pending" && product.walmart_listing_id && (
+                          <form
+                            action={`/api/channels/walmart/listings/${product.walmart_listing_id}/check-status`}
+                            method="POST"
+                          >
+                            <button type="submit">Check status</button>
+                          </form>
+                        )}
+                      </div>
+                    ) : hasActiveWalmartConnection ? (
+                      <CreateWalmartListingForm productId={product.id} />
                     ) : (
                       <span className="muted">not listed</span>
                     )}
@@ -166,6 +254,26 @@ function CreateListingForm({ productId }: { productId: string }): ReactElement {
   );
 }
 
+/** Plain HTML form, no client JS -- see CreateListingForm's own comment for
+ *  why. More fields than Shopify's equivalent form because Offer Setup by
+ *  Match genuinely needs more from the tenant: a GTIN to match against an
+ *  existing Walmart catalog item (Shopify's createListing() makes a brand
+ *  new item and needs no such identifier), a shipping weight, and a product
+ *  category -- see /api/channels/walmart/listings' own doc comment.
+ *  Condition is fixed to "New" server-side (v1 scope), no field for it here. */
+function CreateWalmartListingForm({ productId }: { productId: string }): ReactElement {
+  return (
+    <form action="/api/channels/walmart/listings" method="POST" className="stack" style={{ gap: 6 }}>
+      <input type="hidden" name="productId" value={productId} />
+      <input type="text" name="gtin" placeholder="GTIN" required style={{ width: 120 }} />
+      <input type="text" name="price" placeholder="19.99" required style={{ width: 80 }} />
+      <input type="text" name="shippingWeightLbs" placeholder="weight (lb)" required style={{ width: 100 }} />
+      <input type="text" name="productCategory" placeholder="category" required style={{ width: 120 }} />
+      <button type="submit">Submit offer to Walmart</button>
+    </form>
+  );
+}
+
 function describeError(error: string): string {
   if (error === "product_missing_fields") return "Enter both a SKU and a name before submitting.";
   if (error === "product_sku_already_exists") return "A product with that SKU already exists.";
@@ -187,6 +295,27 @@ function describeError(error: string): string {
       `The listing was created on Shopify (product ${error.slice("shopify_listing_created_but_not_recorded:".length)}) ` +
       "but saving it here failed — check server logs; avoid creating it again from this page."
     );
+  }
+  if (error === "walmart_listing_missing_fields") return "Enter a GTIN, price, shipping weight, and category before submitting.";
+  if (error === "walmart_listing_invalid_price") return "Price must look like 19.99 (up to two decimal places).";
+  if (error === "walmart_listing_invalid_weight") return "Shipping weight must be a positive number (in pounds).";
+  if (error === "walmart_listing_product_not_found") return "That product could not be found.";
+  if (error === "walmart_listing_already_exists") return "This product already has a Walmart listing submission.";
+  if (error === "walmart_listing_not_found") return "That Walmart listing could not be found.";
+  if (error.startsWith("walmart_listing_no_connection:")) {
+    return `No active Walmart connection (${error.slice("walmart_listing_no_connection:".length)}).`;
+  }
+  if (error.startsWith("walmart_listing_submit_failed:")) {
+    return `Walmart rejected the offer submission: ${error.slice("walmart_listing_submit_failed:".length)}`;
+  }
+  if (error.startsWith("walmart_listing_submitted_but_not_recorded:")) {
+    return (
+      `The offer feed was submitted to Walmart (feed ${error.slice("walmart_listing_submitted_but_not_recorded:".length)}) ` +
+      "but saving it here failed — check server logs before submitting again."
+    );
+  }
+  if (error.startsWith("walmart_listing_status_check_failed:")) {
+    return `Could not check Walmart feed status: ${error.slice("walmart_listing_status_check_failed:".length)}`;
   }
   return error;
 }

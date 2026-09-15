@@ -369,10 +369,50 @@ data —
   This is also the *only* path `WalmartConnector.submitListing()` has for Offer Setup by
   Match (no synchronous equivalent the way Shopify's `productSet` mutation is) — see
   §4.3's note on why this forced `ChannelConnector.submitListing`/`getFeedStatus` to
-  split out of a single `pushListing()` in the first place. `submitListing()` itself
-  currently throws rather than submitting: `NormalizedListing` doesn't yet carry the
-  fields Walmart's match-feed payload requires (price, productIdentifiers, condition,
-  shippingWeight) — see its doc comment for the exact list.
+  split out of a single `pushListing()` in the first place.
+- **Outbound listing creation — built** (`WalmartConnector.submitListing()`,
+  `buildMpItemMatchFeedPayload()`, `POST /api/channels/walmart/listings`,
+  `POST /api/channels/walmart/listings/[id]/check-status`, `/products` page): a tenant
+  can now submit an Offer Setup by Match (`MP_ITEM_MATCH`) feed matching an internal
+  product to an EXISTING Walmart catalog item by GTIN — genuinely different from
+  Shopify's `createListing()`, which makes a brand-new item. `NormalizedListing` grew
+  the optional, channel-specific fields the match-feed payload needs (`price`,
+  `productIdentifier`, `condition`, `shippingWeightLbs`, `productCategory` — see its own
+  doc comment); `submitListing()` validates all of them are present (naming exactly
+  what's missing, same as before) before building and posting the real feed body.
+  - **v1 scope, deliberately narrow, same spirit as Shopify's single-variant-only
+    scope**: GTIN only (no UPC/EAN/ISBN picker in the form yet, though the type allows
+    them), `condition` fixed to `"New"` server-side (non-new conditions additionally
+    need a main image URL this form doesn't collect).
+  - **Genuinely asynchronous, unlike Shopify's flow**: `submitListing()` only proves
+    Walmart *accepted* the feed for processing, not that the item was actually matched
+    or ingested — the new `channel_listings` row lands as `listing_status = 'pending'`
+    (a third state alongside Shopify's `'draft'`/`'active'`), and a manual "Check
+    status" button on `/products` calls the new check-status route, which calls
+    `getFeedStatus()` and resolves the row to `'active'` or `'error'` (with Walmart's
+    own error message stored in `raw_payload`). Deliberately manual rather than an
+    automatic poller — CLAUDE.md §4.4's rate-limited job queue is the right home for
+    that eventually, but this is `getFeedStatus()`'s first real caller of any kind, and
+    an unverified background-polling implementation isn't more trustworthy than an
+    honest manual button until this has run against a real feed.
+  - **No new migration**: `channel_listings.raw_payload` (already existed) stores
+    `{feedId, submittedAt}` at submission and gets `{lastCheckedAt, error}` merged in on
+    check — same "last-seen raw channel data, for debugging/replay" column CLAUDE.md
+    §2.1 already documents, just repurposed for a pending outcome instead of a pulled
+    listing's raw payload. `external_id`/`external_sku` are both set to the internal
+    SKU submitted (Walmart's own numeric item id isn't obtainable from this flow — same
+    "Walmart only knows its own SKU here" reasoning `pushInventory()` already
+    documents), which is also what gives the row's uniqueness real teeth (Walmart
+    itself doesn't allow duplicate-SKU offer submissions either).
+  - **UNVERIFIED, same as the rest of this connector**: the `MP_ITEM_MATCH` feed
+    envelope/field shapes were confirmed against a live fetch of
+    developer.walmart.com's own doc page and literal JSON example (GTIN as
+    `productIdType`, plain numeric `price`/`ShippingWeight` with no nested unit or
+    currency object, pounds implied for `ShippingWeight`) — not against a real feed
+    submission, since no Walmart sandbox/production credentials exist in this codebase.
+    `UPC`/`EAN`/`ISBN` as `productIdType` values, and whether `productCategory` is
+    validated against a fixed taxonomy, were not confirmed the same way and should be
+    treated as unverified until tried for real.
 - **Inventory API**: real-time single-item stock updates (`PUT /v3/inventory?sku=...`).
   Implemented as `WalmartConnector.pushInventory()` — like Amazon's Listings Items API,
   the interface's `productId` parameter must actually be the channel's own SKU
@@ -590,13 +630,17 @@ succeeded or failed."
   is on a third-party-fulfilled product (e.g. Shopify's own demo "3p Fulfilled"
   product) needs the third-party scope specifically; merchant-managed is the
   default/simplest case and what a normal seller-fulfilled product needs.
-- **Still not implemented**: the shared `ChannelConnector.submitListing`/
-  `getFeedStatus` interface itself — `NormalizedListing` still lacks the fields
-  Shopify's product-creation mutations require (title, a price, at least one variant),
+- **Still not implemented for Shopify specifically**: the shared `ChannelConnector.
+  submitListing`/`getFeedStatus` interface itself — `NormalizedListing` still lacks the
+  fields Shopify's product-creation mutations require (title, at least one variant),
   and nothing forces `createListing()` (see the new paragraph below) into that
-  async-feed shape, the same reasoning `pullProductCatalog()` already used. Amazon/
-  Walmart still have no outbound listing-creation path at all. `subscribeToEvents` is
-  still a deliberate no-op on the connector itself — real-time webhooks are wired in as
+  async-feed shape, the same reasoning `pullProductCatalog()` already used. That's a
+  deliberate, permanent split, not a gap: Shopify's `productSet` mutation is
+  synchronous and doesn't fit submit-then-poll at all. Walmart's own outbound path
+  (below, in §4.2) DOES now implement the shared interface for real — see that
+  section's "Outbound listing creation" paragraph. Amazon still has no outbound
+  listing-creation path at all. `subscribeToEvents` is still a deliberate no-op on the
+  connector itself — real-time webhooks are wired in as
   application/web-layer infrastructure instead, see the paragraph below.
 - **Wired into the app** (migration `0019_channel_connections_shopify.sql`): a
   Shopify row in `channel_connections` reuses the same table Amazon's OAuth flow

@@ -46,6 +46,47 @@ export interface NormalizedListing {
   channel: string;
   channelMarketplace: string;
   externalSku: string;
+
+  /** Everything below is optional and channel-specific -- only
+   *  WalmartConnector.submitListing() (its Offer-Setup-by-Match /
+   *  MP_ITEM_MATCH feed) needs any of it today. Grown here, on the shared
+   *  type, per submitListing()'s own original doc comment ("NormalizedListing
+   *  needs to grow these before this can submit anything real") -- unlike
+   *  Shopify's outbound listing path, which is a deliberately separate,
+   *  non-interface method (ShopifyConnector.createListing) because
+   *  Shopify's synchronous productSet mutation doesn't fit this
+   *  submit-then-poll shape at all. Amazon has no outbound listing path
+   *  yet either way. */
+
+  /** Money-scalar-compatible string, e.g. "19.99" -- same convention
+   *  NormalizedOrderLine.unitPrice already uses. */
+  price?: string;
+  /** Matches an existing Walmart catalog item by its own product
+   *  identifier. GTIN is the only value confirmed against a live fetched
+   *  Walmart doc page's literal JSON example
+   *  (developer.walmart.com/us-marketplace/docs/create-an-offer-for-an-
+   *  existing-walmart-item); UPC/EAN/ISBN are the other identifier types
+   *  Walmart's docs reference elsewhere but weren't confirmed against a
+   *  literal payload example the same way -- treat those three as
+   *  unverified until tried against a real feed. */
+  productIdentifier?: { productIdType: "GTIN" | "UPC" | "EAN" | "ISBN"; productId: string };
+  /** e.g. "New" -- Walmart also allows non-new conditions (Remanufactured,
+   *  Pre-Owned variants) for eligible sellers, which additionally require a
+   *  main image URL this isn't wired to collect; only "New" is exercised
+   *  in this codebase so far. */
+  condition?: string;
+  /** Pounds -- confirmed unit for the US Marketplace's product package
+   *  weight fields (developer.walmart.com/us-marketplace/docs/item-setup-
+   *  schema-key-points). Named with the unit in the field name since
+   *  Walmart's own payload field (a plain "ShippingWeight": 6.94) carries
+   *  no unit of its own. */
+  shippingWeightLbs?: number;
+  /** Free text in the one confirmed example payload (e.g. "Large
+   *  Appliances"). Whether Walmart validates this against a fixed taxonomy
+   *  wasn't confirmed by any doc page fetched for this pass -- an invalid
+   *  value is expected to surface as a real feed-item ingestion error via
+   *  getFeedStatus(), not something pre-validated here. */
+  productCategory?: string;
 }
 
 export interface SyncResult {
