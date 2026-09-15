@@ -817,18 +817,33 @@ succeeded or failed."
 - **Phase 3 — The retention feature (Months 5-7)**: rules/automation engine (order
   routing at minimum). Add Shopify as channel #3 to validate the abstraction holds for
   a structurally different API type.
-- **Phase 4 — Operational maturity (Months 7-9)**: reporting/analytics on separate
-  read store. Multi-warehouse/3PL support: the ledger-level piece (moving stock
+- **Phase 4 — Operational maturity (Months 7-9)**: reporting/analytics — **first pass
+  built** (`/reports`, `packages/web/src/app/(app)/reports/page.tsx`): sales by
+  channel and top SKUs by revenue (both period-selectable, default 30 days, excludes
+  cancelled orders), a returns summary (total vs. restocked-sellable, using the
+  returns handling below), and a live inventory snapshot (units on hand/reserved/
+  available tenant-wide, plus an out-of-stock/oversold list) — plain queries against
+  the existing transactional tables, deliberately not the separate CDC-fed
+  read-optimized store this section used to describe as the only shape (see that
+  page's own doc comment for the "start simple" reasoning, same call already made for
+  the event bus and job queue). No dollar inventory-value figure — this schema has no
+  cost/COGS column, only sale price, so a $ "stock value" would silently misrepresent
+  one as the other; units only. The real CDC-fed store is still open, see the item
+  below. Multi-warehouse/3PL support: the ledger-level piece (moving stock
   between two locations, §2.2's "Multi-location transfers") and the
   locations-management UI (`/locations` — create + rename a warehouse/3pl/fba/wfs
   location; no delete, `type` fixed after creation, see that page's own doc
   comment) are now built; per-location fulfillment routing beyond what the rules
   engine's `route_to_warehouse` action already does is still open. Returns
-  handling. Rate-limit hardening, circuit breakers, observability dashboards.
+  handling — **built**, see §2.2/§3. Rate-limit hardening, circuit breakers — **built**,
+  see §4.4. Observability dashboards still open — no external account (Sentry/Datadog)
+  provisioned yet, alerting today is still the `[ALERT]`-tagged log lines §4.4
+  describes.
   - Open question for Arif: given the widened volume ceiling (§0: up to 50,000
     orders/month), whether the CDC-fed reporting store is worth moving earlier than
     Phase 4 — not a change to the phase order itself, just worth deciding deliberately
-    rather than by default.
+    rather than by default. The `/reports` first pass above doesn't resolve this
+    either way — it's cheap enough at today's volume that the decision can still wait.
 - **Phase 5 — Scale features (Months 9-12+)**: eBay/TikTok Shop/additional channels.
   Stock forecasting. B2B portal (if pursuing Cin7-style ERP breadth). SOC 2 prep if
   targeting mid-market.
