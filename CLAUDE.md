@@ -748,11 +748,13 @@ succeeded or failed."
   routing at minimum). Add Shopify as channel #3 to validate the abstraction holds for
   a structurally different API type.
 - **Phase 4 — Operational maturity (Months 7-9)**: reporting/analytics on separate
-  read store. Multi-warehouse/3PL support (the ledger-level piece — moving stock
-  between two locations — is now built, see §2.2's "Multi-location transfers"; a
-  locations-management UI and per-location fulfillment routing beyond what the rules
-  engine already does are still open). Returns handling. Rate-limit hardening,
-  circuit breakers, observability dashboards.
+  read store. Multi-warehouse/3PL support: the ledger-level piece (moving stock
+  between two locations, §2.2's "Multi-location transfers") and the
+  locations-management UI (`/locations` — create + rename a warehouse/3pl/fba/wfs
+  location; no delete, `type` fixed after creation, see that page's own doc
+  comment) are now built; per-location fulfillment routing beyond what the rules
+  engine's `route_to_warehouse` action already does is still open. Returns
+  handling. Rate-limit hardening, circuit breakers, observability dashboards.
   - Open question for Arif: given the widened volume ceiling (§0: up to 50,000
     orders/month), whether the CDC-fed reporting store is worth moving earlier than
     Phase 4 — not a change to the phase order itself, just worth deciding deliberately

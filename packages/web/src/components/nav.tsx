@@ -44,6 +44,7 @@ export async function Nav(): Promise<ReactElement> {
       </a>
       <a href="/orders">Orders</a>
       <a href="/inventory">Inventory</a>
+      <a href="/locations">Locations</a>
       <a href="/products">Products</a>
       <a href="/picklists">Picklists</a>
       <a href="/rules">Rules</a>
