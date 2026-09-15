@@ -8,11 +8,12 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc --noEmit -p .",
-    "test": "node --import tsx --test test/generate-and-pick.test.ts test/assign-picklist-concurrency.test.ts test/confirm-shipment-e2e.test.ts test/short-pick-backorder-split.test.ts"
+    "test": "node --import tsx --test test/generate-and-pick.test.ts test/assign-picklist-concurrency.test.ts test/confirm-shipment-e2e.test.ts test/short-pick-backorder-split.test.ts test/sale-consumption.test.ts"
   },
   "dependencies": {
     "@alltix/channel-connectors": "0.1.0",
     "@alltix/db": "0.1.0",
+    "@alltix/inventory-service": "0.1.0",
     "@alltix/order-service": "0.1.0",
     "@alltix/shared": "0.1.0",
     "pg": "^8.13.1"

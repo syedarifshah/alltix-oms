@@ -16,6 +16,7 @@ import {
   type TrackingInfo,
 } from "@alltix/channel-connectors";
 import type { OrderService } from "@alltix/order-service";
+import { InventoryService } from "@alltix/inventory-service";
 
 export interface PicklistLine {
   id: string;
@@ -157,6 +158,98 @@ async function spinOffBackorder(
 }
 
 /**
+ * THE MISSING SALE CONSUMPTION FIX: until this existed, a normal,
+ * fully-picked, successfully-shipped order never actually consumed
+ * inventory -- packOrder()'s own ledger correction only ever runs for a
+ * SHORT line (see its own doc comment and the "a full pick makes no ledger
+ * correction" test in test/generate-and-pick.test.ts, which is correct and
+ * unaffected by this change: packOrder() still shouldn't touch the ledger
+ * for a fully-picked line, because the unit hasn't actually left the
+ * building yet at that point -- packed, not shipped). InventoryService's
+ * own eventType table has always defined 'sale' for exactly this
+ * (on_hand += delta AND reserved += delta together), but nothing in the
+ * real order lifecycle ever called it -- on_hand silently never dropped for
+ * a shipped order, and `reserved` stayed permanently stuck at the allocated
+ * amount forever, both drifting further from reality with every order that
+ * shipped normally.
+ *
+ * Called from confirmShipment() once the channel has actually confirmed
+ * shipment and before the local 'packed' -> 'shipped' transition -- the
+ * unit is being recorded as consumed at the moment this codebase considers
+ * it truly gone (confirmed shipped), not merely packed and still sitting in
+ * a box on a shelf.
+ *
+ * One order_line at a time, mirroring generatePicklist()'s own per-line
+ * reservation lookup: each line's location comes from the SAME
+ * 'reservation' inventory_events row allocateOrder() wrote for it
+ * (idempotency_key `order-allocation:<order_id>:<order_line_id>`) -- not a
+ * fresh lookup -- so a sale is recorded at the exact location that unit was
+ * actually reserved from and picked from, never a different location the
+ * order happens to touch. `order_lines.quantity` is read fresh (not the
+ * original allocation quantity) specifically because packOrder()'s
+ * short-pick handling may already have reduced it -- a partially-short line
+ * only ever sells what was actually picked and packed, the same "this order
+ * really is going to ship that many, no more" quantity packOrder() itself
+ * settled on.
+ *
+ * Idempotent via InventoryService.recordInventoryEvent's own
+ * idempotency_key uniqueness (`order-sale:<order_id>:<order_line_id>`) --
+ * safe to call twice for the same order without double-consuming stock.
+ *
+ * A zero-line order (never allocated against anything, see
+ * allocateOrder()'s own "vacuously allocatable" comment) has nothing to
+ * iterate here and is a correct no-op. Exported (not a private
+ * WarehouseService method) so it can be tested directly against a seeded
+ * order/reservation/inventory_levels state without needing a real,
+ * successful confirmShipment() call -- which needs a live, successfully-
+ * confirming marketplace connection this repo doesn't have for any channel
+ * yet (see confirmShipment()'s own doc comment) -- same "exported for
+ * testability, real callers use the wrapping method" precedent
+ * packages/scheduler/src/index.ts's recordSyncFailure/recordSyncSuccess
+ * already set.
+ */
+export async function recordShipmentSaleEvents(
+  pool: Pool,
+  inventoryService: InventoryService,
+  tenantId: string,
+  orderId: string,
+): Promise<void> {
+  const lines = await withTenant(pool, tenantId, (client) =>
+    client.query<{ id: string; product_id: string; quantity: number }>(
+      `SELECT id, product_id, quantity FROM order_lines WHERE order_id = $1 AND tenant_id = $2`,
+      [orderId, tenantId],
+    ),
+  );
+
+  for (const line of lines.rows) {
+    const reservation = await withTenant(pool, tenantId, (client) =>
+      client.query<{ location_id: string }>(
+        `SELECT location_id FROM inventory_events
+          WHERE tenant_id = $1 AND event_type = 'reservation' AND idempotency_key = $2`,
+        [tenantId, `order-allocation:${orderId}:${line.id}`],
+      ),
+    );
+    const locationId = reservation.rows[0]?.location_id;
+    if (!locationId) {
+      throw new Error(
+        `No reservation event found for order ${orderId} line ${line.id} -- cannot record a sale without knowing which location it shipped from`,
+      );
+    }
+
+    await inventoryService.recordInventoryEvent({
+      tenantId,
+      productId: line.product_id,
+      locationId,
+      eventType: "sale",
+      quantityDelta: -line.quantity,
+      referenceType: "order",
+      referenceId: orderId,
+      idempotencyKey: `order-sale:${orderId}:${line.id}`,
+    });
+  }
+}
+
+/**
  * Owns picklists, packing, and shipment confirmation back to channels
  * (CLAUDE.md §1). Persists picklists as their own stateful entity
  * (picklists/picklist_lines, migration 0013) rather than deriving them from
@@ -186,6 +279,15 @@ async function spinOffBackorder(
  * kit's components instead of a single nonexistent "kit SKU" in inventory.
  */
 export class WarehouseService {
+  // Not injected via the constructor the way OrderService/eventBus are --
+  // InventoryService holds no state beyond the pool reference (same as this
+  // class's own relationship to `pool`), so there's nothing a caller would
+  // ever need to substitute for it the way a test substitutes a shared
+  // eventBus; see recordShipmentSaleEvents()'s own doc comment for why the
+  // function it's threaded into is exported standalone instead, for testing
+  // without a live confirmShipment() call.
+  private readonly inventoryService: InventoryService;
+
   constructor(
     private readonly pool: Pool,
     private readonly orderService: OrderService,
@@ -198,7 +300,9 @@ export class WarehouseService {
     // subscriber today. A real caller that wants RulesEngine or reporting
     // to see these can inject a shared bus later without any other change.
     private readonly eventBus: EventBus = new InProcessEventBus(),
-  ) {}
+  ) {
+    this.inventoryService = new InventoryService(pool);
+  }
 
   private async publish<T>(tenantId: string, name: DomainEventName, payload: T): Promise<void> {
     await this.eventBus.publish({ name, tenantId, occurredAt: new Date().toISOString(), payload });
@@ -709,6 +813,16 @@ export class WarehouseService {
    * connectors today. Any other channel throws a clear "not implemented"
    * error rather than silently skipping the channel call and transitioning
    * anyway.
+   *
+   * Once the channel confirms, {@link recordShipmentSaleEvents} runs before
+   * the local 'packed' -> 'shipped' transition -- this is where a shipped
+   * order's stock is actually consumed (see that function's own doc
+   * comment for the gap this closes). Deliberately in that order, not
+   * after the transition: if recording the sale somehow throws, the order
+   * stays 'packed' locally (consistent with the channel-call-failed case
+   * above) rather than becoming 'shipped' with no matching consumption
+   * ever recorded for it -- the one outcome this whole fix exists to rule
+   * out.
    */
   async confirmShipment(tenantId: string, orderId: string, tracking: TrackingInfo): Promise<void> {
     const order = await withTenant(this.pool, tenantId, async (client) => {
@@ -742,6 +856,7 @@ export class WarehouseService {
       );
     }
 
+    await recordShipmentSaleEvents(this.pool, this.inventoryService, tenantId, orderId);
     await this.orderService.transition(tenantId, orderId, "packed", "shipped");
   }
 }

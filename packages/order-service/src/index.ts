@@ -9,6 +9,7 @@ import {
   type Order,
   type OrderReceivedPayload,
   type OrderStatus,
+  type ReturnDisposition,
 } from "@alltix/shared";
 import type { NormalizedOrder } from "@alltix/channel-connectors";
 
@@ -27,7 +28,14 @@ export interface PersistPulledOrdersResult {
  *  on_hold -> validated step (see order-state-machine.ts's ON_HOLD /
  *  BACKORDERED RESOLUTION comment) -- both are "this order is now in the
  *  normal flow, pending allocation," so one event name is correct for
- *  either origin. */
+ *  either origin.
+ *
+ *  'returned' is deliberately NOT here -- it moved to its own dedicated
+ *  {@link returnOrder} (see transition()'s dispatch and returnOrder's own
+ *  doc comment for why: unlike every other flip below, it needs a
+ *  disposition decision and a real ledger side effect for 'sellable',
+ *  neither of which a plain guarded UPDATE can express). It still
+ *  publishes DomainEvent.OrderReturned itself, just not through this map. */
 const SIMPLE_TRANSITION_EVENT: Partial<Record<OrderStatus, DomainEventName>> = {
   validated: DomainEvent.OrderValidated,
   on_hold: DomainEvent.OrderOnHold,
@@ -35,7 +43,6 @@ const SIMPLE_TRANSITION_EVENT: Partial<Record<OrderStatus, DomainEventName>> = {
   packed: DomainEvent.OrderPacked,
   shipped: DomainEvent.OrderShipped,
   delivered: DomainEvent.OrderDelivered,
-  returned: DomainEvent.OrderReturned,
   refunded: DomainEvent.OrderRefunded,
 };
 
@@ -96,7 +103,7 @@ export class OrderService {
    * attempt, not a caller error.
    *
    * 'validated', 'on_hold', 'picking', 'packed', 'shipped', 'delivered',
-   * 'returned', and 'refunded' are all plain guarded status flips (see
+   * and 'refunded' are all plain guarded status flips (see
    * {@link simpleTransition}) -- 'validated' is a pass-through today (only
    * the state-machine edge is enforced, no real validation logic exists
    * yet), reached either from 'received' (a fresh channel pull) or from
@@ -110,13 +117,12 @@ export class OrderService {
    * called by WarehouseService (CLAUDE.md §1) once it's done its own
    * picklist/inventory-adjustment/channel-confirmation work, so the order
    * state machine stays owned in exactly one place rather than
-   * WarehouseService writing to `orders.status` itself; 'delivered' /
-   * 'returned' / 'refunded' are the three branches CLAUDE.md §3 draws off
-   * 'shipped' -- deliberately *not* wired to touch the inventory ledger
-   * (a decided product choice: a return may not be resellable as-is, so
-   * restocking is a separate, manual inventory adjustment once the
-   * returned item has actually been inspected, not an automatic
-   * consequence of the status flip). 'allocated' goes through
+   * WarehouseService writing to `orders.status` itself; 'delivered' and
+   * 'refunded' are two of the three branches CLAUDE.md §3 draws off
+   * 'shipped', and touch nothing in the inventory ledger -- 'refunded' is a
+   * money-side event with no physical-goods counterpart in this state
+   * machine (it's only reachable directly from 'shipped', not via
+   * 'returned'). 'allocated' goes through
    * {@link allocateOrder} instead since it has a real sufficiency check and
    * two possible outcomes -- reachable from 'validated' (the normal path)
    * or 'backordered' (a manual retry once stock may have arrived; same
@@ -124,15 +130,31 @@ export class OrderService {
    * 'backordered' rather than throwing). 'cancelled' goes through
    * {@link cancelOrder} instead, since (unlike the plain flips above) it
    * sometimes has to release a live reservation first -- see its own doc
-   * comment. No other `to` value is implemented.
+   * comment. 'returned' -- CLAUDE.md §3's third branch off 'shipped' --
+   * goes through {@link returnOrder} instead: `options.disposition` is
+   * REQUIRED for this `to` value (throws otherwise, see returnOrder's own
+   * doc comment for why there's deliberately no default) and decides
+   * whether this restocks the exact quantity the order's own 'sale' ledger
+   * events say it consumed when shipped. No other `to` value is
+   * implemented.
    */
-  async transition(tenantId: string, orderId: string, from: OrderStatus, to: OrderStatus): Promise<OrderStatus> {
+  async transition(
+    tenantId: string,
+    orderId: string,
+    from: OrderStatus,
+    to: OrderStatus,
+    options?: { disposition?: ReturnDisposition },
+  ): Promise<OrderStatus> {
     if (!isValidOrderTransition(from, to)) {
       throw new Error(`Invalid order transition: ${from} -> ${to}`);
     }
 
     if (to === "allocated") {
       return this.allocateOrder(tenantId, orderId, from);
+    }
+
+    if (to === "returned") {
+      return this.returnOrder(tenantId, orderId, from, options?.disposition);
     }
 
     if (
@@ -142,7 +164,6 @@ export class OrderService {
       to === "packed" ||
       to === "shipped" ||
       to === "delivered" ||
-      to === "returned" ||
       to === "refunded"
     ) {
       return this.simpleTransition(tenantId, orderId, from, to);
@@ -263,6 +284,128 @@ export class OrderService {
 
     await this.publish(tenantId, DomainEvent.OrderCancelled, { orderId });
     return "cancelled";
+  }
+
+  /**
+   * shipped -> returned, with the inventory disposition decision CLAUDE.md
+   * §3 always described as "a separate manual inventory adjustment" now
+   * folded into this one call instead of being left as an unstated,
+   * un-auditable manual step a human might or might not remember to do
+   * later. `disposition` is REQUIRED -- there is no default, because
+   * guessing either way would be wrong for some real return: silently
+   * restocking a genuinely damaged unit inflates on_hand with stock that
+   * doesn't really exist to sell, and silently NOT restocking a perfectly
+   * sellable return quietly loses real, sellable inventory forever. A
+   * caller (the order detail page's dedicated return form, see
+   * order-status.ts) must say which one this is.
+   *
+   *  - 'sellable': restocks exactly what {@link
+   *    WarehouseService.recordShipmentSaleEvents} (packages/warehouse-service)
+   *    consumed when this order shipped -- read back off the ORDER'S OWN
+   *    'sale' inventory_events rows (same product/location/quantity), not
+   *    recomputed from order_lines independently. Same "the ledger's own
+   *    record is the source of truth" precedent {@link cancelOrder} already
+   *    established for releasing reservations off the matching 'reservation'
+   *    rows, applied here to 'sale' rows instead. Written as a 'receipt'
+   *    event (CLAUDE.md's own eventType table: "new stock in," which a
+   *    sellable return genuinely is) with `reference_type = 'return'`
+   *    (packages/shared/src/types.ts's InventoryReferenceType) -- that
+   *    reference type has existed in the schema since the inventory ledger
+   *    was first designed but was never actually written anywhere until
+   *    this method. Idempotency key `order-return:<orderId>:<saleEventId>`,
+   *    keyed off the sale event's own row id (mirroring cancelOrder's own
+   *    `order-cancellation:<orderId>:<reservationEventId>` shape) -- a
+   *    distinct event from the sale it's reversing, not a literal
+   *    reversal-by-reference of that row.
+   *  - 'damaged': flips status with no restock at all -- the unit is gone,
+   *    not back on a shelf to sell, so there's nothing for the ledger to
+   *    add back. (A tenant that wants an explicit shrinkage/write-off record
+   *    for a damaged return can still log one separately via
+   *    InventoryService.recordInventoryEvent's 'damage' eventType -- this
+   *    method doesn't do that automatically, since there's no quantity this
+   *    method itself knows to attribute the write-off to beyond what the
+   *    sale already consumed.)
+   *
+   * If this order has no matching 'sale' events at all (it shipped before
+   * WarehouseService.recordShipmentSaleEvents existed, or has zero lines),
+   * 'sellable' silently restocks nothing rather than throwing -- a missing
+   * historical sale event is a pre-existing data gap this method shouldn't
+   * block a real return over.
+   *
+   * Everything -- the guarded flip and every restock event/inventory_levels
+   * update for 'sellable' -- happens in one transaction, same "an order is
+   * never left half-mutated" discipline {@link cancelOrder} uses: a return
+   * that loses a concurrent race (the order already moved off 'shipped')
+   * must not have already restocked inventory for a return that didn't
+   * actually happen. Written inline against inventory_events/inventory_levels
+   * rather than composed through InventoryService, for the same
+   * transaction-boundary reason cancelOrder() already gives for doing the
+   * same thing with its own release events.
+   */
+  private async returnOrder(
+    tenantId: string,
+    orderId: string,
+    from: OrderStatus,
+    disposition: ReturnDisposition | undefined,
+  ): Promise<OrderStatus> {
+    if (!disposition) {
+      throw new Error(
+        "OrderService.transition: 'returned' requires options.disposition ('sellable' or 'damaged') -- " +
+          "restocking behavior depends on it, so this can't default silently either way",
+      );
+    }
+
+    await withTenant(this.pool, tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE orders SET status = 'returned', updated_at = now() WHERE id = $1 AND tenant_id = $2 AND status = $3`,
+        [orderId, tenantId, from],
+      );
+      if (result.rowCount === 0) {
+        throw new Error(
+          `Order ${orderId} is not in status '${from}' -- refusing return (concurrent update?)`,
+        );
+      }
+
+      if (disposition !== "sellable") {
+        return;
+      }
+
+      const soldLines = await client.query<{
+        id: string;
+        product_id: string;
+        location_id: string;
+        quantity_delta: number;
+      }>(
+        `SELECT id, product_id, location_id, quantity_delta FROM inventory_events
+          WHERE tenant_id = $1 AND reference_type = 'order' AND reference_id = $2 AND event_type = 'sale'`,
+        [tenantId, orderId],
+      );
+
+      for (const row of soldLines.rows) {
+        // Sale rows store a negative quantity_delta (on_hand/reserved both
+        // dropped when it shipped) -- restocking needs the positive
+        // magnitude being given back.
+        const restockQuantity = -row.quantity_delta;
+        const inserted = await client.query<{ id: string }>(
+          `INSERT INTO inventory_events
+             (tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
+           VALUES ($1, $2, $3, 'receipt', $4, 'return', $5, $6)
+           ON CONFLICT (idempotency_key) DO NOTHING
+           RETURNING id`,
+          [tenantId, row.product_id, row.location_id, restockQuantity, orderId, `order-return:${orderId}:${row.id}`],
+        );
+        if (inserted.rows[0]) {
+          await client.query(
+            `UPDATE inventory_levels SET on_hand = on_hand + $1, updated_at = now()
+               WHERE product_id = $2 AND location_id = $3`,
+            [restockQuantity, row.product_id, row.location_id],
+          );
+        }
+      }
+    });
+
+    await this.publish(tenantId, DomainEvent.OrderReturned, { orderId, disposition });
+    return "returned";
   }
 
   /** A status flip with no side effects beyond the guarded UPDATE itself --

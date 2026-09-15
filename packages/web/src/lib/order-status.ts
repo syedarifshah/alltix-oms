@@ -1,4 +1,4 @@
-import { ORDER_STATE_TRANSITIONS, isValidOrderTransition, type OrderStatus } from "@alltix/shared";
+import { ORDER_STATE_TRANSITIONS, isValidOrderTransition, type OrderStatus, type ReturnDisposition } from "@alltix/shared";
 
 /** Every status in the CLAUDE.md §3 state machine, in the diagram's own
  *  order -- Object.keys preserves insertion order, and
@@ -54,10 +54,15 @@ export interface OrderManualAction {
  *    placeOrderOnHold -- not a manual button; there's still no
  *    staff-initiated "place this order on hold" action on this page.)
  *  - 'backordered' -> 'allocated': manual retry once stock may have arrived.
- *  - 'shipped' -> 'delivered' / 'returned' / 'refunded': the three branches
- *    CLAUDE.md §3 draws off 'shipped'. 'returned' only flips status --
- *    restocking inventory is a deliberately separate manual step (see
- *    OrderService.transition's doc comment).
+ *  - 'shipped' -> 'delivered' / 'refunded': two of the three branches
+ *    CLAUDE.md §3 draws off 'shipped'. The third, 'returned', is
+ *    deliberately NOT in this list -- it needs a disposition decision
+ *    (sellable vs damaged) a plain button can't carry, so the order detail
+ *    page renders it as its own small form (see RETURN_DISPOSITIONS below)
+ *    posting to a dedicated /api/orders/[id]/return route instead of the
+ *    generic /transition route every action below posts to. See
+ *    OrderService.transition's doc comment for the restock behavior each
+ *    disposition actually triggers.
  */
 const MANUAL_ORDER_ACTIONS: Partial<Record<OrderStatus, OrderManualAction[]>> = {
   validated: [
@@ -83,14 +88,41 @@ const MANUAL_ORDER_ACTIONS: Partial<Record<OrderStatus, OrderManualAction[]>> = 
   ],
   shipped: [
     { to: "delivered", label: "Mark delivered" },
-    {
-      to: "returned",
-      label: "Mark returned",
-      hint: "Only flips status -- restocking inventory is a separate manual inventory adjustment.",
-    },
     { to: "refunded", label: "Mark refunded" },
   ],
 };
+
+export interface ReturnDispositionOption {
+  value: ReturnDisposition;
+  label: string;
+  hint: string;
+}
+
+/** Options for the order detail page's dedicated "Mark returned" form
+ *  (posts to /api/orders/[id]/return, not the generic /transition route --
+ *  see MANUAL_ORDER_ACTIONS's own comment on why). Only rendered when
+ *  isOrderReturnable(order.status) -- i.e. only from 'shipped', the one
+ *  state CLAUDE.md §3's diagram draws a 'returned' edge off of. */
+export const RETURN_DISPOSITIONS: ReturnDispositionOption[] = [
+  {
+    value: "sellable",
+    label: "Sellable",
+    hint: "Restocks the exact quantity this order shipped, at the location it shipped from.",
+  },
+  {
+    value: "damaged",
+    label: "Damaged / not resellable",
+    hint: "Marks the order returned without adding anything back to available stock.",
+  },
+];
+
+/** Whether the order detail page should render the dedicated return form --
+ *  delegates to isValidOrderTransition the same way isOrderCancellable does,
+ *  so this can never drift out of sync with what the state machine (and
+ *  therefore OrderService.transition) actually allows. */
+export function isOrderReturnable(status: OrderStatus): boolean {
+  return isValidOrderTransition(status, "returned");
+}
 
 export function manualOrderActions(status: OrderStatus): OrderManualAction[] {
   return MANUAL_ORDER_ACTIONS[status] ?? [];

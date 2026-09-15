@@ -142,6 +142,35 @@ first, not silently moved out from under it. Reachable today from `/inventory`'s
 throws outright on `eventType: 'transfer'` (it has no two-location signature) and
 points callers at this method instead.
 
+**Shipment sale-consumption — built, closing a real gap** (`packages/warehouse-service/src/index.ts`'s
+exported `recordShipmentSaleEvents`, called from `WarehouseService.confirmShipment` once
+the channel confirms and before the local `packed` → `shipped` flip): until this existed,
+a normal, fully-picked, successfully-shipped order never actually consumed inventory.
+`packOrder`'s own ledger correction only ever fires for a *short* line (proven by an
+existing, still-correct test: "a full pick makes no ledger correction") — a fully-picked
+line left `on_hand` untouched and `reserved` permanently stuck at the allocated amount
+forever, both silently drifting further from reality with every order that shipped
+normally. The `sale` `event_type` was always defined in `InventoryService`'s own
+`eventType` table (`on_hand += delta` AND `reserved += delta` together) but nothing in
+the real order lifecycle ever called it until now. One `sale` event per order_line,
+at the location the reservation event says it was actually reserved/picked from,
+quantity = the line's current (possibly short-pick-reduced) quantity — idempotent via
+`order-sale:<orderId>:<orderLineId>`.
+
+**Returns handling — built** (`OrderService.returnOrder`, dispatched from
+`OrderService.transition` when `to === 'returned'`): the "restocking is a separate manual
+step" language this section used to have is gone — a return now requires an explicit
+`disposition` (`'sellable' | 'damaged'`, `packages/shared/src/types.ts`'s
+`ReturnDisposition`) with no default, since guessing either way would be wrong for some
+real return. `'sellable'` restocks exactly what the order's own `sale` events (above) say
+it consumed — read back off the ledger, not recomputed from `order_lines` — as a
+`receipt` event with `reference_type = 'return'` (an `InventoryReferenceType` that
+existed in the schema from the start but was never actually written anywhere until now).
+`'damaged'` flips status with no restock. Surfaced on `/orders/[id]` as a dedicated
+return form (`POST /api/orders/[id]/return`, separate from the generic `/transition`
+route the same way `/cancel` is) rather than a plain button, since the disposition choice
+can't be expressed as a fixed `to` value.
+
 **Retrofit risk at the top of the target range**: a tenant near 50,000 orders/month
 (§0) can generate 100k+ `inventory_events` rows/month on its own, before
 receipts/adjustments/transfers are counted. An unpartitioned, unarchived ledger table

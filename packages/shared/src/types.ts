@@ -51,6 +51,15 @@ export type InventoryEventType =
 
 export type InventoryReferenceType = "order" | "po" | "manual" | "return" | "transfer";
 
+/** The disposition decision OrderService.transition() now requires when
+ *  `to === 'returned'` (see its own doc comment): 'sellable' restocks
+ *  exactly what the order's own 'sale' inventory_events rows say it
+ *  consumed when shipped; 'damaged' flips status with no restock at all --
+ *  the unit is gone, not back on the shelf. No default -- a return without
+ *  an explicit disposition throws rather than silently guessing either
+ *  way. */
+export type ReturnDisposition = "sellable" | "damaged";
+
 export interface InventoryEvent {
   id: string;
   tenantId: string;

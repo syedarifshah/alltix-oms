@@ -5,7 +5,13 @@ import { withTenant } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
-import { orderStatusBadgeClass, isOrderCancellable, manualOrderActions } from "@/lib/order-status";
+import {
+  orderStatusBadgeClass,
+  isOrderCancellable,
+  isOrderReturnable,
+  manualOrderActions,
+  RETURN_DISPOSITIONS,
+} from "@/lib/order-status";
 import type { OrderStatus } from "@alltix/shared";
 
 export const dynamic = "force-dynamic";
@@ -307,6 +313,28 @@ export default async function OrderDetailPage({ params, searchParams }: OrderDet
           {action.hint && <span className="muted">{action.hint}</span>}
         </form>
       ))}
+
+      {isOrderReturnable(order.status as OrderStatus) && (
+        <form
+          action={`/api/orders/${order.id}/return`}
+          method="POST"
+          className="row"
+          style={{ marginBottom: 20, alignItems: "center" }}
+        >
+          <input type="hidden" name="from" value={order.status} />
+          <span>Mark returned:</span>
+          {RETURN_DISPOSITIONS.map((option, i) => (
+            <label key={option.value} className="row" style={{ gap: 4 }}>
+              <input type="radio" name="disposition" value={option.value} defaultChecked={i === 0} />
+              {option.label}
+            </label>
+          ))}
+          <button type="submit">Submit</button>
+          <span className="muted">
+            {RETURN_DISPOSITIONS.map((option) => `${option.label}: ${option.hint}`).join(" ")}
+          </span>
+        </form>
+      )}
 
       {isOrderCancellable(order.status as OrderStatus) && (
         <form action={`/api/orders/${order.id}/cancel`} method="POST" className="row" style={{ marginBottom: 20 }}>

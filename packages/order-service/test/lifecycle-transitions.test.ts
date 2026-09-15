@@ -193,16 +193,12 @@ test("retrying a backordered order stays backordered if still short, then succee
   assert.equal(events.rows[0]?.count, "1", "exactly one reservation from the successful retry");
 });
 
-test("shipped -> delivered / returned / refunded are plain status flips with no inventory side effects", async () => {
+test("shipped -> delivered / refunded are plain status flips with no inventory side effects", async () => {
   const orderService = new OrderService(pool);
 
   const deliveredId = await insertOrderAtStatus("shipped", "DELIVERED-ORDER");
   assert.equal(await orderService.transition(tenantId, deliveredId, "shipped", "delivered"), "delivered");
   assert.equal(await statusOf(deliveredId), "delivered");
-
-  const returnedId = await insertOrderAtStatus("shipped", "RETURNED-ORDER");
-  assert.equal(await orderService.transition(tenantId, returnedId, "shipped", "returned"), "returned");
-  assert.equal(await statusOf(returnedId), "returned");
 
   const refundedId = await insertOrderAtStatus("shipped", "REFUNDED-ORDER");
   assert.equal(await orderService.transition(tenantId, refundedId, "shipped", "refunded"), "refunded");
@@ -211,14 +207,117 @@ test("shipped -> delivered / returned / refunded are plain status flips with no 
   const anyInventoryEvents = await withTenant(pool, tenantId, (client) =>
     client.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM inventory_events WHERE tenant_id = $1 AND reference_id = ANY($2::uuid[])`,
-      [tenantId, [deliveredId, returnedId, refundedId]],
+      [tenantId, [deliveredId, refundedId]],
     ),
   );
-  assert.equal(
-    anyInventoryEvents.rows[0]?.count,
-    "0",
-    "marking returned must NOT auto-restock -- that's a deliberate separate manual step",
+  assert.equal(anyInventoryEvents.rows[0]?.count, "0");
+});
+
+test("shipped -> returned requires an explicit disposition -- no silent default either way", async () => {
+  const orderId = await insertOrderAtStatus("shipped", "NO-DISPOSITION-ORDER");
+  const orderService = new OrderService(pool);
+
+  await assert.rejects(() => orderService.transition(tenantId, orderId, "shipped", "returned"), /requires options\.disposition/);
+  assert.equal(await statusOf(orderId), "shipped", "a rejected return must not have changed the order's status");
+});
+
+test("a 'damaged' return flips status but restocks nothing, even though the order has a real sale event", async () => {
+  const externalSku = `SKU-${randomUUID().slice(0, 8)}`;
+  const productId = await seedProduct(0, externalSku);
+  const orderId = await insertOrderAtStatus("shipped", "DAMAGED-RETURN-ORDER");
+  const orderService = new OrderService(pool);
+
+  await withTenant(pool, tenantId, (client) =>
+    client.query(
+      `INSERT INTO inventory_events (tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
+       VALUES ($1, $2, $3, 'sale', -3, 'order', $4, $5)`,
+      [tenantId, productId, locationId, orderId, `order-sale:${orderId}:synthetic-line`],
+    ),
   );
+
+  const result = await orderService.transition(tenantId, orderId, "shipped", "returned", { disposition: "damaged" });
+  assert.equal(result, "returned");
+  assert.equal(await statusOf(orderId), "returned");
+
+  const level = await withTenant(pool, tenantId, (client) =>
+    client.query<{ on_hand: number }>(`SELECT on_hand FROM inventory_levels WHERE product_id = $1 AND location_id = $2`, [
+      productId,
+      locationId,
+    ]),
+  );
+  assert.equal(level.rows[0]?.on_hand, 0, "a damaged return must not restock anything");
+});
+
+test("a 'sellable' return restocks exactly what the order's own sale events consumed", async () => {
+  const externalSku = `SKU-${randomUUID().slice(0, 8)}`;
+  // Seeded at 4 on_hand, then immediately "sold" down to 0 below -- models
+  // a real shipment (4 arrived, all 4 shipped), so the return's restock can
+  // be asserted back up to the original 4, not into negative territory.
+  const productId = await seedProduct(4, externalSku);
+  const orderId = await insertOrderAtStatus("shipped", "SELLABLE-RETURN-ORDER");
+  const orderService = new OrderService(pool);
+
+  // Models what WarehouseService.recordShipmentSaleEvents() would have
+  // written at real shipment time -- a 'sale' event consuming 4 units, plus
+  // its matching inventory_levels effect (on_hand and reserved both -4).
+  await withTenant(pool, tenantId, async (client) => {
+    await client.query(
+      `INSERT INTO inventory_events (tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
+       VALUES ($1, $2, $3, 'sale', -4, 'order', $4, $5)`,
+      [tenantId, productId, locationId, orderId, `order-sale:${orderId}:synthetic-line`],
+    );
+    await client.query(
+      `UPDATE inventory_levels SET on_hand = on_hand - 4, reserved = reserved - 4 WHERE product_id = $1 AND location_id = $2`,
+      [productId, locationId],
+    );
+  });
+
+  const result = await orderService.transition(tenantId, orderId, "shipped", "returned", { disposition: "sellable" });
+  assert.equal(result, "returned");
+  assert.equal(await statusOf(orderId), "returned");
+
+  const level = await withTenant(pool, tenantId, (client) =>
+    client.query<{ on_hand: number }>(`SELECT on_hand FROM inventory_levels WHERE product_id = $1 AND location_id = $2`, [
+      productId,
+      locationId,
+    ]),
+  );
+  assert.equal(level.rows[0]?.on_hand, 4, "restocked back to exactly what was sold");
+
+  const returnEvent = await withTenant(pool, tenantId, (client) =>
+    client.query<{ event_type: string; reference_type: string; quantity_delta: number }>(
+      `SELECT event_type, reference_type, quantity_delta FROM inventory_events WHERE reference_type = 'return' AND reference_id = $1`,
+      [orderId],
+    ),
+  );
+  assert.equal(returnEvent.rows.length, 1);
+  assert.equal(returnEvent.rows[0]?.event_type, "receipt");
+  assert.equal(returnEvent.rows[0]?.quantity_delta, 4);
+
+  // Calling it again (e.g. a retried request) must not double-restock --
+  // same idempotency-via-idempotency_key contract as everywhere else in
+  // this ledger.
+  await assert.rejects(
+    () => orderService.transition(tenantId, orderId, "shipped", "returned", { disposition: "sellable" }),
+    /not in status 'shipped'/,
+    "a second return attempt fails at the guarded status flip, not a double-restock",
+  );
+  const levelAfterRetry = await withTenant(pool, tenantId, (client) =>
+    client.query<{ on_hand: number }>(`SELECT on_hand FROM inventory_levels WHERE product_id = $1 AND location_id = $2`, [
+      productId,
+      locationId,
+    ]),
+  );
+  assert.equal(levelAfterRetry.rows[0]?.on_hand, 4, "no double-restock on a rejected retry");
+});
+
+test("a 'sellable' return with no matching sale events restocks nothing rather than throwing", async () => {
+  const orderId = await insertOrderAtStatus("shipped", "NO-SALE-EVENT-ORDER");
+  const orderService = new OrderService(pool);
+
+  const result = await orderService.transition(tenantId, orderId, "shipped", "returned", { disposition: "sellable" });
+  assert.equal(result, "returned");
+  assert.equal(await statusOf(orderId), "returned");
 });
 
 test("an on-hold order cannot jump straight to allocated, skipping the resume step", async () => {
