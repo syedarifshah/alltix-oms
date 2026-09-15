@@ -1,6 +1,14 @@
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { withTenant } from "@alltix/db";
-import type { PicklistLineStatus, PicklistStatus } from "@alltix/shared";
+import {
+  DomainEvent,
+  InProcessEventBus,
+  type DomainEventName,
+  type EventBus,
+  type OrderSplitForBackorderPayload,
+  type PicklistLineStatus,
+  type PicklistStatus,
+} from "@alltix/shared";
 import {
   createAmazonConnectorFromChannelConnection,
   createShopifyConnectorFromChannelConnection,
@@ -27,6 +35,125 @@ export interface Picklist {
   assignedTo: string | null;
   orderIds: string[];
   lines: PicklistLine[];
+}
+
+/** One short-picked order_line, as packOrder() found it -- enough for
+ *  spinOffBackorder() to either insert a brand-new line on the backorder
+ *  order (a partial pick, quantityPicked > 0: the original order_line stays
+ *  put, already reduced to quantityPicked by the time spinOffBackorder() is
+ *  called) or re-parent this order_line onto it wholesale (nothing picked
+ *  at all, quantityPicked === 0). See packOrder()'s own SHORT-PICK SPLIT
+ *  doc comment, and spinOffBackorder()'s, for why those are different
+ *  operations rather than always insert-a-new-line. */
+interface ShortLine {
+  orderLineId: string;
+  productId: string;
+  unitPrice: string;
+  fulfillmentType: string;
+  shortfall: number;
+  quantityPicked: number;
+}
+
+interface BackorderResult {
+  orderId: string;
+  lines: Array<{ productId: string; quantity: number }>;
+}
+
+/**
+ * Inserts the brand-new backordered order that packOrder()'s SHORT-PICK
+ * SPLIT spins off for `orderId`'s shortfall, then gives it each short
+ * line's missing quantity -- either as a fresh order_lines row (a partial
+ * pick) or by re-parenting the original order_line onto it wholesale
+ * (nothing picked at all) -- see the per-line comment below for why those
+ * are different operations. See packOrder()'s own doc comment for the
+ * broader reasoning (why this is a real order, why its external_order_id is
+ * derived rather than channel-supplied, why it skips
+ * OrderService.persistPulledOrders()'s usual ingestion pipeline). A free
+ * function taking the already-open transaction's `client` directly (not a
+ * WarehouseService method) since it has no need of `this` and every caller
+ * already holds the same client packOrder() itself is using -- keeping it
+ * out of the class body makes that "runs inside the caller's transaction,
+ * never opens its own" contract impossible to get wrong by accident.
+ */
+async function spinOffBackorder(
+  client: PoolClient,
+  tenantId: string,
+  orderId: string,
+  shortLines: ShortLine[],
+): Promise<BackorderResult> {
+  const orderRow = await client.query<{
+    channel: string;
+    external_order_id: string;
+    customer: Record<string, unknown> | null;
+    shipping_address: Record<string, unknown> | null;
+    placed_at: string | null;
+    preferred_location_id: string | null;
+  }>(
+    `SELECT channel, external_order_id, customer, shipping_address, placed_at, preferred_location_id
+       FROM orders WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+    [orderId, tenantId],
+  );
+  const original = orderRow.rows[0];
+  if (!original) {
+    throw new Error(`Order ${orderId} not found for tenant ${tenantId}`);
+  }
+
+  const backorderInsert = await client.query<{ id: string }>(
+    `INSERT INTO orders
+       (tenant_id, channel, external_order_id, status, customer, shipping_address, placed_at,
+        preferred_location_id, split_from_order_id)
+     VALUES ($1, $2, $3, 'backordered', $4, $5, $6, $7, $8)
+     RETURNING id`,
+    [
+      tenantId,
+      original.channel,
+      `${original.external_order_id}:backorder`,
+      JSON.stringify(original.customer),
+      JSON.stringify(original.shipping_address),
+      original.placed_at,
+      original.preferred_location_id,
+      orderId,
+    ],
+  );
+  const backorderOrderId = backorderInsert.rows[0]!.id;
+
+  for (const shortLine of shortLines) {
+    if (shortLine.quantityPicked > 0) {
+      // Partial pick: packOrder() already reduced the original order_line's
+      // own quantity down to quantityPicked, so the shortfall needs a
+      // brand-new line here.
+      await client.query(
+        `INSERT INTO order_lines (tenant_id, order_id, product_id, quantity, unit_price, fulfillment_type)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [tenantId, backorderOrderId, shortLine.productId, shortLine.shortfall, shortLine.unitPrice, shortLine.fulfillmentType],
+      );
+    } else {
+      // Nothing was picked at all -- re-parent the EXISTING order_line onto
+      // the backorder rather than delete-and-reinsert. order_lines.quantity
+      // has a CHECK (quantity > 0), so the original row can't be reduced to
+      // zero in place; and picklist_lines.order_line_id is a NOT NULL FK
+      // with no ON DELETE behavior (deliberately -- a picklist's own audit
+      // record, migration 0013, must never be able to vanish just because
+      // the order_line it graded got tidied up later), so the row can't be
+      // deleted either once it's been picked against. Re-parenting keeps
+      // that FK intact, preserves the order_line's own id/history (still
+      // reachable from the *backorder* order's detail page, telling that
+      // order's own real history: "spun off after a picking attempt found
+      // nothing here"), and needs no separate INSERT -- its existing
+      // quantity is already exactly the shortfall, since nothing was picked
+      // means shortfall === the original requested quantity.
+      await client.query(`UPDATE order_lines SET order_id = $1 WHERE id = $2 AND tenant_id = $3`, [
+        backorderOrderId,
+        shortLine.orderLineId,
+        tenantId,
+      ]);
+    }
+  }
+
+  return {
+    orderId: backorderOrderId,
+    lines: shortLines.map((l) => ({ productId: l.productId, quantity: l.shortfall })),
+  };
 }
 
 /**
@@ -62,7 +189,20 @@ export class WarehouseService {
   constructor(
     private readonly pool: Pool,
     private readonly orderService: OrderService,
+    // Same default-to-a-private-in-process-bus shape as OrderService's own
+    // constructor (packages/order-service/src/index.ts) -- fine for the
+    // same reason services.ts's getWarehouseService() doc comment already
+    // gives for not sharing OrderService's bus here: none of this class's
+    // own publishes (OrderBackordered/OrderCancelled/OrderSplitForBackorder
+    // from packOrder()'s short-pick split, see its doc comment) need a
+    // subscriber today. A real caller that wants RulesEngine or reporting
+    // to see these can inject a shared bus later without any other change.
+    private readonly eventBus: EventBus = new InProcessEventBus(),
   ) {}
+
+  private async publish<T>(tenantId: string, name: DomainEventName, payload: T): Promise<void> {
+    await this.eventBus.publish({ name, tenantId, occurredAt: new Date().toISOString(), payload });
+  }
 
   /**
    * Generates one picklist per distinct location among `orderIds`' lines
@@ -284,45 +424,108 @@ export class WarehouseService {
   }
 
   /**
-   * Resolves one order's picking outcome into 'packed': every picklist_line
-   * belonging to this order's order_lines must already be recorded (not
-   * 'pending' -- packing can't happen mid-pick). For any line that came up
-   * short (quantity_picked < quantity_requested), inserts a real
-   * inventory_events entry -- 'damage' if the line was marked damaged,
-   * 'adjustment' otherwise -- instead of silently treating the requested
-   * and picked quantities as if they matched (CLAUDE.md §2.2). That event
-   * both corrects on_hand (the phantom unit(s) were never physically
-   * there) and releases the matching amount of `reserved` (this order isn't
-   * going to ship what was never really available), so `available` is
-   * unaffected -- the shortfall was never really available stock to begin
-   * with, this just makes the ledger admit it.
+   * Resolves one order's picking outcome into 'packed' -- or, when every
+   * line came up short with nothing at all picked, into 'cancelled' (see
+   * SHORT-PICK SPLIT below). Every picklist_line belonging to this order's
+   * order_lines must already be recorded (not 'pending' -- packing can't
+   * happen mid-pick). For any line that came up short (quantity_picked <
+   * quantity_requested), inserts a real inventory_events entry -- 'damage'
+   * if the line was marked damaged, 'adjustment' otherwise -- instead of
+   * silently treating the requested and picked quantities as if they
+   * matched (CLAUDE.md §2.2). That event both corrects on_hand (the
+   * phantom unit(s) were never physically there) and releases the matching
+   * amount of `reserved` (this order isn't going to ship what was never
+   * really available), so `available` is unaffected -- the shortfall was
+   * never really available stock to begin with, this just makes the ledger
+   * admit it.
+   *
+   * SHORT-PICK SPLIT (CLAUDE.md §3's now-resolved OPEN PRODUCT DECISION --
+   * Arif's call: split into a partial shipment + backorder, not silently
+   * ship-what-was-picked or hold the whole order): a shortfall no longer
+   * disappears into just a ledger correction. For every short line:
+   *  - if *something* was picked (quantity_picked > 0), the ORIGINAL
+   *    order_line's own quantity is reduced to what was actually picked --
+   *    this order really is going to ship that many, no more.
+   *  - if *nothing* was picked (quantity_picked === 0), the original
+   *    order_line is re-parented onto the new backorder order wholesale
+   *    (its order_id is repointed, everything else about the row is
+   *    untouched) rather than deleted -- order_lines.quantity has a
+   *    CHECK (quantity > 0) so it can never be reduced to zero in place,
+   *    and picklist_lines.order_line_id is a NOT NULL FK with no ON DELETE
+   *    behavior, so the row can't be deleted either once it's been picked
+   *    against (see spinOffBackorder()'s own doc comment for the full
+   *    reasoning).
+   * Every short line's missing quantity (requested - picked) ends up on a
+   * brand-new order, inserted directly at status 'backordered' (see
+   * migration 0023's `split_from_order_id`, which points it back at this
+   * order) -- from a person's perspective it's a completely ordinary
+   * backordered order from here on: the existing 'backordered' -> 'allocated'
+   * manual retry (packages/web/src/lib/order-status.ts) picks it up once
+   * stock is back, same as any order that came up short at allocation time
+   * instead of at picking time.
+   *
+   * If the split leaves the ORIGINAL order with no lines at all (every line
+   * short-picked to zero -- nothing physically exists to box up), the
+   * original is cancelled outright instead of proceeding to 'packed': a
+   * 'packed' order with zero lines would be an empty shipment, and this
+   * order's entire content now lives on the new backorder order instead.
+   * That cancellation is a raw, guarded status flip here rather than a call
+   * to OrderService.cancelOrder() -- that method independently re-reads and
+   * re-releases every still-standing 'reservation' event for this order,
+   * which would double-release: the per-line shortfall correction above
+   * already reduced `reserved` by the *entire* originally-reserved quantity
+   * for every line in this all-short case (shortfall === quantity_requested
+   * when quantity_picked is 0), so there is nothing left for a second
+   * release pass to safely subtract.
+   *
+   * Everything -- the ledger corrections, the original order's order_lines
+   * split, the new order/order_lines insert, and (when it applies) the
+   * original order's cancellation -- happens in one transaction: an order
+   * must never be observable half-split (e.g. its lines already reduced but
+   * no backorder order yet holding the difference). Written directly
+   * against orders/order_lines here rather than composed through
+   * OrderService, for the same reason the ledger correction above is
+   * written directly against inventory_events rather than composed through
+   * InventoryService: both those classes always open their own separate
+   * transaction, and this operation cannot be split across two round-trips
+   * without a window where the split is only half-committed (see
+   * OrderService.cancelOrder's own doc comment for this codebase's existing
+   * precedent on the same tradeoff). Events (OrderBackordered for the new
+   * order, OrderCancelled for the original when it's cancelled, and
+   * OrderSplitForBackorder either way) are published only after this
+   * transaction commits -- same "never publish from inside an open
+   * transaction" discipline every other method in this file and
+   * OrderService follow.
+   *
+   * A backorder order's external_order_id is derived
+   * (`<original>:backorder`), not a fresh channel-supplied id -- this is an
+   * internal fulfillment artifact, not a second real marketplace order, so
+   * it never collides with a genuine external_order_id and is stable per
+   * original order. It deliberately does NOT go through
+   * OrderService.persistPulledOrders()'s usual 'order.received' pipeline --
+   * no usage-metering increment, no RulesEngine routing/hold rule run
+   * against it -- it's fulfillment overhead of the ONE real order that was
+   * already counted/routed when it first came in, not a new customer order.
    *
    * If every line on the owning picklist(s) is now resolved, marks the
-   * picklist 'completed'. Then transitions this order 'picking' -> 'packed'
-   * via OrderService.
-   *
-   * OPEN PRODUCT DECISION (not implemented, flagged rather than silently
-   * skipped -- same treatment as the kitting/bundling gap on this class's
-   * own doc comment): a short-picked line only corrects the ledger here. It
-   * does not trigger any backorder or split-shipment handling -- the order
-   * proceeds straight to 'packed' and will ship only what was actually
-   * picked, with no record anywhere that the customer is now owed the
-   * missing quantity. Whether a shortfall should instead spin off a
-   * backorder for the difference, hold the whole order, or something else
-   * is a real product decision that needs making before this reaches a
-   * seller who cares about it.
+   * picklist 'completed' regardless of which of the two outcomes above the
+   * order landed on.
    */
   async packOrder(tenantId: string, orderId: string): Promise<void> {
-    const affectedPicklistIds = await withTenant(this.pool, tenantId, async (client) => {
+    const result = await withTenant(this.pool, tenantId, async (client) => {
       const lines = await client.query<{
         id: string;
         picklist_id: string;
+        order_line_id: string;
         product_id: string;
         quantity_requested: number;
         quantity_picked: number;
         status: PicklistLineStatus;
+        unit_price: string;
+        fulfillment_type: string;
       }>(
-        `SELECT pl.id, pl.picklist_id, pl.product_id, pl.quantity_requested, pl.quantity_picked, pl.status
+        `SELECT pl.id, pl.picklist_id, pl.order_line_id, pl.product_id, pl.quantity_requested, pl.quantity_picked, pl.status,
+                ol.unit_price, ol.fulfillment_type
            FROM picklist_lines pl
            JOIN order_lines ol ON ol.id = pl.order_line_id
           WHERE ol.order_id = $1 AND pl.tenant_id = $2`,
@@ -332,8 +535,9 @@ export class WarehouseService {
       if (lines.rows.length === 0) {
         // No picklist lines at all -- either a zero-line order (already
         // moved straight to 'picking' by generatePicklist()) or one that
-        // was never put on a picklist. Nothing to reconcile either way.
-        return [];
+        // was never put on a picklist. Nothing to reconcile, nothing to
+        // split -- proceed straight to 'packed'.
+        return { affectedPicklistIds: [] as string[], backorder: null as BackorderResult | null, originalCancelled: false };
       }
 
       const pending = lines.rows.filter((l) => l.status === "pending");
@@ -353,9 +557,19 @@ export class WarehouseService {
         throw new Error(`Picklist ${picklistId} not found for tenant ${tenantId}`);
       }
 
+      const shortLines: ShortLine[] = [];
+      // Count of order_lines still standing on the ORIGINAL order once
+      // every line above has been resolved -- both an unaffected
+      // (non-short) line and a partially-short line (quantity reduced, not
+      // deleted) count toward this; only a fully-zero-picked line does not.
+      let remainingLineCount = 0;
+
       for (const line of lines.rows) {
         const shortfall = line.quantity_requested - line.quantity_picked;
-        if (shortfall <= 0) continue;
+        if (shortfall <= 0) {
+          remainingLineCount++;
+          continue;
+        }
 
         await client.query(
           `INSERT INTO inventory_events
@@ -376,13 +590,81 @@ export class WarehouseService {
              WHERE product_id = $2 AND location_id = $3`,
           [shortfall, line.product_id, locationId],
         );
+
+        shortLines.push({
+          orderLineId: line.order_line_id,
+          productId: line.product_id,
+          unitPrice: line.unit_price,
+          fulfillmentType: line.fulfillment_type,
+          shortfall,
+          quantityPicked: line.quantity_picked,
+        });
+
+        if (line.quantity_picked > 0) {
+          await client.query(`UPDATE order_lines SET quantity = $1 WHERE id = $2 AND tenant_id = $3`, [
+            line.quantity_picked,
+            line.order_line_id,
+            tenantId,
+          ]);
+          remainingLineCount++;
+        }
+        // else: leave this order_line untouched for now -- spinOffBackorder()
+        // re-parents it onto the new backorder order below (once that order
+        // exists to re-parent it onto), rather than deleting it here. See
+        // spinOffBackorder()'s per-line comment for why a delete-and-reinsert
+        // doesn't work: order_lines.quantity's CHECK (quantity > 0) rules
+        // out reducing it to zero in place, and picklist_lines.order_line_id
+        // is a NOT NULL FK with no ON DELETE behavior, so the row can't be
+        // deleted either once it's been picked against.
       }
 
-      return [...new Set(lines.rows.map((l) => l.picklist_id))];
+      let backorder: BackorderResult | null = null;
+      let originalCancelled = false;
+
+      if (shortLines.length > 0) {
+        backorder = await spinOffBackorder(client, tenantId, orderId, shortLines);
+
+        if (remainingLineCount === 0) {
+          // Nothing survived on the original order -- see this method's
+          // SHORT-PICK SPLIT doc comment for why this is a raw guarded flip,
+          // not OrderService.cancelOrder().
+          const cancelled = await client.query(
+            `UPDATE orders SET status = 'cancelled', updated_at = now()
+               WHERE id = $1 AND tenant_id = $2 AND status = 'picking'`,
+            [orderId, tenantId],
+          );
+          if (cancelled.rowCount === 0) {
+            throw new Error(`Order ${orderId} is not in status 'picking' -- refusing to cancel (concurrent update?)`);
+          }
+          originalCancelled = true;
+        }
+      }
+
+      return {
+        affectedPicklistIds: [...new Set(lines.rows.map((l) => l.picklist_id))],
+        backorder,
+        originalCancelled,
+      };
     });
 
-    for (const picklistId of affectedPicklistIds) {
+    for (const picklistId of result.affectedPicklistIds) {
       await this.maybeCompletePicklist(tenantId, picklistId);
+    }
+
+    if (result.backorder) {
+      await this.publish(tenantId, DomainEvent.OrderBackordered, { orderId: result.backorder.orderId });
+      const splitPayload: OrderSplitForBackorderPayload = {
+        originalOrderId: orderId,
+        backorderOrderId: result.backorder.orderId,
+        originalOrderCancelled: result.originalCancelled,
+        lines: result.backorder.lines,
+      };
+      await this.publish(tenantId, DomainEvent.OrderSplitForBackorder, splitPayload);
+    }
+
+    if (result.originalCancelled) {
+      await this.publish(tenantId, DomainEvent.OrderCancelled, { orderId });
+      return;
     }
 
     await this.orderService.transition(tenantId, orderId, "picking", "packed");

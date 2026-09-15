@@ -19,6 +19,17 @@ interface OrderHeaderRow {
   created_at: string;
   updated_at: string;
   preferred_location_id: string | null;
+  split_from_order_id: string | null;
+}
+
+/** Either direction of a SHORT-PICK SPLIT link (WarehouseService.packOrder,
+ *  migration 0023) -- the order this one was split from, or an order that
+ *  was split off from this one. Same three fields either way: enough to
+ *  render a link and a status badge, nothing more. */
+interface RelatedOrderRow {
+  id: string;
+  status: string;
+  external_order_id: string;
 }
 
 interface OrderLineRow {
@@ -162,14 +173,15 @@ export default async function OrderDetailPage({ params, searchParams }: OrderDet
 
   const data = await withTenant(pool, tenantId, async (client) => {
     const orderResult = await client.query<OrderHeaderRow>(
-      `SELECT id, status, channel, external_order_id, placed_at, created_at, updated_at, preferred_location_id
+      `SELECT id, status, channel, external_order_id, placed_at, created_at, updated_at, preferred_location_id,
+              split_from_order_id
          FROM orders WHERE id = $1`,
       [id],
     );
     const order = orderResult.rows[0];
     if (!order) return null;
 
-    const [lines, events, ruleExecutions, picklistLines] = await Promise.all([
+    const [lines, events, ruleExecutions, picklistLines, splitFromOrder, splitIntoOrders] = await Promise.all([
       client.query<OrderLineRow>(
         `SELECT
            ol.id, ol.quantity, ol.unit_price, ol.fulfillment_type,
@@ -214,12 +226,25 @@ export default async function OrderDetailPage({ params, searchParams }: OrderDet
           ORDER BY pl.updated_at`,
         [id],
       ),
+      // SHORT-PICK SPLIT linkage (WarehouseService.packOrder, migration
+      // 0023) -- at most one of these two queries ever returns a row for a
+      // given order: an order is either something else's backorder
+      // (split_from_order_id set) or the source of at most one backorder of
+      // its own (packOrder can only run once per order), never both.
+      order.split_from_order_id
+        ? client.query<RelatedOrderRow>(`SELECT id, status, external_order_id FROM orders WHERE id = $1`, [
+            order.split_from_order_id,
+          ])
+        : Promise.resolve({ rows: [] as RelatedOrderRow[] }),
+      client.query<RelatedOrderRow>(`SELECT id, status, external_order_id FROM orders WHERE split_from_order_id = $1`, [id]),
     ]);
 
     return {
       order,
       lines: lines.rows,
       timeline: buildTimeline(order, events.rows, ruleExecutions.rows, picklistLines.rows),
+      splitFromOrder: splitFromOrder.rows[0] ?? null,
+      splitIntoOrders: splitIntoOrders.rows,
     };
   });
 
@@ -227,7 +252,7 @@ export default async function OrderDetailPage({ params, searchParams }: OrderDet
     notFound();
   }
 
-  const { order, lines, timeline } = data;
+  const { order, lines, timeline, splitFromOrder, splitIntoOrders } = data;
 
   return (
     <main className="page">
@@ -243,6 +268,30 @@ export default async function OrderDetailPage({ params, searchParams }: OrderDet
       </p>
 
       {error && <div className="alert alert-danger">Couldn&apos;t update this order ({error}).</div>}
+
+      {splitFromOrder && (
+        <div className="alert alert-warning">
+          This order is a backorder split off from{" "}
+          <a href={`/orders/${splitFromOrder.id}`}>
+            {splitFromOrder.external_order_id} ({splitFromOrder.status})
+          </a>{" "}
+          after a short pick.
+        </div>
+      )}
+      {splitIntoOrders.length > 0 && (
+        <div className="alert alert-warning">
+          A short pick on this order split its unfulfilled quantity into{" "}
+          {splitIntoOrders.map((backorder, i) => (
+            <span key={backorder.id}>
+              {i > 0 && ", "}
+              <a href={`/orders/${backorder.id}`}>
+                {backorder.external_order_id} ({backorder.status})
+              </a>
+            </span>
+          ))}
+          .
+        </div>
+      )}
 
       {manualOrderActions(order.status as OrderStatus).map((action) => (
         <form

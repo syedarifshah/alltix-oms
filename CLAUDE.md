@@ -214,6 +214,28 @@ received → validated → allocated → picking → packed → shipped → deli
 - Every transition publishes an event (`order.allocated`, `order.shipped`) that the
   Rules Engine and Reporting layer subscribe to independently — the order service
   itself doesn't know or care who's listening.
+- **Short-pick handling — built** (`packages/warehouse-service/src/index.ts`'s
+  `WarehouseService.packOrder`, migration `0023_orders_split_from_order_id.sql`):
+  resolved the OPEN PRODUCT DECISION this section used to flag. Arif's call:
+  split into a partial shipment + backorder, not silently ship-what-was-picked
+  or hold the whole order. When a picklist line comes up short, the ledger
+  correction (`adjustment`/`damage` inventory_events, unchanged from before) still
+  happens, but the shortfall no longer just vanishes into it: the original
+  order_line is reduced to what was actually picked (or, if nothing at all was
+  picked, re-parented wholesale onto the new order — `order_lines.quantity`'s
+  `CHECK (quantity > 0)` rules out reducing it to zero in place, and
+  `picklist_lines.order_line_id` is a NOT NULL FK with no `ON DELETE` behavior, so
+  the row can never just be deleted once it's been picked against), and a
+  brand-new order is inserted directly at `backordered` — linked back via
+  `orders.split_from_order_id` — carrying the missing quantity. From there it's
+  an entirely ordinary backordered order: the existing `backordered` →
+  `allocated` manual retry picks it up once stock is back. If a short pick leaves
+  the *original* order with nothing left to ship (every line picked to zero), that
+  order is cancelled outright instead of packed as an empty shipment — see
+  `packOrder`'s own doc comment for why that's a raw guarded status flip rather
+  than a call to `OrderService.cancelOrder()` (the ledger correction above already
+  fully released that order's reservation; a second release pass would
+  double-release). `/orders/[id]` surfaces the link in both directions.
 
 ## 4. Marketplace Integration Layer
 

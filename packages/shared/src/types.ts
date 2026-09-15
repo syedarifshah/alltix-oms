@@ -103,6 +103,11 @@ export interface Order {
    *  allocateOrder() allocates against this location instead of its default
    *  choice. Null means no routing rule fired for this order. */
   preferredLocationId: string | null;
+  /** Set only on an order spun off by WarehouseService.packOrder's
+   *  short-pick handling (migration 0023) -- points back at the real order
+   *  this one's shortfall was split from. Null for every ordinarily-ingested
+   *  order. */
+  splitFromOrderId: string | null;
   rawPayload: unknown;
 }
 

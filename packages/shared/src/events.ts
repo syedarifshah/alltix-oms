@@ -21,6 +21,17 @@ export const DomainEvent = {
   OrderCancelled: "order.cancelled",
   OrderReturned: "order.returned",
   OrderRefunded: "order.refunded",
+  // Published once per short-pick split (WarehouseService.packOrder,
+  // CLAUDE.md §3): a picklist line came up short, so the shortfall was spun
+  // off into a brand-new order (see OrderSplitForBackorderPayload) rather
+  // than silently shipping less than the customer ordered. Fires alongside
+  // -- not instead of -- OrderBackordered (published for the new order
+  // itself) and, when the original order had nothing left to ship at all,
+  // OrderCancelled (for the original) -- this event exists so a subscriber
+  // (e.g. a future customer-notification feature) can find both halves of
+  // the split together without having to correlate two separate events by
+  // timing/orderId guesswork.
+  OrderSplitForBackorder: "order.split_for_backorder",
   InventoryChanged: "inventory.changed",
 } as const;
 
@@ -46,4 +57,18 @@ export interface OrderReceivedPayload {
   channelMarketplace: string;
   externalOrderId: string;
   shippingAddress: Record<string, unknown> | null;
+}
+
+/** Payload for `order.split_for_backorder` -- see DomainEvent.OrderSplitForBackorder's
+ *  own comment for why this exists as its own event/payload rather than
+ *  making a subscriber reconstruct the relationship from OrderBackordered/
+ *  OrderCancelled alone. `originalOrderCancelled` is true only when the
+ *  original order had nothing left to ship at all (every line short-picked
+ *  to zero) and was cancelled outright rather than packed with a reduced
+ *  line set -- see WarehouseService.packOrder's doc comment. */
+export interface OrderSplitForBackorderPayload {
+  originalOrderId: string;
+  backorderOrderId: string;
+  originalOrderCancelled: boolean;
+  lines: Array<{ productId: string; quantity: number }>;
 }
