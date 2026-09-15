@@ -2,6 +2,13 @@ import type { Pool } from "pg";
 import { withTenant, decryptChannelSecret } from "@alltix/db";
 import type { FulfillmentType } from "@alltix/shared";
 import type { AuthToken, NormalizedOrder, NormalizedOrderLine, SyncResult, TrackingInfo } from "./connector.js";
+// CLAUDE.md §4.4's in-process retry/backoff (see retry.ts's own doc
+// comment) -- every call site below is a drop-in swap, not a behavior
+// change for the success/hard-failure paths; only sustained 429/503s or
+// thrown network errors behave differently (RateLimitExhaustedError instead
+// of a response the caller's own `if (!response.ok)` would still have to
+// handle, or a raw thrown fetch error).
+import { fetchWithBackoff } from "./retry.js";
 
 // SP-API auth has been LWA-only since Oct 2023 -- no AWS IAM/SigV4 signing
 // required (CLAUDE.md §4.1). This is a smoke-test-only implementation:
@@ -320,7 +327,7 @@ export class AmazonConnector {
       client_secret: this.credentials.clientSecret,
     });
 
-    const response = await fetch(LWA_TOKEN_URL, {
+    const response = await fetchWithBackoff(LWA_TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body,
@@ -353,7 +360,7 @@ export class AmazonConnector {
   async getMarketplaceParticipations(): Promise<MarketplaceParticipation[]> {
     const { accessToken } = await this.authenticate();
 
-    const response = await fetch(
+    const response = await fetchWithBackoff(
       `${this.baseUrl}/sellers/v1/marketplaceParticipations`,
       {
         method: "GET",
@@ -382,7 +389,7 @@ export class AmazonConnector {
   async getOrderItems(amazonOrderId: string): Promise<AmazonOrderItem[]> {
     const { accessToken } = await this.authenticate();
 
-    const response = await fetch(
+    const response = await fetchWithBackoff(
       `${this.baseUrl}/orders/v0/orders/${encodeURIComponent(amazonOrderId)}/orderItems`,
       {
         method: "GET",
@@ -430,7 +437,7 @@ export class AmazonConnector {
       CreatedAfter: since instanceof Date ? since.toISOString() : since,
     });
 
-    const response = await fetch(`${this.baseUrl}/orders/v0/orders?${query.toString()}`, {
+    const response = await fetchWithBackoff(`${this.baseUrl}/orders/v0/orders?${query.toString()}`, {
       method: "GET",
       headers: {
         "x-amz-access-token": accessToken,
@@ -490,7 +497,7 @@ export class AmazonConnector {
   async pushInventory(sellerSku: string, quantity: number): Promise<SyncResult> {
     const { accessToken } = await this.authenticate();
 
-    const response = await fetch(
+    const response = await fetchWithBackoff(
       `${this.baseUrl}/listings/2021-08-01/items/${encodeURIComponent(this.sellerId)}/${encodeURIComponent(sellerSku)}` +
         `?marketplaceIds=${this.marketplaceIds.join(",")}`,
       {
@@ -574,7 +581,7 @@ export class AmazonConnector {
     const isSandbox = this.isSandbox();
     const items = await this.getOrderItems(isSandbox ? SP_API_SANDBOX_TEST_CASE_ORDER_ID : orderId);
 
-    const response = await fetch(
+    const response = await fetchWithBackoff(
       `${this.baseUrl}/orders/v0/orders/${encodeURIComponent(orderId)}/shipmentConfirmation`,
       {
         method: "POST",

@@ -12,6 +12,14 @@ import type {
   SyncResult,
   TrackingInfo,
 } from "./connector.js";
+// CLAUDE.md §4.4's in-process retry/backoff -- see retry.ts's own doc
+// comment and amazon-connector.ts's identical import for the full
+// reasoning. Only request() (the shared wrapper every non-token Marketplace
+// API call goes through) is swapped, not authenticate()'s token exchange --
+// a token 429 is a different, much rarer failure mode this connector has
+// never actually observed (UNVERIFIED status, see this file's class doc
+// comment), and leaving it as plain fetch keeps this change minimal.
+import { fetchWithBackoff } from "./retry.js";
 
 // Walmart Marketplace API connector -- channel #2 (CLAUDE.md §8 Phase 2).
 // Researched live against developer.walmart.com before writing any of this
@@ -379,7 +387,7 @@ export class WalmartConnector implements ChannelConnector {
       ...(init.headers as Record<string, string> | undefined),
     };
 
-    const response = await fetch(`${this.baseUrl}${path}`, { ...init, headers });
+    const response = await fetchWithBackoff(`${this.baseUrl}${path}`, { ...init, headers });
     const data = (await response.json()) as T;
     return { ok: response.ok, status: response.status, data };
   }

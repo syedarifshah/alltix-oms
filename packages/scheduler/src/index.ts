@@ -6,6 +6,7 @@ import {
   SP_API_SANDBOX_TEST_CASE_CREATED_AFTER,
   createShopifyConnectorFromChannelConnection,
   createWalmartConnectorFromChannelConnection,
+  RateLimitExhaustedError,
   type NormalizedShopifyProductVariant,
 } from "@alltix/channel-connectors";
 import { InventoryService } from "@alltix/inventory-service";
@@ -53,6 +54,23 @@ export interface TenantSyncResult {
  *  tenant to 'error' on the very next cron tick; three in a row is a much
  *  stronger signal of a genuinely dead credential/token than one. */
 export const CONSECUTIVE_FAILURE_ERROR_THRESHOLD = 3;
+
+/** CLAUDE.md §4.4's cross-run circuit-breaker cooldown -- how long a
+ *  connection sits out of every discovery query's `WHERE` clause once
+ *  fetchWithBackoff (packages/channel-connectors/src/retry.ts) has already
+ *  exhausted its own in-process retries and thrown RateLimitExhaustedError.
+ *  A fixed window, deliberately NOT exponential the way the in-process
+ *  backoff is: the in-process half already spends a few seconds proving a
+ *  429/503 is sustained, not a blip, before this even fires, and the
+ *  cadence this cooldown sits inside of is a once-or-twice-daily cron tick
+ *  (CLAUDE.md §4.4's job queue is per-run, not per-second) -- there's no
+ *  meaningful difference between "back off 15 minutes" and "back off 15
+ *  minutes, then 30, then 60" when the next opportunity to even check is
+ *  tomorrow's run regardless. Fifteen minutes is long enough that a single
+ *  rate-limited run doesn't immediately retry into the same throttle on
+ *  the very next tick of a more frequent schedule, without leaving a
+ *  connection dark for the rest of a day over one bad run. */
+export const RATE_LIMIT_COOLDOWN_MS = 15 * 60 * 1000;
 
 /**
  * Records a failed sync attempt against the tenant's active channel_connections
@@ -150,10 +168,19 @@ export async function recordSyncFailure(
  * incident stays visible even once resolved, rather than being erased the
  * moment things recover.
  *
- * `AND consecutive_failures > 0` is a pure optimization, not a correctness
- * requirement -- without it, every single successful run of a healthy
- * connection (the overwhelmingly common case) would still issue a no-op
- * UPDATE and bump updated_at for no reason.
+ * `AND (consecutive_failures > 0 OR rate_limited_until IS NOT NULL)` is a
+ * pure optimization, not a correctness requirement -- without it, every
+ * single successful run of a healthy connection (the overwhelmingly common
+ * case) would still issue a no-op UPDATE and bump updated_at for no reason.
+ *
+ * Also clears `rate_limited_until` -- a successful call this run is direct
+ * proof the earlier trip has resolved, so there's no reason to make the
+ * connection sit out the rest of its cooldown once it's demonstrably
+ * healthy again. (In practice a still-cooling-down connection never
+ * reaches this line at all: it was excluded from the discovery query's
+ * `rate_limited_until` filter in the first place -- this clears a cooldown
+ * that already expired naturally, or one from a run prior to this cooldown
+ * concept existing at all.)
  *
  * Matches only status = 'active' rows -- a row already flipped to 'error'
  * is not auto-recovered by this. That's dead code for the 'error' case as
@@ -170,10 +197,63 @@ export async function recordSyncSuccess(
   await withTenant(appPool, tenantId, (client) =>
     client.query(
       `UPDATE channel_connections
-          SET consecutive_failures = 0, updated_at = now()
-        WHERE tenant_id = $1 AND channel = $2 AND status = 'active' AND consecutive_failures > 0`,
+          SET consecutive_failures = 0, rate_limited_until = NULL, updated_at = now()
+        WHERE tenant_id = $1 AND channel = $2 AND status = 'active'
+          AND (consecutive_failures > 0 OR rate_limited_until IS NOT NULL)`,
       [tenantId, channel],
     ),
+  );
+}
+
+/**
+ * The cross-run half of CLAUDE.md §4.4's circuit breaker: called from a
+ * syncXTenant()/syncShopifyCatalogForTenant() catch block specifically when
+ * `err instanceof RateLimitExhaustedError` (i.e. fetchWithBackoff itself
+ * already retried in-process and gave up -- this is not called for every
+ * failure, only a confirmed-sustained one), it stamps
+ * `rate_limited_until` far enough in the future that the next discovery
+ * query skips this connection entirely rather than immediately re-hitting
+ * a marketplace that just finished telling us to slow down.
+ *
+ * The cooldown is `max(RATE_LIMIT_COOLDOWN_MS, retryAfterMs ?? 0)` -- our
+ * own default floor, unless the marketplace's own Retry-After (surfaced on
+ * RateLimitExhaustedError.retryAfterMs, already the larger of the two by
+ * the time fetchWithBackoff throws -- see its own doc comment) asked for
+ * longer, in which case honoring what we were actually told beats our
+ * generic default.
+ *
+ * Deliberately independent of consecutive_failures/status='error' --
+ * RateLimitExhaustedError is a distinct failure mode from "this credential
+ * is dead" (recordSyncFailure()'s doc comment), so a rate-limit trip does
+ * NOT increment consecutive_failures or risk flipping status to 'error':
+ * being throttled is not evidence the connection itself is broken, and a
+ * healthy connection shouldn't lose its 'active' status over a marketplace
+ * doing exactly what rate limits are supposed to do. The catch block below
+ * still calls recordSyncFailure() too (this run IS a failed sync, and the
+ * per-run console.error/skip-remaining-tenants behavior is unchanged) --
+ * this function only adds the cooldown on top, it doesn't replace that call.
+ */
+export async function recordRateLimitTrip(
+  appPool: Pool,
+  tenantId: string,
+  channel: "amazon" | "shopify" | "walmart",
+  retryAfterMs: number | null,
+): Promise<void> {
+  const cooldownMs = Math.max(RATE_LIMIT_COOLDOWN_MS, retryAfterMs ?? 0);
+  const rateLimitedUntil = new Date(Date.now() + cooldownMs);
+
+  await withTenant(appPool, tenantId, (client) =>
+    client.query(
+      `UPDATE channel_connections
+          SET rate_limited_until = $1, updated_at = now()
+        WHERE tenant_id = $2 AND channel = $3 AND status = 'active'`,
+      [rateLimitedUntil, tenantId, channel],
+    ),
+  );
+
+  console.error(
+    `[ALERT] ${channel} channel_connections for tenant ${tenantId} is being rate-limited -- ` +
+      `backing off until ${rateLimitedUntil.toISOString()} (${Math.round(cooldownMs / 1000)}s) before retrying.`,
   );
 }
 
@@ -225,7 +305,9 @@ export async function syncAmazonOrders(params: SyncAmazonOrdersParams): Promise<
   rulesEngine.attach(eventBus);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
-    `SELECT DISTINCT tenant_id FROM channel_connections WHERE channel = 'amazon' AND status = 'active'`,
+    `SELECT DISTINCT tenant_id FROM channel_connections
+      WHERE channel = 'amazon' AND status = 'active'
+        AND (rate_limited_until IS NULL OR rate_limited_until <= now())`,
   );
 
   const results: TenantSyncResult[] = [];
@@ -301,6 +383,13 @@ async function syncTenant(appPool: Pool, orderService: OrderService, tenantId: s
     // silently forever, no signal anywhere beyond this one log line); it
     // no longer is.
     await recordSyncFailure(appPool, tenantId, "amazon", message);
+    // CLAUDE.md §4.4's cross-run circuit breaker -- only when
+    // fetchWithBackoff itself already exhausted its in-process retries (see
+    // recordRateLimitTrip()'s doc comment for why this is additive to, not
+    // a replacement for, the recordSyncFailure() call above).
+    if (err instanceof RateLimitExhaustedError) {
+      await recordRateLimitTrip(appPool, tenantId, "amazon", err.retryAfterMs);
+    }
     return { tenantId, success: false, insertedOrderIds: [], skippedExternalOrderIds: [], error: message };
   }
 }
@@ -326,7 +415,9 @@ export async function syncShopifyOrders(params: SyncAmazonOrdersParams): Promise
   rulesEngine.attach(eventBus);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
-    `SELECT DISTINCT tenant_id FROM channel_connections WHERE channel = 'shopify' AND status = 'active'`,
+    `SELECT DISTINCT tenant_id FROM channel_connections
+      WHERE channel = 'shopify' AND status = 'active'
+        AND (rate_limited_until IS NULL OR rate_limited_until <= now())`,
   );
 
   const results: TenantSyncResult[] = [];
@@ -384,6 +475,11 @@ async function syncShopifyTenant(appPool: Pool, orderService: OrderService, tena
     // Same cross-run failure tracking as syncTenant() -- see
     // recordSyncFailure()'s doc comment.
     await recordSyncFailure(appPool, tenantId, "shopify", message);
+    // Same cross-run circuit breaker as syncTenant() -- see
+    // recordRateLimitTrip()'s doc comment.
+    if (err instanceof RateLimitExhaustedError) {
+      await recordRateLimitTrip(appPool, tenantId, "shopify", err.retryAfterMs);
+    }
     return { tenantId, success: false, insertedOrderIds: [], skippedExternalOrderIds: [], error: message };
   }
 }
@@ -415,7 +511,9 @@ export async function syncWalmartOrders(params: SyncAmazonOrdersParams): Promise
   rulesEngine.attach(eventBus);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
-    `SELECT DISTINCT tenant_id FROM channel_connections WHERE channel = 'walmart' AND status = 'active'`,
+    `SELECT DISTINCT tenant_id FROM channel_connections
+      WHERE channel = 'walmart' AND status = 'active'
+        AND (rate_limited_until IS NULL OR rate_limited_until <= now())`,
   );
 
   const results: TenantSyncResult[] = [];
@@ -480,6 +578,11 @@ async function syncWalmartTenant(appPool: Pool, orderService: OrderService, tena
     // not a bug: an unverified connection that's actually broken SHOULD
     // end up visibly in 'error' rather than failing invisibly forever.
     await recordSyncFailure(appPool, tenantId, "walmart", message);
+    // Same cross-run circuit breaker as syncTenant() -- see
+    // recordRateLimitTrip()'s doc comment.
+    if (err instanceof RateLimitExhaustedError) {
+      await recordRateLimitTrip(appPool, tenantId, "walmart", err.retryAfterMs);
+    }
     return { tenantId, success: false, insertedOrderIds: [], skippedExternalOrderIds: [], error: message };
   }
 }
@@ -525,7 +628,9 @@ export async function syncShopifyCatalog(params: SyncShopifyCatalogParams): Prom
   const inventoryService = new InventoryService(appPool);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
-    `SELECT DISTINCT tenant_id FROM channel_connections WHERE channel = 'shopify' AND status = 'active'`,
+    `SELECT DISTINCT tenant_id FROM channel_connections
+      WHERE channel = 'shopify' AND status = 'active'
+        AND (rate_limited_until IS NULL OR rate_limited_until <= now())`,
   );
 
   const results: CatalogSyncResult[] = [];
@@ -581,6 +686,19 @@ async function syncShopifyCatalogForTenant(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Shopify catalog sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
+    // Unlike recordSyncFailure() (deliberately skipped here, see below),
+    // recordRateLimitTrip() IS called for a catalog-sync rate limit --
+    // rate_limited_until lives on the same channel_connections row
+    // syncShopifyOrders' discovery query also filters on, and a shop
+    // that's actively throttling this tenant's GraphQL calls is throttling
+    // the same underlying API order sync also calls, regardless of which
+    // job tripped it first. Skipping this would mean a sustained catalog
+    // rate-limit gets silently retried every run forever, the exact
+    // "no cross-run signal anywhere" gap recordSyncFailure() itself was
+    // built to close.
+    if (err instanceof RateLimitExhaustedError) {
+      await recordRateLimitTrip(appPool, tenantId, "shopify", err.retryAfterMs);
+    }
     // Deliberately NOT wired into recordSyncFailure()/the shared
     // consecutive_failures counter that syncTenant()/syncShopifyTenant()/
     // syncWalmartTenant() now use (see recordSyncFailure()'s doc comment)

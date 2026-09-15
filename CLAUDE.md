@@ -441,8 +441,49 @@ succeeded or failed."
   token-bucket algorithm.
 - **Priority lanes**: order-status writes > inventory writes > bulk catalog syncs —
   never let a bulk job starve a time-sensitive order update.
-- **Exponential backoff + circuit breaker** per channel connection — back off
-  automatically on 503s rather than risking account-level suspension.
+- **Exponential backoff + circuit breaker per channel connection — built**, but
+  deliberately NOT the literal BullMQ+Redis token-bucket queue the top bullet above
+  still names as the aspirational v2+ shape. This app runs on Vercel Hobby with no
+  persistent process and no Redis anywhere in the stack (confirmed by grep before
+  building this) — a central job queue would mean standing up brand-new paid infra
+  for a single self-testing tenant, for a problem this codebase hasn't hit yet at
+  real scale. What's built instead is the two-tier split that actually fits a
+  stateless serverless function:
+  - **In-process** (`packages/channel-connectors/src/retry.ts`'s `fetchWithBackoff`,
+    a drop-in `fetch()` replacement wired into every outbound call Amazon's six call
+    sites, Walmart's `request()`, and Shopify's `graphql()` make): full-jitter
+    exponential backoff (AWS's recommended formula) across up to 4 attempts total,
+    honoring a response's `Retry-After` header when it exceeds the computed delay.
+    Deliberately capped short (max ~4s of backoff) — a Vercel function has its own
+    tight execution-time budget (10s on Hobby), so sleeping out a long real-world
+    rate-limit window inside one invocation risks the function itself timing out
+    before ever reaching the give-up path. Still-retryable after every attempt
+    throws `RateLimitExhaustedError` (carrying the last status and any
+    `Retry-After`, in ms) instead of handing back a bad response — every other
+    outcome (success, or a non-retryable status like 400/403) is byte-for-byte
+    identical to plain `fetch()`, so no connector's own response handling changed.
+  - **Cross-run** (`migrations/0024_channel_connections_rate_limited_until.sql`,
+    `packages/scheduler/src/index.ts`'s `recordRateLimitTrip()`/
+    `RATE_LIMIT_COOLDOWN_MS`): when a `syncXTenant()`/`syncShopifyCatalogForTenant()`
+    catch block sees a `RateLimitExhaustedError`, it stamps
+    `channel_connections.rate_limited_until` at least 15 minutes out (or the
+    marketplace's own longer `Retry-After`, if given) — a fixed cooldown, not
+    exponential, since the cadence this sits inside (a cron tick, not a tight retry
+    loop) is already coarse enough that exponential backoff has nothing to bite on.
+    Every discovery query (`syncAmazonOrders`/`syncShopifyOrders`/
+    `syncWalmartOrders`/`syncShopifyCatalog`) now filters
+    `rate_limited_until IS NULL OR rate_limited_until <= now()`, so a throttled
+    connection sits out entirely instead of being retried into the same throttle on
+    the next tick. Deliberately independent of `consecutive_failures`/`status =
+    'error'` (see below) — being rate-limited isn't evidence the connection itself
+    is dead, so it never risks flipping a healthy tenant to `error`.
+    `recordSyncSuccess()` clears `rate_limited_until` on a demonstrated success
+    rather than making the tenant wait out a cooldown that's already been proven
+    unnecessary. Same `[ALERT]`-tagged log-based alerting as the failure-tracking
+    below (no email/Slack infra exists). Tested against a real local Postgres in
+    `packages/channel-connectors/test/retry.test.ts` (in-process backoff, injectable
+    `sleep`, no real timers) and `packages/scheduler/test/rate-limit-cooldown.test.ts`
+    (the DB write and the discovery-query filtering).
 - **Idempotency keys** on every write and every event handler — both Amazon and
   Walmart will redeliver; handlers must be safe to run twice.
 - **Cross-run sync failure tracking/alerting — built** (`migrations/

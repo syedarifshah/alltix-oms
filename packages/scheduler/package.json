@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc --noEmit -p .",
-    "test": "node --import tsx --test test/amazon-order-sync-e2e.test.ts test/sync-failure-tracking.test.ts"
+    "test": "node --import tsx --test test/amazon-order-sync-e2e.test.ts test/sync-failure-tracking.test.ts test/rate-limit-cooldown.test.ts"
   },
   "dependencies": {
     "@alltix/channel-connectors": "0.1.0",

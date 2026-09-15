@@ -3,6 +3,13 @@ import type { Pool } from "pg";
 import { withTenant, decryptChannelSecret } from "@alltix/db";
 import type { FulfillmentType } from "@alltix/shared";
 import type { AuthToken, NormalizedOrder, NormalizedOrderLine, SyncResult, TrackingInfo } from "./connector.js";
+// CLAUDE.md §4.4's in-process retry/backoff -- see retry.ts's own doc
+// comment and amazon-connector.ts's identical import for the full
+// reasoning. Shopify has no separate token-exchange call to leave alone
+// the way Walmart's does (authenticate() here just reads the
+// already-issued offline access token out of storage, no network call) --
+// graphql() is the one and only outbound HTTP call this connector makes.
+import { fetchWithBackoff } from "./retry.js";
 
 // Shopify Admin API connector -- channel #3 (CLAUDE.md §8 Phase 3).
 // Researched live against shopify.dev before writing any of this (same
@@ -721,7 +728,7 @@ export class ShopifyConnector {
   private async graphql<T>(query: string, variables: Record<string, unknown> = {}): Promise<GraphQLResponse<T>> {
     const { accessToken } = await this.authenticate();
 
-    const response = await fetch(`https://${this.credentials.shopDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+    const response = await fetchWithBackoff(`https://${this.credentials.shopDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
       method: "POST",
       headers: {
         "X-Shopify-Access-Token": accessToken,

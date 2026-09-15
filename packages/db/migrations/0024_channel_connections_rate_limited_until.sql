@@ -1,0 +1,20 @@
+-- CLAUDE.md §4.4's cross-run half of "exponential backoff + circuit breaker
+-- per channel connection" -- the in-process half (a single call retrying a
+-- few times before giving up) lives entirely in application code
+-- (packages/channel-connectors/src/retry.ts's fetchWithBackoff) and needs no
+-- schema change. This column is what makes the *other* half real: once a
+-- connection has been sustained-rate-limited (fetchWithBackoff exhausts its
+-- retries and throws RateLimitExhaustedError), the scheduler stamps a
+-- cooldown here so the NEXT cron tick's discovery query skips this
+-- connection entirely instead of immediately hammering a marketplace that
+-- just told us to back off.
+--
+-- Nullable, no default -- the overwhelming majority of connections are
+-- healthy at any given moment and this stays NULL. `rate_limited_until`
+-- rather than a boolean "is_rate_limited" flag so the cooldown expires on
+-- its own (a discovery query's `rate_limited_until <= now()` check) without
+-- a second job needing to come along and clear a flag.
+--
+-- Expand-only per CLAUDE.md §9: a new nullable column with no default,
+-- backfilling nothing on existing rows.
+ALTER TABLE channel_connections ADD COLUMN rate_limited_until TIMESTAMPTZ;
