@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc --noEmit -p .",
-    "test": "node --import tsx --test test/amazon-connector.test.ts test/shopify-connector.test.ts test/walmart-connector.test.ts test/retry.test.ts"
+    "test": "node --import tsx --test test/amazon-connector.test.ts test/shopify-connector.test.ts test/walmart-connector.test.ts test/ebay-connector.test.ts test/retry.test.ts"
   },
   "dependencies": {
     "@alltix/db": "0.1.0",

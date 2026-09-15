@@ -13,6 +13,7 @@ import {
   createAmazonConnectorFromChannelConnection,
   createShopifyConnectorFromChannelConnection,
   createWalmartConnectorFromChannelConnection,
+  createEbayConnectorFromChannelConnection,
   type TrackingInfo,
 } from "@alltix/channel-connectors";
 import type { OrderService } from "@alltix/order-service";
@@ -805,14 +806,17 @@ export class WarehouseService {
    * 'amazon' (AmazonConnector.confirmShipment(), verified live against the
    * sandbox -- see its doc comment for the sandbox-has-no-matching-scenario
    * caveat), 'shopify' (ShopifyConnector.confirmShipment(), verified live
-   * against a real dev store -- see CLAUDE.md §4.5), and 'walmart'
+   * against a real dev store -- see CLAUDE.md §4.5), 'walmart'
    * (WalmartConnector.confirmShipment(), UNVERIFIED IN PRACTICE -- wired the
    * same way as the other two, but see CLAUDE.md §4.2 and
    * WalmartConnector's own class doc comment for why nothing has actually
-   * round-tripped against Walmart's live API yet) are wired to real
-   * connectors today. Any other channel throws a clear "not implemented"
-   * error rather than silently skipping the channel call and transitioning
-   * anyway.
+   * round-tripped against Walmart's live API yet), and 'ebay'
+   * (EbayConnector.confirmShipment(), UNVERIFIED IN PRACTICE more so even
+   * than Walmart's -- see CLAUDE.md §4.6 and EbayConnector's own class doc
+   * comment: this environment's network policy blocks eBay's API hosts
+   * outright) are wired to real connectors today. Any other channel throws
+   * a clear "not implemented" error rather than silently skipping the
+   * channel call and transitioning anyway.
    *
    * Once the channel confirms, {@link recordShipmentSaleEvents} runs before
    * the local 'packed' -> 'shipped' transition -- this is where a shipped
@@ -849,6 +853,9 @@ export class WarehouseService {
       await connector.confirmShipment(order.external_order_id, tracking);
     } else if (order.channel === "walmart") {
       const connector = await createWalmartConnectorFromChannelConnection(this.pool, tenantId);
+      await connector.confirmShipment(order.external_order_id, tracking);
+    } else if (order.channel === "ebay") {
+      const connector = await createEbayConnectorFromChannelConnection(this.pool, tenantId);
       await connector.confirmShipment(order.external_order_id, tracking);
     } else {
       throw new Error(

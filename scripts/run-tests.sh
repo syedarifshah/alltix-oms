@@ -34,6 +34,7 @@ SAFE_TESTS=(
   "packages/channel-connectors/test/amazon-connector.test.ts"
   "packages/channel-connectors/test/shopify-connector.test.ts"
   "packages/channel-connectors/test/walmart-connector.test.ts"
+  "packages/channel-connectors/test/ebay-connector.test.ts"
   "packages/channel-connectors/test/retry.test.ts"
   "packages/db/test/channel-connections-rls.test.ts"
   "packages/rules-engine/test/evaluate-golden.test.ts"

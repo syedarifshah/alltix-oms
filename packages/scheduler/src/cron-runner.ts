@@ -1,6 +1,12 @@
 import { schedule, type ScheduledTask } from "node-cron";
 import type { Pool } from "pg";
-import { runAmazonOrderSyncJob, runShopifyOrderSyncJob, runWalmartOrderSyncJob, type TenantSyncResult } from "./index.js";
+import {
+  runAmazonOrderSyncJob,
+  runShopifyOrderSyncJob,
+  runWalmartOrderSyncJob,
+  runEbayOrderSyncJob,
+  type TenantSyncResult,
+} from "./index.js";
 
 // The "how it gets triggered" layer packages/scheduler/src/index.ts's own
 // header comment flagged as separate, later infrastructure work -- this is
@@ -364,6 +370,106 @@ export function startWalmartOrderSyncScheduler(options: WalmartOrderSyncSchedule
   console.log(
     JSON.stringify({
       event: "walmart_order_sync_scheduler_started",
+      cronExpression,
+      timezone: timezone ?? "system default",
+      at: new Date().toISOString(),
+    }),
+  );
+
+  return task;
+}
+
+// -- eBay counterparts. Same parallel-function call as Shopify's/Walmart's
+// above -- still not enough shared shape to justify a generic abstraction
+// with four channels wired this way, and ebay_order_sync_run needs to stay
+// its own distinguishable log event same as the other three.
+
+const DEFAULT_EBAY_CRON_EXPRESSION = "*/5 * * * *"; // every 5 minutes, same conservative default as the other three
+
+export interface EbayOrderSyncSchedulerOptions {
+  appPool: Pool;
+  adminPool: Pool;
+  cronExpression?: string;
+  timezone?: string;
+  maxRetries?: number;
+  retryDelayMs?: number;
+}
+
+/** eBay counterpart to {@link runWalmartOnceWithRetry} -- see its doc
+ *  comment for the retry contract (systemic-failure-only; a single tenant's
+ *  failure is already caught and returned as a non-throwing result inside
+ *  runEbayOrderSyncJob's own syncEbayTenant). */
+export async function runEbayOnceWithRetry(
+  appPool: Pool,
+  adminPool: Pool,
+  maxRetries: number = DEFAULT_MAX_RETRIES,
+  retryDelayMs: number = DEFAULT_RETRY_DELAY_MS,
+): Promise<void> {
+  const startedAt = Date.now();
+  const runId = new Date(startedAt).toISOString();
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      const results = await runEbayOrderSyncJob(appPool, adminPool);
+      console.log(
+        JSON.stringify({
+          event: "ebay_order_sync_run",
+          runId,
+          attempt,
+          success: true,
+          durationMs: Date.now() - startedAt,
+          ...summarizeResults(results),
+        }),
+      );
+      return;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const willRetry = attempt <= maxRetries;
+      console.error(
+        JSON.stringify({
+          event: "ebay_order_sync_run",
+          runId,
+          attempt,
+          success: false,
+          durationMs: Date.now() - startedAt,
+          error: message,
+          willRetry,
+        }),
+      );
+      if (!willRetry) return;
+      await sleep(retryDelayMs * attempt);
+    }
+  }
+}
+
+/** eBay counterpart to {@link startWalmartOrderSyncScheduler} -- same
+ *  noOverlap reasoning (two overlapping passes could race to write the same
+ *  tenant's channel_connections.last_order_sync_at row). A separate
+ *  node-cron task from the other three, so all four channels' polling
+ *  cadences can be tuned independently and started/stopped on their own. */
+export function startEbayOrderSyncScheduler(options: EbayOrderSyncSchedulerOptions): ScheduledTask {
+  const {
+    appPool,
+    adminPool,
+    cronExpression = DEFAULT_EBAY_CRON_EXPRESSION,
+    timezone,
+    maxRetries = DEFAULT_MAX_RETRIES,
+    retryDelayMs = DEFAULT_RETRY_DELAY_MS,
+  } = options;
+
+  const task = schedule(cronExpression, () => runEbayOnceWithRetry(appPool, adminPool, maxRetries, retryDelayMs), {
+    name: "ebay-order-sync",
+    noOverlap: true,
+    timezone,
+  });
+
+  task.on("execution:overlap", () => {
+    console.warn(JSON.stringify({ event: "ebay_order_sync_skipped_overlap", at: new Date().toISOString() }));
+  });
+
+  console.log(
+    JSON.stringify({
+      event: "ebay_order_sync_scheduler_started",
       cronExpression,
       timezone: timezone ?? "system default",
       at: new Date().toISOString(),

@@ -543,6 +543,14 @@ Offer-Setup-by-Match write is feed-submit-then-poll with no synchronous equivale
 and `SyncResult` has no way to represent "submitted, not yet known to have
 succeeded or failed."
 
+Channel #4 (eBay, §4.6) does NOT implement this interface at all — not even partially
+the way Amazon/Shopify do (both still implement `authenticate`/`pullOrders`/
+`pushInventory`/`confirmShipment` for real, just not `submitListing`/`getFeedStatus`).
+`EbayConnector` is a standalone class with no listing-creation method of any shape,
+because eBay's outbound listing path needs tenant-level business policies and a
+merchant location this codebase has no onboarding flow for anywhere — see §4.6's own
+note on why that's out of scope entirely, not just narrowed.
+
 ### 4.4 Handling API rate limits (critical — causes most production incidents)
 
 - Central **rate-limited job queue** per tenant, per marketplace, per endpoint —
@@ -858,6 +866,132 @@ succeeded or failed."
     `write_products` after already connecting will hit this exact confusing error and
     need to reconnect with a fresh token.
 
+### 4.6 eBay Sell APIs (channel #4 — built once the connector abstraction had proven itself)
+
+- **Why now**: CLAUDE.md §8 Phase 5's roadmap lists eBay/TikTok Shop/additional channels
+  as later "scale features," but by the time this was picked up, the connector
+  abstraction had already been proven against three structurally different APIs
+  (Shopify's synchronous/event-driven shape, Walmart's feed/poll-heavy shape, Amazon's
+  SP-API-sandbox-and-Listings-Items shape) — a natural next expansion rather than
+  something that needed to wait for the rest of Phase 5.
+- **Auth**: a real OAuth Authorization Code Grant + long-lived refresh token — the
+  closest of the three existing channels to Amazon's own shape, not Walmart's
+  `client_credentials` pair (no user consent, no refresh token at all). Confirmed
+  request/response shapes (`POST /identity/v1/oauth2/token`, HTTP Basic
+  `client_id:client_secret`, `grant_type=authorization_code` or `refresh_token`, and the
+  literal example JSON response) from developer.ebay.com's own doc page, fetched live.
+  The authorize-redirect URL (`GET https://auth.ebay.com/oauth2/authorize` or
+  `auth.sandbox.ebay.com`, params `client_id`/`redirect_uri`/`response_type=code`/
+  `scope`/`state`) is confirmed the same way. The callback's own query params
+  (`code`/`state` on success) are standard OAuth2 (RFC 6749 §4.1.2), NOT confirmed
+  against a literal official eBay example the way everything else in this auth flow is
+  — every official doc page fetched described the token exchange without ever showing
+  the actual redirect URL eBay sends back; see `ebay-oauth.ts`'s own header comment.
+  Implemented in `packages/channel-connectors/src/ebay-oauth.ts`
+  (`buildEbayAuthorizeUrl`/`parseEbayOAuthCallback`/`exchangeEbayAuthorizationCode`,
+  mirroring `amazon-oauth.ts`'s shape) and `ebay-connector.ts`'s own `authenticate()`
+  (refresh-token exchange, mirroring `AmazonConnector.authenticate()`'s caching).
+- **Fulfillment API**: `GET /sell/fulfillment/v1/order` pulls orders,
+  `filter=creationdate:[<since>..]` for the since-cursor (confirmed literal filter
+  syntax from developers.ebay.com's discovering-unfulfilled-orders.html static guide),
+  `limit=200` with **no pagination beyond the first page** — a real, documented gap
+  (the response's own `next`/`href` fields aren't followed), not a theoretical one.
+  `lineItemCost` is the line's **total**, not a per-unit price (confirmed via the
+  type's own field description: "calculated by multiplying the single unit price by
+  the number of units purchased") — `normalizeEbayOrderLine()` divides by `quantity`
+  to get `unitPrice`. `sku` isn't always populated on a real line item (a real
+  community-fetched example response had none) — falls back to `legacyItemId`, then
+  `lineItemId`. No eBay analog of Amazon's AFN/Walmart's WFS exists in this codebase's
+  `FulfillmentType` union, so every eBay line maps to `seller_fulfilled`.
+- **Inventory API — `pushInventory()` narrower than Amazon's/Walmart's own**: eBay's own
+  docs state quantity "must be updated at both the inventory item and offer level" for
+  a live listing's displayed quantity to actually change — the offer-level half needs
+  an `offerId` this codebase has no onboarding flow to ever capture (see the listing-
+  creation bullet below), so `EbayConnector.pushInventory()` only does the
+  inventory-item half (`GET` then `PUT /sell/inventory/v1/inventory_item/{sku}`,
+  merging only `availability.shipToLocationAvailability.quantity` into whatever's
+  already there rather than constructing a full replace body from scratch, since this
+  codebase has no confirmed-against-a-literal-example shape for the `product`/
+  `condition`/`packageWeightAndSize` fields a from-scratch body would need). A SKU with
+  an existing published offer may not show the new quantity live on eBay even though
+  this call succeeds — a real, documented narrowing, same spirit as Amazon's/Walmart's
+  own "MFN/DEFAULT fulfillment channel only" `pushInventory()` scope.
+- **`confirmShipment()`**: `GET` the order for its line items, then
+  `POST /sell/fulfillment/v1/order/{orderId}/shipping_fulfillment` — endpoint pattern
+  and body field names (`lineItems`, `shippedDate`, `shipmentTrackingNumber`,
+  `shippingCarrierCode`) confirmed from developer.ebay.com's fulfillment overview page,
+  in prose rather than a literal rendered example (unlike Amazon's/Walmart's own
+  confirmShipment() bodies). `shippingCarrierCode` is set directly from
+  `tracking.carrier` with **no mapping/validation against eBay's own carrier-code
+  enum** — unlike Amazon's confirmShipment(), which deliberately uses the
+  always-valid `'Other'` + carrierName combination, no equivalent always-valid
+  fallback was confirmed for eBay this pass, so an arbitrary carrier string may be
+  rejected by eBay's own enum validation. Single-fulfillment assumption (every line
+  ships together, same tracking info applied to all) — same documented limitation
+  Amazon's/Walmart's own confirmShipment() carry.
+- **No outbound listing creation at all** (deliberately, not just narrowed the way
+  Amazon's/Walmart's are): eBay's own three-step Inventory API flow
+  (`createOrReplaceInventoryItem` → `createOffer` → `publishOffer`) requires
+  tenant-level business policies (payment/return/fulfillment policy ids) and a
+  `merchantLocationKey` this codebase has no onboarding flow for anywhere — a strictly
+  bigger prerequisite gap than even Amazon's deferred Product Type Definitions API
+  scope. `EbayConnector` deliberately does not implement the shared
+  `ChannelConnector.submitListing`/`getFeedStatus` interface pair at all (unlike
+  Walmart's real implementation) for this reason — revisit as its own explicitly-picked
+  task, the same way Amazon's/Walmart's listing creation each were.
+- **Wired into the app** (no new migration — reuses the same `channel_connections`
+  columns Amazon's own row already uses: `lwa_client_id` for the OAuth client id,
+  `encrypted_client_secret`/`encrypted_refresh_token` for the real refresh-token pair,
+  `marketplace = ''` since no per-region concept was confirmed anywhere on the Order
+  type, `external_account_id` reusing the tenant's own `clientId` since eBay's REST
+  APIs identify the seller purely from the access token — no independent seller id
+  ever comes back on the callback the way Amazon's `selling_partner_id` does, same
+  reuse-`clientId` pattern Walmart's own connect route already established for an
+  identical reason): `/settings/channels` has a "Connect eBay" OAuth link (mirroring
+  Amazon's own "Connect Amazon" redirect exactly) that hits
+  `/api/channels/ebay/connect` → eBay's consent screen → `/api/channels/ebay/callback`,
+  which verifies the signed CSRF `state` token (`packages/web/src/lib/ebay-oauth-state.ts`
+  — a near-literal fork of `amazon-oauth-state.ts` with its own
+  `EBAY_OAUTH_STATE_SECRET`, deliberately not shared, same "each channel gets its own
+  distinguishable secret" reasoning the scheduler's own per-channel functions already
+  follow), exchanges the code, and upserts the row. The scheduler
+  (`packages/scheduler/src/{index,cron-runner}.ts`) runs an eBay order-sync pass in
+  parallel to the other three — `syncEbayOrders`/`runEbayOrderSyncJob`/
+  `startEbayOrderSyncScheduler`, a separate node-cron task and separate
+  `scripts/ebay-order-sync-{job,scheduler}.ts` entrypoints. What actually triggers a
+  sync on this app's Vercel deployment is `GET /api/cron/ebay-order-sync` (same
+  `CRON_SECRET` Bearer-token gate, same idempotency contract as the other three cron
+  routes) plus its `crons` entry in `vercel.json` (`0 6 * * *`, staggered 30 minutes
+  after Walmart's own order-sync cron). `WarehouseService.confirmShipment()` dispatches
+  to `createEbayConnectorFromChannelConnection` on `order.channel === "ebay"`,
+  alongside the other three branches. `recordSyncFailure`/`recordSyncSuccess`/
+  `recordRateLimitTrip`'s `channel` parameter type was widened to include `"ebay"`.
+- **UNVERIFIED IN ITS ENTIRETY, more so than any other channel in this codebase**: this
+  environment's outbound network policy blocks **both** `api.ebay.com` and
+  `api.sandbox.ebay.com` entirely (confirmed directly — a token-exchange `curl` to each
+  host was rejected at the proxy level, the same class of block already documented for
+  `api.amazon.com`), on top of there being no eBay sandbox/production credentials
+  anywhere in this codebase yet (same "no self-serve sandbox" starting position
+  Walmart's connector carried, see `.env.example`'s `EBAY_SANDBOX_*` entries). So
+  nothing eBay-related has been exercised against live infrastructure of any kind, not
+  even once — unlike Amazon (proven against its SP-API sandbox) or Shopify (proven
+  against a real dev store), and even more unverified than Walmart's own wiring (which
+  at least confirmed its single most important request shape against one official doc
+  page's literal rendered JSON example). Several of this connector's own shapes were
+  cross-confirmed across multiple independent sources (official doc pages, a real
+  OpenAPI spec file mirror on GitHub, and community-written generated API-client docs)
+  specifically because individual eBay doc pages fetched during this pass were
+  frequently thin/templated and didn't render literal examples the way Amazon's/
+  Walmart's better-preserved pages did — see each method's own doc comment in
+  `packages/channel-connectors/src/ebay-connector.ts` for exactly what was confirmed
+  where. Pure request/response mapping logic (`normalizeEbayOrder`/
+  `normalizeEbayOrderLine`, plus `ebay-oauth.ts`'s URL-building/parsing) is unit-tested
+  (`packages/channel-connectors/test/ebay-connector.test.ts`) — everything past that
+  boundary (`authenticate`, `pullOrders`, `pushInventory`, `confirmShipment`, the OAuth
+  token exchange) stays a well-researched first draft until run against real
+  credentials, exactly the status Amazon and Walmart each carried before their own
+  first live pass.
+
 ## 5. Technology Stack
 
 | Layer | Choice | Why |
@@ -957,8 +1091,9 @@ succeeded or failed."
     Phase 4 — not a change to the phase order itself, just worth deciding deliberately
     rather than by default. The `/reports` first pass above doesn't resolve this
     either way — it's cheap enough at today's volume that the decision can still wait.
-- **Phase 5 — Scale features (Months 9-12+)**: eBay/TikTok Shop/additional channels.
-  Stock forecasting. B2B portal (if pursuing Cin7-style ERP breadth). SOC 2 prep if
+- **Phase 5 — Scale features (Months 9-12+)**: eBay — built ahead of the rest of this
+  phase, see §4.6 — /TikTok Shop/additional channels. Stock forecasting. B2B portal (if
+  pursuing Cin7-style ERP breadth). SOC 2 prep if
   targeting mid-market.
 
 ## 9. Deployment & DevOps

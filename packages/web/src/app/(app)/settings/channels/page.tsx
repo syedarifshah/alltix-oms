@@ -55,6 +55,17 @@ interface WalmartConnectionRow extends FailureTrackingColumns {
   last_order_sync_at: string | null;
 }
 
+/** eBay's row, like Walmart's, has no independent seller id and no
+ *  marketplace concept worth showing -- external_account_id reuses the
+ *  tenant's own eBay OAuth clientId (see the callback route's own comment
+ *  for why). */
+interface EbayConnectionRow extends FailureTrackingColumns {
+  external_account_id: string;
+  status: string;
+  created_at: string;
+  last_order_sync_at: string | null;
+}
+
 /** Sandbox vs. production is never stored as its own column (see
  *  packages/db/migrations/0012_channel_connections.sql) -- the connection's
  *  own lwa_client_id is compared against this process's known sandbox/
@@ -149,55 +160,71 @@ export default async function ChannelsSettingsPage({
     );
   }
 
-  const { connection, shopifyConnection, walmartConnection } = await withTenant(pool, tenantId, async (client) => {
-    const amazonResult = await client.query<ChannelConnectionRow>(
-      `SELECT external_account_id, marketplace, status, created_at, last_order_sync_at, lwa_client_id,
-              consecutive_failures, last_failure_at, last_failure_message
-         FROM channel_connections
-        WHERE channel = 'amazon'
-        ORDER BY created_at DESC
-        LIMIT 1`,
-    );
-    const shopifyResult = await client.query<ShopifyConnectionRow>(
-      `SELECT external_account_id, status, created_at, last_order_sync_at,
-              (encrypted_client_secret IS NOT NULL) AS has_webhook_secret,
-              consecutive_failures, last_failure_at, last_failure_message
-         FROM channel_connections
-        WHERE channel = 'shopify'
-        ORDER BY created_at DESC
-        LIMIT 1`,
-    );
-    const walmartResult = await client.query<WalmartConnectionRow>(
-      `SELECT external_account_id, status, created_at, last_order_sync_at,
-              consecutive_failures, last_failure_at, last_failure_message
-         FROM channel_connections
-        WHERE channel = 'walmart'
-        ORDER BY created_at DESC
-        LIMIT 1`,
-    );
-    return {
-      connection: amazonResult.rows[0] ?? null,
-      shopifyConnection: shopifyResult.rows[0] ?? null,
-      walmartConnection: walmartResult.rows[0] ?? null,
-    };
-  });
+  const { connection, shopifyConnection, walmartConnection, ebayConnection } = await withTenant(
+    pool,
+    tenantId,
+    async (client) => {
+      const amazonResult = await client.query<ChannelConnectionRow>(
+        `SELECT external_account_id, marketplace, status, created_at, last_order_sync_at, lwa_client_id,
+                consecutive_failures, last_failure_at, last_failure_message
+           FROM channel_connections
+          WHERE channel = 'amazon'
+          ORDER BY created_at DESC
+          LIMIT 1`,
+      );
+      const shopifyResult = await client.query<ShopifyConnectionRow>(
+        `SELECT external_account_id, status, created_at, last_order_sync_at,
+                (encrypted_client_secret IS NOT NULL) AS has_webhook_secret,
+                consecutive_failures, last_failure_at, last_failure_message
+           FROM channel_connections
+          WHERE channel = 'shopify'
+          ORDER BY created_at DESC
+          LIMIT 1`,
+      );
+      const walmartResult = await client.query<WalmartConnectionRow>(
+        `SELECT external_account_id, status, created_at, last_order_sync_at,
+                consecutive_failures, last_failure_at, last_failure_message
+           FROM channel_connections
+          WHERE channel = 'walmart'
+          ORDER BY created_at DESC
+          LIMIT 1`,
+      );
+      const ebayResult = await client.query<EbayConnectionRow>(
+        `SELECT external_account_id, status, created_at, last_order_sync_at,
+                consecutive_failures, last_failure_at, last_failure_message
+           FROM channel_connections
+          WHERE channel = 'ebay'
+          ORDER BY created_at DESC
+          LIMIT 1`,
+      );
+      return {
+        connection: amazonResult.rows[0] ?? null,
+        shopifyConnection: shopifyResult.rows[0] ?? null,
+        walmartConnection: walmartResult.rows[0] ?? null,
+        ebayConnection: ebayResult.rows[0] ?? null,
+      };
+    },
+  );
 
   const isConnected = connection?.status === "active";
   const environment = connection ? classifyEnvironment(connection.lwa_client_id) : null;
   const isShopifyConnected = shopifyConnection?.status === "active";
   const isWalmartConnected = walmartConnection?.status === "active";
+  const isEbayConnected = ebayConnection?.status === "active";
 
   return (
     <main className="page">
       <h1>Channels</h1>
       <p className="subtitle">
-        Amazon, Shopify, and Walmart connectors — eBay isn&apos;t built yet. Walmart&apos;s wiring is complete but
-        UNVERIFIED against real Walmart infrastructure (no self-serve sandbox exists the way Shopify/Amazon have
-        one) — connecting will correctly fail here until a real clientId/clientSecret pair is entered.
+        Amazon, Shopify, Walmart, and eBay connectors. Walmart&apos;s and eBay&apos;s wiring is complete but
+        UNVERIFIED against real infrastructure (no self-serve sandbox exists for either the way Shopify/Amazon
+        have one, and this environment can&apos;t even reach eBay&apos;s API hosts at all) — connecting will
+        correctly fail here until real credentials exist and a real consent/token round trip has happened.
       </p>
 
       {connected === "amazon" && <div className="alert alert-success">Amazon connected.</div>}
       {connected === "walmart" && <div className="alert alert-success">Walmart connected.</div>}
+      {connected === "ebay" && <div className="alert alert-success">eBay connected.</div>}
       {connected === "shopify" && (
         <div className="alert alert-success">
           Shopify connected.
@@ -212,9 +239,25 @@ export default async function ChannelsSettingsPage({
       )}
       {error?.startsWith("shopify_") && <div className="alert alert-danger">Shopify connection failed ({error}).</div>}
       {error?.startsWith("walmart_") && <div className="alert alert-danger">Walmart connection failed ({error}).</div>}
-      {error && !error.startsWith("shopify_") && !error.startsWith("walmart_") && (
-        <div className="alert alert-danger">Amazon connection failed ({error}).</div>
-      )}
+      {error?.startsWith("ebay_") && <div className="alert alert-danger">eBay connection failed ({error}).</div>}
+      {error &&
+        !error.startsWith("shopify_") &&
+        !error.startsWith("walmart_") &&
+        !error.startsWith("ebay_") &&
+        // Amazon's own error codes (e.g. "missing_callback_params",
+        // "invalid_or_expired_state", "token_exchange_failed") were written
+        // before any other channel had its own OAuth-redirect flow, so
+        // unlike Shopify/Walmart/eBay they carry no distinguishing prefix
+        // -- this catch-all stays Amazon-specific for exactly that reason,
+        // not because it's a safe default for "anything unrecognized."
+        // eBay's callback route deliberately prefixes every one of its own
+        // error codes with "ebay_" (even where the underlying check is
+        // conceptually identical to Amazon's, e.g. invalid/expired state)
+        // specifically so they route to the eBay banner above instead of
+        // falling into this catch-all -- see that route's own doc comment.
+        (
+          <div className="alert alert-danger">Amazon connection failed ({error}).</div>
+        )}
 
       <h2>Amazon</h2>
       <div className="card">
@@ -326,6 +369,42 @@ export default async function ChannelsSettingsPage({
           </div>
         ) : (
           <WalmartConnectForm buttonLabel="Connect Walmart" />
+        )}
+      </div>
+
+      <h2>eBay</h2>
+      <div className="card">
+        {ebayConnection ? (
+          <div className="stack">
+            <div className="row">
+              <span className={isEbayConnected ? "badge badge-success" : "badge badge-danger"}>
+                {ebayConnection.status}
+              </span>
+              <span className="muted">client id {ebayConnection.external_account_id}</span>
+            </div>
+            <div className="muted">Connected since {new Date(ebayConnection.created_at).toISOString()}</div>
+            <div className="muted">
+              Last order sync:{" "}
+              {ebayConnection.last_order_sync_at
+                ? new Date(ebayConnection.last_order_sync_at).toISOString()
+                : "never synced yet"}
+            </div>
+            <div className="alert alert-info" style={{ marginTop: 8, marginBottom: 0 }}>
+              UNVERIFIED against real eBay infrastructure, more so even than Walmart&apos;s own connection above --
+              this environment&apos;s network policy blocks eBay&apos;s API hosts outright, so nothing here has
+              round-tripped against eBay at all, sandbox or production. Order sync failures are no longer silent,
+              though — see below if this connection has started failing.
+            </div>
+            <SyncFailureBanner
+              status={ebayConnection.status}
+              consecutive_failures={ebayConnection.consecutive_failures}
+              last_failure_at={ebayConnection.last_failure_at}
+              last_failure_message={ebayConnection.last_failure_message}
+            />
+            {!isEbayConnected && <a href="/api/channels/ebay/connect">Reconnect eBay</a>}
+          </div>
+        ) : (
+          <a href="/api/channels/ebay/connect">Connect eBay</a>
         )}
       </div>
     </main>
