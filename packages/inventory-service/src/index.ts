@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 import { withTenant } from "@alltix/db";
 import type { InventoryEventType, InventoryReferenceType } from "@alltix/shared";
@@ -19,6 +20,33 @@ export interface RecordInventoryEventResult {
    *  earlier call, so this call was a safe no-op. */
   applied: boolean;
   eventId: string | null;
+}
+
+export interface TransferStockInput {
+  tenantId: string;
+  productId: string;
+  fromLocationId: string;
+  toLocationId: string;
+  /** Must be a positive integer -- see {@link InventoryService.transferStock}'s
+   *  doc comment for why this transfers *available* stock, not raw on_hand. */
+  quantity: number;
+  /** Base key for this transfer -- see transferStock()'s doc comment for how
+   *  it becomes two distinct inventory_events.idempotency_key values (one
+   *  per leg), and why checking just the outbound leg is enough to detect
+   *  "already applied." */
+  idempotencyKey: string;
+}
+
+export interface TransferStockResult {
+  /** false if `idempotencyKey`'s outbound leg already existed -- this
+   *  transfer (both legs; see the doc comment on why checking one leg is
+   *  sufficient) was already applied by an earlier call, so this call was a
+   *  safe no-op. */
+  applied: boolean;
+  /** The shared `reference_id` linking this transfer's two inventory_events
+   *  rows (reference_type = 'transfer') -- null when `applied` is false,
+   *  since nothing new was recorded to link. */
+  transferId: string | null;
 }
 
 /**
@@ -63,10 +91,13 @@ export interface RecordInventoryEventResult {
  *                           still handles that inline rather than through
  *                           this method, since eventType alone can't tell
  *                           the two flavors apart.
- *   - transfer:             not implemented. Moving stock between two
+ *   - transfer:             not handled here -- moving stock between two
  *                           locations needs a two-location signature this
- *                           method doesn't have yet -- throws rather than
- *                           silently doing the wrong thing with one.
+ *                           method doesn't have; use {@link
+ *                           InventoryService.transferStock} instead. This
+ *                           method still throws outright on eventType ===
+ *                           'transfer' rather than silently doing the
+ *                           wrong thing with one location.
  *
  * Idempotent: `idempotency_key` is UNIQUE on inventory_events (migration
  * 0005), so a retried call with the same key inserts nothing a second time
@@ -91,8 +122,9 @@ export class InventoryService {
 
     if (eventType === "transfer") {
       throw new Error(
-        "InventoryService.recordInventoryEvent: 'transfer' is not implemented -- moving stock between two " +
-          "locations needs a two-location signature this method doesn't have yet",
+        "InventoryService.recordInventoryEvent: 'transfer' is not implemented on this method -- moving stock " +
+          "between two locations needs a two-location signature this method doesn't have; call " +
+          "InventoryService.transferStock() instead",
       );
     }
 
@@ -142,6 +174,144 @@ export class InventoryService {
         [productId, locationId],
       );
       return result.rows[0]?.available ?? 0;
+    });
+  }
+
+  /**
+   * Moves stock between two locations for the same product -- the
+   * multi-warehouse/3PL capability CLAUDE.md §8 Phase 4 calls for and
+   * `recordInventoryEvent`'s own doc comment above flagged as needing a
+   * two-location signature it doesn't have. This is that signature.
+   *
+   * Only ever moves `on_hand`, never `reserved`: a transfer moves physical
+   * stock that's actually free to move, not stock a specific order at the
+   * source location is already counting on. That's why the sufficiency
+   * check below is against `available` (on_hand - reserved), not raw
+   * on_hand -- moving reserved-but-not-yet-shipped stock out from under a
+   * live reservation would leave that order's allocation pointing at stock
+   * that's no longer there. If a tenant genuinely needs to move reserved
+   * stock, the order has to be released/re-routed first (a separate,
+   * deliberate action) -- this method won't do that implicitly.
+   *
+   * Concurrency: locks the source (product, location) row with
+   * `SELECT ... FOR UPDATE` and re-checks `available` under that lock
+   * before mutating anything -- the exact same check-then-act-under-lock
+   * discipline `OrderService.allocateOrder` uses (CLAUDE.md §3's "must be
+   * atomic... to prevent two orders allocating the last unit
+   * simultaneously" applies just as much to two concurrent transfers, or a
+   * transfer racing an allocation, draining the same source). The
+   * destination side needs no equivalent lock: its mutation is a plain
+   * increment (`on_hand + $delta`) via the same upsert-on-first-write
+   * pattern `recordInventoryEvent` already uses, which Postgres applies
+   * atomically per row regardless of what else is concurrently touching it.
+   *
+   * Ledger shape: records TWO `inventory_events` rows, both
+   * `event_type = 'transfer'` -- one with a negative `quantity_delta` at
+   * `fromLocationId`, one with a positive `quantity_delta` at
+   * `toLocationId` -- sharing one freshly generated `reference_id`
+   * (`reference_type = 'transfer'`, migration
+   * 0022_inventory_events_transfer_reference_type.sql) so the two legs of
+   * one transfer can be found and displayed together later, the same role
+   * reference_type/reference_id already play for 'order' and 'po'. Both
+   * legs are inserted in the same DB transaction as the two
+   * `inventory_levels` mutations -- either the whole transfer lands or
+   * none of it does, never a decrement with no matching increment.
+   *
+   * Idempotent, like `recordInventoryEvent`: `idempotencyKey` becomes two
+   * distinct `inventory_events.idempotency_key` values under the hood
+   * (`${idempotencyKey}:out` / `${idempotencyKey}:in`, since the column is
+   * UNIQUE per row and this writes two rows) -- but checking whether the
+   * outbound leg already exists is enough to know the *whole* transfer
+   * already committed, since both legs are always written together in one
+   * transaction. A retried call with the same key is therefore a safe
+   * no-op, exactly like `recordInventoryEvent`'s own idempotency contract.
+   *
+   * Throws (nothing is written) for: `fromLocationId === toLocationId`
+   * (nonsensical -- there's nothing to move), a non-positive or
+   * non-integer `quantity`, or insufficient `available` stock at the
+   * source under the lock above.
+   */
+  async transferStock(input: TransferStockInput): Promise<TransferStockResult> {
+    const { tenantId, productId, fromLocationId, toLocationId, quantity, idempotencyKey } = input;
+
+    if (fromLocationId === toLocationId) {
+      throw new Error("InventoryService.transferStock: fromLocationId and toLocationId must be different locations");
+    }
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      throw new Error(`InventoryService.transferStock: quantity must be a positive integer, got ${quantity}`);
+    }
+
+    const outboundKey = `${idempotencyKey}:out`;
+    const inboundKey = `${idempotencyKey}:in`;
+
+    return withTenant(this.pool, tenantId, async (client) => {
+      // Lock the source row and re-check available stock under that lock --
+      // see this method's doc comment for why this mirrors
+      // OrderService.allocateOrder's own check-then-act discipline.
+      const sourceLevel = await client.query<{ available: number }>(
+        `SELECT available FROM inventory_levels WHERE product_id = $1 AND location_id = $2 FOR UPDATE`,
+        [productId, fromLocationId],
+      );
+      const availableAtSource = sourceLevel.rows[0]?.available ?? 0;
+      if (availableAtSource < quantity) {
+        throw new Error(
+          `InventoryService.transferStock: insufficient available stock at source location ` +
+            `(have ${availableAtSource}, need ${quantity})`,
+        );
+      }
+
+      // Idempotency check comes after the lock+read above (cheap, and
+      // keeps the lock-then-verify order identical regardless of whether
+      // this is a fresh call or a retry) but before any write: if the
+      // outbound leg already exists, the whole transfer already committed
+      // in an earlier call, so there is nothing left to do.
+      const existingOutbound = await client.query<{ id: string }>(
+        `SELECT id FROM inventory_events WHERE idempotency_key = $1`,
+        [outboundKey],
+      );
+      if (existingOutbound.rows[0]) {
+        return { applied: false, transferId: null };
+      }
+
+      const transferId = randomUUID();
+
+      await client.query(
+        `INSERT INTO inventory_events
+           (tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
+         VALUES ($1, $2, $3, 'transfer', $4, 'transfer', $5, $6)`,
+        [tenantId, productId, fromLocationId, -quantity, transferId, outboundKey],
+      );
+      // A plain UPDATE, not the upsert `recordInventoryEvent` uses for its
+      // single-location writes -- the sufficiency check above already
+      // proved an inventory_levels row exists at the source (a nonexistent
+      // row reads available as 0, which fails that check for any positive
+      // quantity), so there's nothing to upsert here.
+      await client.query(
+        `UPDATE inventory_levels SET on_hand = on_hand - $1, updated_at = now()
+           WHERE product_id = $2 AND location_id = $3`,
+        [quantity, productId, fromLocationId],
+      );
+
+      await client.query(
+        `INSERT INTO inventory_events
+           (tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
+         VALUES ($1, $2, $3, 'transfer', $4, 'transfer', $5, $6)`,
+        [tenantId, productId, toLocationId, quantity, transferId, inboundKey],
+      );
+      // Upsert here, unlike the source: the destination may be receiving
+      // its first-ever stock for this product, exactly the "first event
+      // creates the row on the fly" case this class's own doc comment
+      // above describes for recordInventoryEvent.
+      await client.query(
+        `INSERT INTO inventory_levels (tenant_id, product_id, location_id, on_hand, reserved)
+           VALUES ($1, $2, $3, $4, 0)
+         ON CONFLICT (product_id, location_id) DO UPDATE SET
+           on_hand = inventory_levels.on_hand + EXCLUDED.on_hand,
+           updated_at = now()`,
+        [tenantId, productId, toLocationId, quantity],
+      );
+
+      return { applied: true, transferId };
     });
   }
 }

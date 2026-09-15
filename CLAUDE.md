@@ -104,7 +104,7 @@ inventory_events (
   location_id UUID FK -> locations,
   event_type TEXT,        -- 'receipt','sale','reservation','release','adjustment','damage','transfer'
   quantity_delta INT,     -- signed
-  reference_type TEXT,    -- 'order','po','manual','return'
+  reference_type TEXT,    -- 'order','po','manual','return','transfer'
   reference_id UUID,
   idempotency_key TEXT UNIQUE,  -- prevents double-processing on retries/redelivery
   created_at TIMESTAMPTZ
@@ -126,6 +126,21 @@ inventory_levels (
 change — marketplace order, PO receipt, or manual count — goes through
 `inventory_events` first. This gives a full audit trail and makes oversell bugs
 debuggable instead of mysterious.
+
+**Multi-location transfers — built** (`packages/inventory-service/src/index.ts`'s
+`InventoryService.transferStock()`, migration
+`0022_inventory_events_transfer_reference_type.sql`): moves `on_hand` between two
+locations for the same product, atomically
+(a `SELECT ... FOR UPDATE` lock + re-check of *available* — not raw on_hand — at the
+source, same discipline as `OrderService.allocateOrder`'s own oversell-prevention),
+recording two paired `inventory_events` rows (`event_type = 'transfer'`,
+`reference_type = 'transfer'`, sharing one generated `reference_id` so both legs of a
+transfer can be found together). Deliberately never touches `reserved` — stock a
+specific order is already counting on at a location has to be released/re-routed
+first, not silently moved out from under it. Reachable today from `/inventory`'s
+"Transfer stock" form (`POST /api/inventory/transfer`); `recordInventoryEvent` still
+throws outright on `eventType: 'transfer'` (it has no two-location signature) and
+points callers at this method instead.
 
 **Retrofit risk at the top of the target range**: a tenant near 50,000 orders/month
 (§0) can generate 100k+ `inventory_events` rows/month on its own, before
@@ -711,7 +726,10 @@ succeeded or failed."
   routing at minimum). Add Shopify as channel #3 to validate the abstraction holds for
   a structurally different API type.
 - **Phase 4 — Operational maturity (Months 7-9)**: reporting/analytics on separate
-  read store. Multi-warehouse/3PL support. Returns handling. Rate-limit hardening,
+  read store. Multi-warehouse/3PL support (the ledger-level piece — moving stock
+  between two locations — is now built, see §2.2's "Multi-location transfers"; a
+  locations-management UI and per-location fulfillment routing beyond what the rules
+  engine already does are still open). Returns handling. Rate-limit hardening,
   circuit breakers, observability dashboards.
   - Open question for Arif: given the widened volume ceiling (§0: up to 50,000
     orders/month), whether the CDC-fed reporting store is worth moving earlier than

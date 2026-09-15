@@ -49,7 +49,7 @@ export type InventoryEventType =
   | "damage"
   | "transfer";
 
-export type InventoryReferenceType = "order" | "po" | "manual" | "return";
+export type InventoryReferenceType = "order" | "po" | "manual" | "return" | "transfer";
 
 export interface InventoryEvent {
   id: string;

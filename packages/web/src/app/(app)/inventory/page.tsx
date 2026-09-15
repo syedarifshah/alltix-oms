@@ -21,6 +21,15 @@ interface InventoryRow {
   updated_at: string;
 }
 
+interface LocationRow {
+  id: string;
+  name: string;
+}
+
+interface InventoryPageProps {
+  searchParams: Promise<{ error?: string; transferred?: string }>;
+}
+
 type Risk = "zero" | "low" | "ok";
 
 /** No spec pins down exactly what counts as "low" ATS -- this is a
@@ -54,7 +63,7 @@ function riskBadge(risk: Risk): ReactElement {
  * directly to inventory_levels" rule. Same auth/tenant pattern as every
  * other page in this app -- see src/app/orders/page.tsx's doc comment.
  */
-export default async function InventoryPage(): Promise<ReactElement> {
+export default async function InventoryPage({ searchParams }: InventoryPageProps): Promise<ReactElement> {
   const authContext = await getAuthContext(await headers());
   if (!authContext) {
     redirect("/sign-in");
@@ -62,6 +71,7 @@ export default async function InventoryPage(): Promise<ReactElement> {
 
   const pool = getAppPool();
   const tenantId = await resolveTenantId(pool, authContext.clerkUserId);
+  const { error, transferred } = await searchParams;
   if (!tenantId) {
     return (
       <main className="page">
@@ -71,7 +81,7 @@ export default async function InventoryPage(): Promise<ReactElement> {
     );
   }
 
-  const rows = await withTenant(pool, tenantId, async (client) => {
+  const { rows, locations } = await withTenant(pool, tenantId, async (client) => {
     const result = await client.query<InventoryRow>(
       `SELECT il.product_id, il.location_id, il.on_hand, il.reserved, il.available, il.channel_buffer, il.updated_at,
               p.internal_sku, p.name AS product_name, loc.name AS location_name
@@ -80,8 +90,22 @@ export default async function InventoryPage(): Promise<ReactElement> {
          JOIN locations loc ON loc.id = il.location_id
         ORDER BY p.internal_sku, loc.name`,
     );
-    return result.rows;
+    // The full location list, not just the ones already showing up in
+    // `rows` above -- a tenant should be able to transfer stock INTO a
+    // location that has no inventory_levels row for anything yet
+    // (InventoryService.transferStock() creates one on the fly), which the
+    // inner-joined query above would never surface.
+    const locationsResult = await client.query<LocationRow>(`SELECT id, name FROM locations ORDER BY name`);
+    return { rows: result.rows, locations: locationsResult.rows };
   });
+
+  // Every transferable product already has at least one inventory_levels
+  // row (there's nothing to move otherwise) -- so the same `rows` this page
+  // already fetches for the ATS table doubles as the transfer form's
+  // product list, deduped by product_id, with no second query needed.
+  const products = [...new Map(rows.map((r) => [r.product_id, { id: r.product_id, sku: r.internal_sku }])).values()].sort(
+    (a, b) => a.sku.localeCompare(b.sku),
+  );
 
   const outOfStockCount = rows.filter((r) => assessRisk(r.available, r.channel_buffer) === "zero").length;
   const lowStockCount = rows.filter((r) => assessRisk(r.available, r.channel_buffer) === "low").length;
@@ -96,6 +120,16 @@ export default async function InventoryPage(): Promise<ReactElement> {
           {outOfStockCount > 0 && <span className="badge badge-danger">{outOfStockCount} out of stock</span>}
           {lowStockCount > 0 && <span className="badge badge-warning">{lowStockCount} running low</span>}
         </div>
+      )}
+
+      {transferred === "1" && <div className="alert alert-success">Stock transferred.</div>}
+      {error && <div className="alert alert-danger">{describeTransferError(error)}</div>}
+
+      {products.length > 0 && locations.length >= 2 && (
+        <details className="stack" style={{ marginBottom: 16 }}>
+          <summary>Transfer stock</summary>
+          <TransferStockForm products={products} locations={locations} />
+        </details>
       )}
 
       {rows.length === 0 ? (
@@ -150,4 +184,81 @@ export default async function InventoryPage(): Promise<ReactElement> {
       )}
     </main>
   );
+}
+
+/**
+ * Plain HTML form, no client JS -- same convention as every other
+ * page-driven mutation in this app (e.g. /products' "Add a product",
+ * /settings/channels' connect forms). POSTs to /api/inventory/transfer,
+ * which calls InventoryService.transferStock().
+ *
+ * Both location dropdowns list every location the tenant has, source and
+ * destination alike -- deliberately not filtered down to "locations that
+ * already stock the selected product," since that would need client-side
+ * JS to react to the product dropdown's selection (this app has none, see
+ * above) or a page reload per selection. An impossible combination (no
+ * stock at the chosen source, or the same location picked twice) fails
+ * server-side with a specific, friendly error instead -- same "verify
+ * server-side, no client-side pre-filtering" tradeoff /settings/channels'
+ * connect forms already make.
+ */
+function TransferStockForm({
+  products,
+  locations,
+}: {
+  products: Array<{ id: string; sku: string }>;
+  locations: LocationRow[];
+}): ReactElement {
+  return (
+    <form action="/api/inventory/transfer" method="POST" className="row" style={{ gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+      <select name="productId" required defaultValue="">
+        <option value="" disabled>
+          Product
+        </option>
+        {products.map((product) => (
+          <option key={product.id} value={product.id}>
+            {product.sku}
+          </option>
+        ))}
+      </select>
+      <select name="fromLocationId" required defaultValue="">
+        <option value="" disabled>
+          From location
+        </option>
+        {locations.map((location) => (
+          <option key={location.id} value={location.id}>
+            {location.name}
+          </option>
+        ))}
+      </select>
+      <select name="toLocationId" required defaultValue="">
+        <option value="" disabled>
+          To location
+        </option>
+        {locations.map((location) => (
+          <option key={location.id} value={location.id}>
+            {location.name}
+          </option>
+        ))}
+      </select>
+      <input type="number" name="quantity" min="1" step="1" placeholder="Quantity" required style={{ width: 100 }} />
+      <button type="submit">Transfer stock</button>
+    </form>
+  );
+}
+
+function describeTransferError(error: string): string {
+  if (error === "not signed in") return "You must be signed in to transfer stock.";
+  if (error === "inventory_transfer_missing_fields") return "Choose a product, both locations, and a quantity before submitting.";
+  if (error === "inventory_transfer_same_location") return "The source and destination locations must be different.";
+  if (error === "inventory_transfer_invalid_quantity") return "Quantity must be a positive whole number.";
+  if (error.startsWith("inventory_transfer_insufficient_stock:")) {
+    return `Not enough available stock at the source location to transfer that much. (${error.slice(
+      "inventory_transfer_insufficient_stock:".length,
+    )})`;
+  }
+  if (error.startsWith("inventory_transfer_failed:")) {
+    return `Could not transfer stock: ${error.slice("inventory_transfer_failed:".length)}`;
+  }
+  return error;
 }
