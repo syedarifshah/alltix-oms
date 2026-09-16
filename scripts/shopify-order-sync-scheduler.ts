@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { createAppPool } from "../packages/db/src/index.js";
 import { startShopifyOrderSyncScheduler } from "../packages/scheduler/src/index.js";
+import { initObservability } from "../packages/shared/src/index.js";
 
 // Shopify counterpart to scripts/amazon-order-sync-scheduler.ts -- the
 // long-running trigger for the Shopify order-sync job. Same node-cron
@@ -26,6 +27,7 @@ function readRequiredEnv(name: string): string {
 }
 
 function main(): void {
+  initObservability("scheduler:shopify");
   const appPool = createAppPool({ connectionString: readRequiredEnv("APP_DATABASE_URL") });
   const adminPool = createAppPool({ connectionString: readRequiredEnv("DATABASE_URL") });
 

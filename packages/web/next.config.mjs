@@ -1,5 +1,12 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+// Imported from the "/config" subpath, not the package root -- confirmed by
+// a real `next build` warning ("Importing withSentryConfig from
+// @sentry/nextjs is deprecated and will stop working in v11. Import it from
+// @sentry/nextjs/config instead") on the very first build against this
+// installed version (10.74.0). Heeded immediately per this package's own
+// AGENTS.md ("Heed deprecation notices").
+import { withSentryConfig } from "@sentry/nextjs/config";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -38,4 +45,21 @@ const nextConfig = {
   ...(process.env.VERCEL ? {} : { output: "standalone" }),
 };
 
-export default nextConfig;
+// Wraps the config to enable source-map upload (build time, no-ops without
+// SENTRY_AUTH_TOKEN/SENTRY_ORG/SENTRY_PROJECT set -- see .env.example) and
+// the Turbopack/Webpack value-injection rules instrumentation.ts and
+// instrumentation-client.ts need at build time. Confirmed by reading
+// @sentry/nextjs's own installed source (node_modules/@sentry/nextjs/build/
+// cjs/config/turbopack/generateValueInjectionRules.js) that this wrapper's
+// Turbopack path is a real, current, non-webpack-only code path -- not the
+// stale "Sentry + Turbopack don't mix yet" caveat from older training data.
+// org/project/authToken are left unset here deliberately (same "wire it
+// now, verify later" call as every marketplace credential in this repo) --
+// they read from SENTRY_ORG/SENTRY_PROJECT/SENTRY_AUTH_TOKEN automatically
+// when those env vars exist, and source-map upload just silently skips
+// itself without them (confirmed via the same source read -- these three
+// options are optional, not required for the app itself to build or run).
+export default withSentryConfig(nextConfig, {
+  silent: true,
+  widenClientFileUpload: true,
+});

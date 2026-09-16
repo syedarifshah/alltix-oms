@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { createAppPool } from "../packages/db/src/index.js";
 import { startEbayOrderSyncScheduler } from "../packages/scheduler/src/index.js";
+import { initObservability } from "../packages/shared/src/index.js";
 
 // eBay counterpart to scripts/walmart-order-sync-scheduler.ts -- the
 // long-running trigger for the eBay order-sync job. Same node-cron
@@ -29,6 +30,7 @@ function readRequiredEnv(name: string): string {
 }
 
 function main(): void {
+  initObservability("scheduler:ebay");
   const appPool = createAppPool({ connectionString: readRequiredEnv("APP_DATABASE_URL") });
   const adminPool = createAppPool({ connectionString: readRequiredEnv("DATABASE_URL") });
 

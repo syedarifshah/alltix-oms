@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { createAppPool } from "../packages/db/src/index.js";
 import { startAmazonOrderSyncScheduler } from "../packages/scheduler/src/index.js";
+import { initObservability } from "../packages/shared/src/index.js";
 
 // The long-running trigger for the Amazon order-sync job -- closes the gap
 // flagged in scripts/amazon-order-sync-job.ts and packages/scheduler/src/
@@ -36,6 +37,7 @@ function readRequiredEnv(name: string): string {
 }
 
 function main(): void {
+  initObservability("scheduler:amazon");
   const appPool = createAppPool({ connectionString: readRequiredEnv("APP_DATABASE_URL") });
   const adminPool = createAppPool({ connectionString: readRequiredEnv("DATABASE_URL") });
 

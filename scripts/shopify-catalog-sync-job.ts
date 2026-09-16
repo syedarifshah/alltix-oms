@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { createAppPool } from "../packages/db/src/index.js";
 import { runShopifyCatalogSyncJob } from "../packages/scheduler/src/index.js";
+import { initObservability, captureError, flushObservability } from "../packages/shared/src/index.js";
 
 // One-shot entrypoint for packages/scheduler's syncShopifyCatalog -- the
 // automatic counterpart to scripts/add-channel-listing.ts's manual,
@@ -21,6 +22,7 @@ function readRequiredEnv(name: string): string {
 }
 
 async function main(): Promise<void> {
+  initObservability("scheduler:shopify-catalog");
   const appPool = createAppPool({ connectionString: readRequiredEnv("APP_DATABASE_URL") });
   const adminPool = createAppPool({ connectionString: readRequiredEnv("DATABASE_URL") });
 
@@ -51,7 +53,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: unknown) => {
+main().catch(async (err: unknown) => {
   console.error("Shopify catalog sync job crashed:", err instanceof Error ? err.message : err);
+  captureError(err, { event: "shopify_catalog_sync_job_crashed" });
+  await flushObservability();
   process.exitCode = 1;
 });

@@ -596,7 +596,8 @@ note on why that's out of scope entirely, not just narrowed.
     `recordSyncSuccess()` clears `rate_limited_until` on a demonstrated success
     rather than making the tenant wait out a cooldown that's already been proven
     unnecessary. Same `[ALERT]`-tagged log-based alerting as the failure-tracking
-    below (no email/Slack infra exists). Tested against a real local Postgres in
+    below, plus a Sentry event (§13; no email/Slack infra exists beyond that).
+    Tested against a real local Postgres in
     `packages/channel-connectors/test/retry.test.ts` (in-process backoff, injectable
     `sleep`, no real timers) and `packages/scheduler/test/rate-limit-cooldown.test.ts`
     (the DB write and the discovery-query filtering).
@@ -615,8 +616,8 @@ note on why that's out of scope entirely, not just narrowed.
   discovery query — a dead connection stops being retried on every cron tick
   instead of failing forever with only a log line each time. A single
   `[ALERT]`-tagged `console.error` fires exactly once, on the run that crosses the
-  threshold (log-based alerting only — no email/Slack/notification infra exists in
-  this codebase, see §5's Observability row). Recovery is manual today: the tenant
+  threshold — log-based, and (as of §13) also a Sentry event via `captureAlert()`;
+  no email/Slack/notification infra exists beyond that. Recovery is manual today: the tenant
   reconnects via `/settings/channels`, which re-verifies live before writing
   `status = 'active'` again; nothing auto-retries an `error` row. Deliberately NOT
   wired into `syncShopifyCatalogForTenant` — catalog sync and order sync are
@@ -1007,7 +1008,7 @@ note on why that's out of scope entirely, not just narrowed.
 | Infra | AWS (ECS/Fargate → EKS as you scale), Terraform | Fargate skips K8s ops until actually needed |
 | Auth | Auth0/Clerk (buy, don't build) | Not your differentiator |
 | Billing | Stripe Billing | Usage-based metering (orders processed, SKU count, seats) |
-| Observability | Datadog or Grafana+Prometheus, Sentry | You *will* need to debug "why did SKU X oversell at 3am" |
+| Observability | Sentry — **built**, see §13 | You *will* need to debug "why did SKU X oversell at 3am" |
 
 ## 6. Security & Compliance
 
@@ -1083,9 +1084,13 @@ note on why that's out of scope entirely, not just narrowed.
   `OrderReceivedPayload` carries no line-item data). Per-location fulfillment
   routing beyond what the rules engine's `route_to_warehouse` action already does
   is otherwise still open. Returns handling — **built**, see §2.2/§3. Rate-limit
-  hardening, circuit breakers — **built**, see §4.4. Observability dashboards
-  still open — no external account (Sentry/Datadog) provisioned yet, alerting
-  today is still the `[ALERT]`-tagged log lines §4.4 describes.
+  hardening, circuit breakers — **built**, see §4.4. Observability dashboards —
+  **built**, see §13: Sentry is wired end-to-end across packages/web and every
+  backend job/scheduler script, with every DSN left unset — no real Sentry account
+  exists yet, so this is wired-and-ready, not proven against a live account (same
+  "wire it now, verify later" status Amazon's/Walmart's/eBay's own credentials
+  carried before their first live pass). The `[ALERT]`-tagged log lines §4.4
+  describes now also fire a Sentry event alongside the log line, not instead of it.
   - Open question for Arif: given the widened volume ceiling (§0: up to 50,000
     orders/month), whether the CDC-fed reporting store is worth moving earlier than
     Phase 4 — not a change to the phase order itself, just worth deciding deliberately
@@ -1146,6 +1151,86 @@ from there.
   `taskkill /IM node.exe` or `pkill node` — it can kill unrelated Node processes on the
   same machine (other dev servers, editor extensions, etc.), not just the one the test
   started.
+
+## 13. Observability (Sentry — §5/§8 Phase 4's "Observability dashboards")
+
+- **Why Sentry, not Datadog/Grafana+Prometheus**: hosted SaaS needing no new infra on
+  this app's Vercel Hobby plan (no Redis/Kafka-class dependency either, same
+  "don't stand up paid infra a single self-testing tenant hasn't earned yet" call
+  §4.4 already makes for BullMQ), and it directly matches §5/§11's own "why did SKU X
+  oversell at 3am" debugging story — a real stack trace plus tenant/order context
+  beats grepping a log line.
+- **Every DSN left unset in `.env.example`, deliberately** — same "wire it now, verify
+  against a real account later" pattern as every marketplace connector's own
+  credentials in this codebase. `Sentry.init()` with no `dsn` is a confirmed,
+  documented no-op in the installed SDK itself (`@sentry/core`'s client logs a
+  debug-only "No DSN provided, client will not send events" and never constructs a
+  transport) — the app behaves identically with or without a real Sentry account
+  connected, and every capture call below stays inert until one exists.
+- **`packages/web` (Next.js, `@sentry/nextjs`)** — this version (10.74.0) confirmed
+  against the actually-installed package's own source
+  (`node_modules/@sentry/nextjs/build/cjs/config/webpack.js` and
+  `config/turbopack/generateValueInjectionRules.js`), not assumed from training data,
+  since this app pins Next.js 16.3.3 (`packages/web/AGENTS.md`'s own "this is NOT the
+  Next.js you know" warning) and this app builds with **Turbopack**
+  (`next build` prints `(Turbopack)`) — several older Sentry+Next.js conventions are
+  confirmed broken or deprecated under this exact combination, not just superseded:
+  - `src/instrumentation.ts`'s `register()` calls `Sentry.init()` directly (branching
+    on `NEXT_RUNTIME` for `nodejs`/`edge`), and exports `onRequestError =
+    Sentry.captureRequestError` — putting `Sentry.init()` in a separate
+    `sentry.server.config.ts`/`sentry.edge.config.ts` file instead is explicitly
+    flagged by the installed SDK as needing to move into `register()`.
+  - `src/instrumentation-client.ts` (the Next.js 15.3+ file convention, confirmed via
+    `node_modules/next/dist/docs/.../instrumentation-client.md`) holds the client-side
+    `Sentry.init()` — **not** the older `sentry.client.config.ts`, which the installed
+    SDK explicitly warns "will no longer work" under Turbopack. Also exports
+    `onRouterTransitionStart = Sentry.captureRouterTransitionStart`, a required hook
+    for navigation instrumentation surfaced as an "ACTION REQUIRED" build warning on
+    the first real build against this SDK version, fixed immediately rather than left
+    as a warning.
+  - `next.config.mjs` wraps its config with `withSentryConfig` imported from the
+    `@sentry/nextjs/config` subpath (not the package root — the root import path
+    triggered a real deprecation warning on the first build against 10.74.0, fixed
+    immediately per `AGENTS.md`'s "heed deprecation notices"). `org`/`project`/
+    `authToken` are left unset (read from `SENTRY_ORG`/`SENTRY_PROJECT`/
+    `SENTRY_AUTH_TOKEN` when present) — build-time source-map upload silently skips
+    itself without them, same no-op-until-configured shape as the DSN.
+  - Two Vercel Cron routes' worth of caveat: every `GET /api/cron/*-order-sync` route
+    runs inside this same Next.js server process, so it's already covered by this
+    wiring — it does not need its own separate `@alltix/shared` observability call.
+- **Non-web packages (`@alltix/shared/src/observability.ts`, plain `@sentry/node`)** —
+  the scheduler's node-cron scripts and the one-shot job scripts under `/scripts` run
+  outside Next.js entirely, so they can't use `@sentry/nextjs`'s file conventions.
+  `initObservability(service)` (idempotent, tags every event with a `service` string
+  like `"scheduler:ebay"` so one shared Sentry project can still tell channels/
+  processes apart), `captureAlert(message, extra)`, `captureError(error, extra)`, and
+  `flushObservability(timeoutMs)` (awaited in every one-shot job script's top-level
+  `main().catch()` before the process exits — `Sentry.captureException`/
+  `captureMessage` enqueue for async delivery, they don't send synchronously, so a
+  short-lived script that exits right after a capture can drop the event entirely
+  without this).
+  - **Deliberately narrow scope, not a blanket `console.error` hook**: `@sentry/node`
+    ships `captureConsoleIntegration` for exactly that, and it was considered and
+    rejected — §4.4's own `recordSyncFailure()`/`recordRateLimitTrip()` doc comments
+    are explicit that only the `[ALERT]`-tagged lines are meant to page anyone; the
+    per-tenant/per-run `console.error` calls alongside them are intentionally
+    non-alerting (a single tenant's transient failure, tolerated and logged, not
+    incident-worthy until it crosses `CONSECUTIVE_FAILURE_ERROR_THRESHOLD`). A blanket
+    hook would silently erase that distinction and flood Sentry with noise on the
+    first transient failure of any tenant, any channel. `captureAlert()`/
+    `captureError()` are called explicitly only at: the two `[ALERT]`-tagged lines in
+    `packages/scheduler/src/index.ts` (`recordSyncFailure`/`recordRateLimitTrip`), and
+    `packages/scheduler/src/cron-runner.ts`'s four `runXOnceWithRetry` functions' final
+    `!willRetry` branch (a whole sync job exhausting every retry — a materially
+    different, rarer signal than one attempt's transient failure).
+- **UNVERIFIED, same status every other external integration in this codebase carried
+  before its first live pass**: no real Sentry account/project has ever been created,
+  so no event from this wiring has ever actually been seen in a Sentry dashboard —
+  only confirmed to build cleanly (`next build`, zero Sentry warnings after the two
+  fixes above) and to run cleanly with `SENTRY_DSN` unset (the full test suite,
+  including the `[ALERT]`-tagged `recordSyncFailure`/`recordRateLimitTrip` tests,
+  passes unchanged). Creating a real project and setting the DSNs in `.env.example`'s
+  Observability section is the remaining step before this is proven, not built.
 
 ---
 

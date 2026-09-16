@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { createAppPool } from "../packages/db/src/index.js";
 import { runShopifyOrderSyncJob } from "../packages/scheduler/src/index.js";
+import { initObservability, captureError, flushObservability } from "../packages/shared/src/index.js";
 
 // Shopify counterpart to scripts/amazon-order-sync-job.ts -- same one-shot
 // entrypoint shape a real cron / ECS scheduled task / EventBridge rule
@@ -19,6 +20,7 @@ function readRequiredEnv(name: string): string {
 }
 
 async function main(): Promise<void> {
+  initObservability("scheduler:shopify");
   const appPool = createAppPool({ connectionString: readRequiredEnv("APP_DATABASE_URL") });
   const adminPool = createAppPool({ connectionString: readRequiredEnv("DATABASE_URL") });
 
@@ -55,7 +57,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: unknown) => {
+main().catch(async (err: unknown) => {
   console.error("Shopify order sync job crashed:", err instanceof Error ? err.message : err);
+  captureError(err, { event: "shopify_order_sync_job_crashed" });
+  await flushObservability();
   process.exitCode = 1;
 });

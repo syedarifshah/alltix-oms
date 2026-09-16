@@ -1,6 +1,6 @@
 import type { Pool } from "pg";
 import { withTenant } from "@alltix/db";
-import { InProcessEventBus, type EventBus } from "@alltix/shared";
+import { InProcessEventBus, type EventBus, captureAlert } from "@alltix/shared";
 import {
   createAmazonConnectorFromChannelConnection,
   SP_API_SANDBOX_TEST_CASE_CREATED_AFTER,
@@ -107,16 +107,18 @@ export const RATE_LIMIT_COOLDOWN_MS = 15 * 60 * 1000;
  * auto-retries an 'error' row; an explicit "retry now" action is future
  * work, not attempted here.
  *
- * Alerting is log-based only, deliberately -- no email/Slack/notification
- * infra exists anywhere in this codebase (CLAUDE.md §5's Observability row
- * names Datadog/Sentry, not a notification service). The distinctly
- * "[ALERT]"-tagged console.error below fires exactly once per incident --
- * on the run that *crosses* the threshold, not on every failed run after
- * (the row leaves the 'active' pool at that point, so there is no "after"
- * to log) -- so a log-based alert (a Sentry issue, a Datadog log monitor
- * matching "[ALERT]") fires once, not once per cron tick for as long as
- * the tenant stays broken. The caller's own per-run console.error is
- * unchanged and still fires every time.
+ * Alerting is log-based AND a Sentry event (captureAlert(), CLAUDE.md §5/§8
+ * Phase 4's "Observability dashboards" -- @alltix/shared's observability.ts
+ * has the full reasoning for why this call site specifically, and not a
+ * blanket console.error hook, is the one wrapped). No email/Slack/other
+ * notification infra exists anywhere in this codebase beyond that. The
+ * distinctly "[ALERT]"-tagged console.error below fires exactly once per
+ * incident -- on the run that *crosses* the threshold, not on every failed
+ * run after (the row leaves the 'active' pool at that point, so there is no
+ * "after" to log) -- so the Sentry event fires once too, not once per cron
+ * tick for as long as the tenant stays broken. The caller's own per-run
+ * console.error is unchanged and still fires every time, but does NOT reach
+ * Sentry -- only this threshold-crossing line does.
  *
  * Exported (along with {@link recordSyncSuccess} and
  * {@link CONSECUTIVE_FAILURE_ERROR_THRESHOLD}) purely so
@@ -151,11 +153,12 @@ export async function recordSyncFailure(
 
     const row = updated.rows[0];
     if (row?.status === "error" && row.consecutive_failures === CONSECUTIVE_FAILURE_ERROR_THRESHOLD) {
-      console.error(
+      const alertMessage =
         `[ALERT] ${channel} channel_connections for tenant ${tenantId} has failed ${row.consecutive_failures} ` +
-          `consecutive sync runs and is now status='error' -- it will NOT be retried automatically until ` +
-          `reconnected via /settings/channels. Last error: ${message}`,
-      );
+        `consecutive sync runs and is now status='error' -- it will NOT be retried automatically until ` +
+        `reconnected via /settings/channels. Last error: ${message}`;
+      console.error(alertMessage);
+      captureAlert(alertMessage, { tenantId, channel, consecutiveFailures: row.consecutive_failures });
     }
   });
 }
@@ -252,10 +255,11 @@ export async function recordRateLimitTrip(
     ),
   );
 
-  console.error(
+  const alertMessage =
     `[ALERT] ${channel} channel_connections for tenant ${tenantId} is being rate-limited -- ` +
-      `backing off until ${rateLimitedUntil.toISOString()} (${Math.round(cooldownMs / 1000)}s) before retrying.`,
-  );
+    `backing off until ${rateLimitedUntil.toISOString()} (${Math.round(cooldownMs / 1000)}s) before retrying.`;
+  console.error(alertMessage);
+  captureAlert(alertMessage, { tenantId, channel, rateLimitedUntil: rateLimitedUntil.toISOString() });
 }
 
 export interface SyncAmazonOrdersParams {

@@ -22,6 +22,7 @@
     "@alltix/shared": "0.1.0",
     "@alltix/warehouse-service": "0.1.0",
     "@clerk/nextjs": "^7.8.3",
+    "@sentry/nextjs": "^10.74.0",
     "next": "^16.3.3",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",

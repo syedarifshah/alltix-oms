@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { createAppPool } from "../packages/db/src/index.js";
 import { runAmazonOrderSyncJob } from "../packages/scheduler/src/index.js";
+import { initObservability, captureError, flushObservability } from "../packages/shared/src/index.js";
 
 // The directly-runnable entrypoint a real cron / ECS scheduled task /
 // EventBridge rule would invoke on a cadence -- see
@@ -21,6 +22,7 @@ function readRequiredEnv(name: string): string {
 }
 
 async function main(): Promise<void> {
+  initObservability("scheduler:amazon");
   const appPool = createAppPool({ connectionString: readRequiredEnv("APP_DATABASE_URL") });
   const adminPool = createAppPool({ connectionString: readRequiredEnv("DATABASE_URL") });
 
@@ -57,7 +59,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: unknown) => {
+main().catch(async (err: unknown) => {
   console.error("Amazon order sync job crashed:", err instanceof Error ? err.message : err);
+  captureError(err, { event: "amazon_order_sync_job_crashed" });
+  await flushObservability();
   process.exitCode = 1;
 });

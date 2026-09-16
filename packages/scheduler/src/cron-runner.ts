@@ -1,5 +1,6 @@
 import { schedule, type ScheduledTask } from "node-cron";
 import type { Pool } from "pg";
+import { captureError } from "@alltix/shared";
 import {
   runAmazonOrderSyncJob,
   runShopifyOrderSyncJob,
@@ -7,6 +8,15 @@ import {
   runEbayOrderSyncJob,
   type TenantSyncResult,
 } from "./index.js";
+
+// captureError() below is called only once a run has exhausted every retry
+// (the `!willRetry` branch) -- a whole sync job failing systemically
+// (DB down, every credential rejected, an unhandled bug) is a materially
+// different, rarer, more urgent signal than one attempt's transient
+// failure, which is expected often enough (a marketplace's momentary 503)
+// that reporting every attempt would be noise. See
+// packages/shared/src/observability.ts's own header comment for why this
+// module doesn't use a blanket console.error->Sentry hook instead.
 
 // The "how it gets triggered" layer packages/scheduler/src/index.ts's own
 // header comment flagged as separate, later infrastructure work -- this is
@@ -80,8 +90,11 @@ function summarizeResults(results: TenantSyncResult[]) {
  * short linear backoff, and logs one structured JSON line per attempt plus
  * the run's final outcome -- console.log/console.error rather than a
  * logging library, matching this codebase's existing basic-observability
- * level (CLAUDE.md §5's Datadog/Grafana+Prometheus/Sentry row is future
- * work, not wired up anywhere yet).
+ * level. Structured logs remain the record of every attempt; a Sentry
+ * event (captureError(), see the import above) additionally fires once a
+ * run has exhausted its retries -- CLAUDE.md §5/§8 Phase 4's "Observability
+ * dashboards" is no longer future work, see @alltix/shared's
+ * observability.ts.
  */
 export async function runOnceWithRetry(
   appPool: Pool,
@@ -120,7 +133,10 @@ export async function runOnceWithRetry(
           willRetry,
         }),
       );
-      if (!willRetry) return;
+      if (!willRetry) {
+        captureError(err, { event: "amazon_order_sync_run", runId, attempt });
+        return;
+      }
       await sleep(retryDelayMs * attempt);
     }
   }
@@ -230,7 +246,10 @@ export async function runShopifyOnceWithRetry(
           willRetry,
         }),
       );
-      if (!willRetry) return;
+      if (!willRetry) {
+        captureError(err, { event: "shopify_order_sync_run", runId, attempt });
+        return;
+      }
       await sleep(retryDelayMs * attempt);
     }
   }
@@ -333,7 +352,10 @@ export async function runWalmartOnceWithRetry(
           willRetry,
         }),
       );
-      if (!willRetry) return;
+      if (!willRetry) {
+        captureError(err, { event: "walmart_order_sync_run", runId, attempt });
+        return;
+      }
       await sleep(retryDelayMs * attempt);
     }
   }
@@ -436,7 +458,10 @@ export async function runEbayOnceWithRetry(
           willRetry,
         }),
       );
-      if (!willRetry) return;
+      if (!willRetry) {
+        captureError(err, { event: "ebay_order_sync_run", runId, attempt });
+        return;
+      }
       await sleep(retryDelayMs * attempt);
     }
   }

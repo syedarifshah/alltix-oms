@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { createAppPool } from "../packages/db/src/index.js";
 import { startWalmartOrderSyncScheduler } from "../packages/scheduler/src/index.js";
+import { initObservability } from "../packages/shared/src/index.js";
 
 // Walmart counterpart to scripts/shopify-order-sync-scheduler.ts -- the
 // long-running trigger for the Walmart order-sync job. Same node-cron
@@ -29,6 +30,7 @@ function readRequiredEnv(name: string): string {
 }
 
 function main(): void {
+  initObservability("scheduler:walmart");
   const appPool = createAppPool({ connectionString: readRequiredEnv("APP_DATABASE_URL") });
   const adminPool = createAppPool({ connectionString: readRequiredEnv("DATABASE_URL") });
 
