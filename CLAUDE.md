@@ -20,11 +20,13 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
     sandbox exists to substitute — see §4.2). Everything else in this MVP definition
     (ledger, order pull/normalize, pick/pack, order-routing rules, billing) is built.
 - **HR & Payroll — Arif's explicit pick, "add HR & payroll"**: a module inside
-  alltix-oms, for tenants — not a separate product. Scope locked to three layers,
-  all in this pass except the third: (1) employee directory + time tracking, no wage
-  math; (2) gross wage calculation (hours × rate), no tax withholding; (3) a real
-  payroll-processor integration, explicitly deferred to its own separately-scoped
-  future task given jurisdiction-specific legal complexity. See §14.
+  alltix-oms, for tenants — not a separate product. Scope locked to three layers:
+  (1) employee directory + time tracking, no wage math — built; (2) gross wage
+  calculation (hours × rate), no tax withholding — built; (3) a real
+  payroll-processor integration — vendor picked (**Check**, an embedded-payroll API
+  provider — see §14.1), but NOT built yet: blocked on Arif getting a real quote/
+  sandbox API key from Check's sales team (no vendor in this space publishes
+  self-serve pricing). See §14/§14.1.
 
 Do not expand this scope without an explicit decision — every module below assumes it.
 
@@ -1544,9 +1546,77 @@ from there.
   all currently); verified instead via `tsc -b`, `next build`, and a manual
   `psql` smoke test of the payroll aggregate query's SQL (FILTER clauses, the
   `extract(epoch ...)` hours computation) against real rows.
-- Real payroll-processor integration (task #34) is intentionally out of scope for
-  this module entirely, pending its own dedicated research/scoping pass given
-  jurisdiction-specific legal complexity.
+
+### 14.1 Real payroll processor integration (task #34 — Arif's explicit pick: Check)
+
+**Status: research/design only — NOT built.** No code exists yet; this section is the
+scoping pass §14's own "explicitly out of scope, pending its own dedicated
+research/scoping pass" line always pointed at. Nothing here should be treated as
+implemented until a "Wired into the app" note like every channel connector's own
+(§4.1-§4.7) appears below it.
+
+**Why this needs a real processor, not more of this codebase's own SQL**: §14's
+gross-wage view (hours × rate) deliberately stops short of tax withholding,
+deductions, filings, and actually moving money to an employee's bank account —
+getting federal/state/local withholding tables, quarterly/annual filings (941, 940,
+state unemployment, W-2s, etc.) right is a regulated, jurisdiction-by-jurisdiction
+problem with real legal liability for getting it wrong, not a business-logic problem
+this team should build in-house. Same "buy, don't build — not your differentiator"
+call §5's tech stack table already makes for auth (Clerk) and billing (Stripe
+Billing).
+
+**Vendor research (this pass)**: the relevant market isn't general payroll software
+(ADP, QuickBooks Payroll) but **embedded/API-first payroll infrastructure** —
+vendors built specifically for a platform like this one to offer payroll as a
+feature to ITS OWN tenants, under alltix-oms's own brand. Four compared:
+
+| Vendor | Coverage | Integration surface | Notes |
+|---|---|---|---|
+| **Check** (chosen) | All 50 US states + DC | Full REST API, or prebuilt white-label "Components" (Onboard, Run Payroll) adopted incrementally | API-first design — "Flexible Payroll API" with optional components, not iframe-only. $4.1B in payroll moved in 2024 (real scale, not a startup toy). |
+| Gusto Embedded | All 50 US states + DC | REST API, React SDK, or prebuilt iframe "Flows" | Most recognized brand; Flows can launch in ~4 weeks with the least engineering, at the cost of API depth/control. |
+| Zeal | All 50 US states + DC | REST API only, no prebuilt UI components | Positions itself as the leanest/most startup-friendly of the group — worth revisiting if Check's actual quote comes back too expensive for this stage. |
+| Salsa | US + Canada | REST API or GraphQL, plus a "Salsa Express" UI component | Only one of these four with Canada coverage — irrelevant given CLAUDE.md §0's US-only customer base (Amazon NA/Walmart US/eBay/Temu US), so not seriously considered. |
+
+**None of these four publish self-serve pricing** — every one gates cost/revenue-share
+terms behind a sales conversation, confirmed across multiple searches and vendor
+pages. This is a real, load-bearing gap: task #34's actual next step is Arif getting
+a real quote (and likely a sandbox API key) from Check's sales team — something this
+research pass cannot do on its own. Nothing below should be built against a live
+Check API until that account exists, same "UNVERIFIED pending real credentials"
+discipline this codebase already holds Walmart/eBay/Temu to (§4.2/§4.6/§4.7).
+
+**Check's confirmed data model** (from `docs.checkhq.com`, not yet exercised against
+a live account): `Company` (the tenant, requires EIN verification), `Employee`/
+`Worker` and `Contractor`, `Pay Schedule`, `Payroll` (a pay run), bank accounts
+(linked via Plaid), and tax documents. Two integration depths: the raw API for full
+programmatic control, or **Check Components** — prebuilt, white-labeled iframes for
+"Onboard" (collects an employee's bank details, tax withholding elections, and tax
+form e-signature in one flow) and "Run Payroll" (submits a pay run with a live
+preview/totals before finalizing).
+
+**Design direction (not yet built)**: use Check Components for v1, not the raw API —
+same reasoning as choosing Check over Gusto's own Flows isn't really "components vs.
+API," it's that **building a custom UI for bank-account linking and tax-withholding-
+election collection would mean re-implementing a highly regulated, liability-heavy
+surface Check has already built and battle-tested**, which is exactly the kind of
+work §5's "buy, don't build" table already says this team shouldn't take on itself.
+Sketch of the flow once a real account exists: a new `/settings/payroll` connects a
+tenant's Check `Company` (their own EIN/bank via the Onboard Component, embedded,
+not collected into this app's own DB — a deliberate privacy/liability boundary, not
+an oversight); each `employees` row gets a nullable `check_employee_id` (an
+expand-only column, added only when this is actually built, not before) once that
+employee completes their own Check Onboard flow; a pay run is triggered from THIS
+app's own already-built gross-wage view (§14, task #33) — `time_entries` stays the
+system of record for hours worked, Check becomes the system of record for money
+movement and tax compliance only, not a second place hours get tracked. A new
+`payroll_connections` table (tenant_id + encrypted Check API key + `check_company_id`
++ status) would mirror `channel_connections`' own shape (§2.4) but scoped to one
+processor per tenant, not one row per channel/marketplace pair.
+
+**Explicitly not decided/built yet**: the actual schema migration, any UI, any
+`packages/` service/connector code, and — most importantly — whether Check's real
+pricing is viable at this platform's current single-self-testing-tenant stage (§0).
+Revisit once Arif has a real quote.
 
 ---
 
