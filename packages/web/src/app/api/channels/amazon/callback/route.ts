@@ -84,8 +84,16 @@ export async function GET(req: NextRequest): Promise<Response> {
   // needs a base URL (sandbox vs. production SP-API host) this route has no
   // way to choose correctly for an application that doesn't exist yet, and
   // -- per the header comment above -- there is no live app to prove that
-  // choice against anyway.
-  const marketplace = process.env.AMAZON_OAUTH_DEFAULT_MARKETPLACE ?? "US";
+  // choice against anyway. So this stores a *region*, not a real
+  // marketplace id -- createAmazonConnectorFromChannelConnection() (see its
+  // own doc comment, added while fixing a real production 403) reads this
+  // value back at sync time to pick a production SP-API host and discover
+  // the real marketplace id(s) live via getMarketplaceParticipations().
+  // Must be one of SP-API's three real regions (NA/EU/FE, CLAUDE.md §4.1) --
+  // anything else is treated as not-a-real-production-connection and stays
+  // on the sandbox host, so this default has to be a real region, not the
+  // country code "US" this used to (wrongly) default to.
+  const marketplace = process.env.AMAZON_OAUTH_DEFAULT_MARKETPLACE ?? "NA";
 
   await withTenant(pool, tenantIdFromState, async (client) => {
     const encryptedClientSecret = await encryptChannelSecret(client, clientSecret);

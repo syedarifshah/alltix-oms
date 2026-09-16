@@ -15,6 +15,8 @@ import {
   parsePurchaseDate,
   AmazonConnector,
   buildCreateListingRequestBody,
+  isAmazonProductionRegion,
+  resolveAmazonProductionBaseUrl,
   SP_API_EU_SANDBOX_BASE_URL,
   SP_API_NA_SANDBOX_BASE_URL,
   SP_API_EU_PRODUCTION_BASE_URL,
@@ -60,6 +62,41 @@ test("isSandbox() is false for every production host -- real dates and order ids
   assert.equal(new AmazonConnector(FAKE_CREDENTIALS, SP_API_EU_PRODUCTION_BASE_URL).isSandbox(), false);
   assert.equal(new AmazonConnector(FAKE_CREDENTIALS, SP_API_NA_PRODUCTION_BASE_URL).isSandbox(), false);
   assert.equal(new AmazonConnector(FAKE_CREDENTIALS, SP_API_FE_PRODUCTION_BASE_URL).isSandbox(), false);
+});
+
+// Regression coverage for the real production bug found and fixed while
+// diagnosing a live "403 Unauthorized" on Amazon order sync: every caller
+// of createAmazonConnectorFromChannelConnection() relied on baseUrl/
+// marketplaceIds defaulting to the sandbox host regardless of what the
+// connection's own stored `marketplace` region said, so a real seller's
+// production refresh token kept getting used against sandbox
+// infrastructure. isAmazonProductionRegion() is the allowlist check that
+// decides "this connection is real production, resolve a production host"
+// vs. "stay on the sandbox default" -- see its own doc comment for why an
+// allowlist (not a denylist) is the fail-safe direction.
+test("isAmazonProductionRegion recognizes exactly SP-API's three real regions", () => {
+  assert.equal(isAmazonProductionRegion("NA"), true);
+  assert.equal(isAmazonProductionRegion("EU"), true);
+  assert.equal(isAmazonProductionRegion("FE"), true);
+});
+
+test("isAmazonProductionRegion is false for the sandbox seed script's own 'UK' marker -- every sandbox-backed e2e test depends on this staying false", () => {
+  assert.equal(isAmazonProductionRegion("UK"), false);
+});
+
+test("isAmazonProductionRegion is false for the old (wrong) 'US' default this app used to store -- a country code, not a region, must not be silently treated as production", () => {
+  assert.equal(isAmazonProductionRegion("US"), false);
+});
+
+test("isAmazonProductionRegion is false for garbage/unset values -- staying on the sandbox default is the safe failure mode, not guessing a production host", () => {
+  assert.equal(isAmazonProductionRegion(""), false);
+  assert.equal(isAmazonProductionRegion("not-a-region"), false);
+});
+
+test("resolveAmazonProductionBaseUrl maps each region to its own confirmed production host", () => {
+  assert.equal(resolveAmazonProductionBaseUrl("NA"), SP_API_NA_PRODUCTION_BASE_URL);
+  assert.equal(resolveAmazonProductionBaseUrl("EU"), SP_API_EU_PRODUCTION_BASE_URL);
+  assert.equal(resolveAmazonProductionBaseUrl("FE"), SP_API_FE_PRODUCTION_BASE_URL);
 });
 
 // buildCreateListingRequestBody() -- pure request-body builder for

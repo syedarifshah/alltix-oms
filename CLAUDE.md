@@ -385,13 +385,51 @@ received → validated → allocated → picking → packed → shipped → deli
     be fetched during this research pass (redirects to a domain outside this
     session's fetchable provenance set).
 
-**Unverified until production**: three pieces of Amazon integration are implemented
-and confirmed to reach live SP-API infrastructure with a correct request shape (or,
-for `createListing()`, cross-confirmed from real community examples), but can't be
-proven to actually succeed until run against a real seller account —
+**Update — the OAuth flow above has now actually been run against a real seller in
+production** (seller `A2P6SIBC86NP1T`, connected via the real redirect flow, not
+`seed-test-channel-connection.ts`), which means the app was in fact published/
+authorized enough for a real consent screen to work — the "cannot be proven until
+run against a real seller account" framing immediately below is now stale for that
+one bullet specifically, left in place with this note rather than silently rewritten,
+since **that same real connection immediately surfaced a real production bug**:
 
-- The OAuth "Connect Amazon" redirect flow (Website Authorization Workflow) — see the
-  detailed writeup above in this section.
+- **PRODUCTION INCIDENT, found and fixed**: order sync for that real seller failed
+  with `SP-API orders failed: 403 Unauthorized: Access to requested resource is
+  denied` on every attempt (`/settings/channels` showed "Last order sync: never
+  synced yet"). Root cause: `createAmazonConnectorFromChannelConnection()` — called
+  by the scheduler, `WarehouseService.confirmShipment`, and the listings route alike
+  — always defaulted `baseUrl`/`marketplaceIds` to the **sandbox** host and
+  marketplace id, regardless of what the connection's own stored `marketplace`
+  region said. That was invisible as long as only sandbox-seeded connections
+  existed; once a real seller connected (storing a real refresh token and region,
+  e.g. `"NA"`, via the OAuth callback), every scheduled sync kept sending that real
+  production access token to the *sandbox* host — which Amazon correctly rejects,
+  producing exactly this 403 (LWA authentication itself was never the problem; the
+  token exchange succeeds, the subsequent `GetOrders` call against the wrong host
+  is what's denied). **Fixed**: that function now resolves a real production host
+  from the connection's stored region (only when the caller doesn't explicitly
+  override `baseUrl`/`marketplaceIds`, so nothing sandbox-backed changed) and
+  discovers the seller's real, current marketplace id(s) live via
+  `getMarketplaceParticipations()` — filtered to `isParticipating` — rather than
+  guessing one, since a single NA-region seller could be provisioned for US, CA,
+  MX, or BR. The stored region column only recognizes SP-API's three real regions
+  (`NA`/`EU`/`FE`) as "this is production" — anything else (including the sandbox
+  seed script's `'UK'` marker, and this app's own previous, wrong `"US"` default
+  for `AMAZON_OAUTH_DEFAULT_MARKETPLACE`, now corrected to `"NA"` in
+  `.env.example`) safely stays on the sandbox default rather than guessing a
+  production host. See `isAmazonProductionRegion`/`resolveAmazonProductionBaseUrl`
+  and `createAmazonConnectorFromChannelConnection`'s own doc comment in
+  `amazon-connector.ts` for the full reasoning, and
+  `packages/channel-connectors/test/amazon-connector.test.ts` for regression
+  coverage of the region-allowlist logic itself. Not yet re-verified against that
+  real seller's actual order data post-fix — that confirmation happens on the next
+  scheduled sync (or a manual trigger) after this ships to production.
+
+**Unverified until production**: two more pieces of Amazon integration are
+implemented and confirmed to reach live SP-API infrastructure with a correct request
+shape (or, for `createListing()`, cross-confirmed from real community examples), but
+can't be proven to actually succeed until run against a real seller account —
+
 - `AmazonConnector.confirmShipment()` — the static sandbox has no matching test
   scenario for this operation on this account; see its doc comment in
   `packages/channel-connectors/src/amazon-connector.ts` for what was tried.

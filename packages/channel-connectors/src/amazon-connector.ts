@@ -304,19 +304,28 @@ export function loadAmazonProductionCredentialsFromEnv(): AmazonProductionCreden
  * tenant and decrypts its client_secret/refresh_token, via {@link withTenant}
  * so RLS scopes the lookup to `tenantId` (CLAUDE.md §2.4). Never logs the
  * decrypted values -- only returns them.
+ *
+ * Also returns the row's own `marketplace` column, alongside (not folded
+ * into) {@link AmazonSandboxCredentials} -- that interface is shared with
+ * the env-var-based sandbox/production loaders above, neither of which has
+ * a `marketplace` concept, so widening it there would be misleading for
+ * those call sites. See {@link createAmazonConnectorFromChannelConnection}
+ * for what this value is actually used for and why it was being silently
+ * ignored before (a real production 403 bug, not a hypothetical one).
  */
 export async function loadAmazonCredentialsFromChannelConnection(
   pool: Pool,
   tenantId: string,
-): Promise<AmazonSandboxCredentials> {
+): Promise<{ credentials: AmazonSandboxCredentials; marketplace: string }> {
   return withTenant(pool, tenantId, async (client) => {
     const result = await client.query<{
       lwa_client_id: string;
       encrypted_client_secret: Buffer;
       encrypted_refresh_token: Buffer;
       external_account_id: string;
+      marketplace: string;
     }>(
-      `SELECT lwa_client_id, encrypted_client_secret, encrypted_refresh_token, external_account_id
+      `SELECT lwa_client_id, encrypted_client_secret, encrypted_refresh_token, external_account_id, marketplace
          FROM channel_connections
         WHERE channel = 'amazon' AND status = 'active'
         ORDER BY created_at DESC
@@ -335,19 +344,118 @@ export async function loadAmazonCredentialsFromChannelConnection(
       decryptChannelSecret(client, row.encrypted_refresh_token),
     ]);
 
-    return { clientId: row.lwa_client_id, clientSecret, refreshToken, sellerId: row.external_account_id };
+    return {
+      credentials: { clientId: row.lwa_client_id, clientSecret, refreshToken, sellerId: row.external_account_id },
+      marketplace: row.marketplace,
+    };
   });
 }
 
-/** Builds an {@link AmazonConnector} from a tenant's channel_connections row instead of process.env. */
+/** SP-API's three real regions (CLAUDE.md §4.1) -- the only values
+ *  {@link createAmazonConnectorFromChannelConnection} recognizes as "this is
+ *  a real production connection, resolve a production host for it." Every
+ *  other stored `channel_connections.marketplace` value (including
+ *  scripts/seed-test-channel-connection.ts's hardcoded 'UK', chosen
+ *  precisely because it ISN'T one of these three) is treated as a sandbox
+ *  connection -- see that function's own doc comment for why this
+ *  allowlist, not a denylist, is the safe direction for this check. */
+export const AMAZON_PRODUCTION_REGIONS = ["NA", "EU", "FE"] as const;
+export type AmazonProductionRegion = (typeof AMAZON_PRODUCTION_REGIONS)[number];
+
+// Exported (alongside resolveAmazonProductionBaseUrl below) so the region-
+// detection logic itself -- the actual bug being fixed -- is unit-testable
+// as a pure function, without needing a live DB connection or a real SP-API
+// call the way exercising createAmazonConnectorFromChannelConnection()
+// end-to-end would.
+export function isAmazonProductionRegion(marketplace: string): marketplace is AmazonProductionRegion {
+  return (AMAZON_PRODUCTION_REGIONS as readonly string[]).includes(marketplace);
+}
+
+export function resolveAmazonProductionBaseUrl(region: AmazonProductionRegion): string {
+  switch (region) {
+    case "NA":
+      return SP_API_NA_PRODUCTION_BASE_URL;
+    case "EU":
+      return SP_API_EU_PRODUCTION_BASE_URL;
+    case "FE":
+      return SP_API_FE_PRODUCTION_BASE_URL;
+  }
+}
+
+/**
+ * Builds an {@link AmazonConnector} from a tenant's channel_connections row
+ * instead of process.env.
+ *
+ * THE BUG THIS FIXES (found while diagnosing a live production 403 on
+ * Amazon order sync): every caller of this function -- the scheduled order
+ * sync job, WarehouseService.confirmShipment, the listings route, and every
+ * e2e test -- calls it with just `(pool, tenantId)`, relying entirely on
+ * `baseUrl`/`marketplaceIds` defaulting to the SP-API *sandbox* host and
+ * marketplace id. That was fine as long as the only channel_connections
+ * rows that existed were sandbox-seeded ones
+ * (scripts/seed-test-channel-connection.ts). Once a real seller connected
+ * through the actual OAuth flow (packages/web's amazon/callback route,
+ * storing a real refresh token and a region in `marketplace`, e.g. "NA"),
+ * every scheduled sync for that tenant kept silently calling the EU
+ * *sandbox* host with a real *production* access token -- which Amazon
+ * correctly rejects with exactly "403 Unauthorized: Access to requested
+ * resource is denied" (a real production token is not a valid credential
+ * against sandbox infrastructure, regardless of how it was obtained).
+ *
+ * THE FIX: when the caller does not explicitly pass `baseUrl`/
+ * `marketplaceIds` (both left `undefined`), resolve them from the
+ * connection's own stored `marketplace` region instead of defaulting to
+ * sandbox. If that region is a real SP-API region (NA/EU/FE --
+ * {@link isAmazonProductionRegion}), this is a real production connection:
+ * pick that region's production host and discover the seller's real,
+ * *current* marketplace id(s) via {@link AmazonConnector.getMarketplaceParticipations}
+ * (filtered to `isParticipating`) rather than guessing one -- a NA-region
+ * seller could be provisioned for US, CA, MX, or BR, and hardcoding
+ * "assume US" would silently misroute anyone who isn't. Any other stored
+ * value (e.g. the sandbox seed script's 'UK') keeps today's exact sandbox
+ * defaults, so every existing sandbox-backed e2e test is unaffected.
+ *
+ * An explicit `baseUrl`/`marketplaceIds` pair (if a future caller ever
+ * passes one) is still honored exactly as before -- this only changes the
+ * *default*, not the ability to override it.
+ */
 export async function createAmazonConnectorFromChannelConnection(
   pool: Pool,
   tenantId: string,
-  baseUrl: string = SP_API_EU_SANDBOX_BASE_URL,
-  marketplaceIds: string[] = [SP_API_SANDBOX_MARKETPLACE_ID],
+  baseUrl?: string,
+  marketplaceIds?: string[],
 ): Promise<AmazonConnector> {
-  const credentials = await loadAmazonCredentialsFromChannelConnection(pool, tenantId);
-  return new AmazonConnector(credentials, baseUrl, marketplaceIds);
+  const { credentials, marketplace } = await loadAmazonCredentialsFromChannelConnection(pool, tenantId);
+
+  if (baseUrl !== undefined && marketplaceIds !== undefined) {
+    return new AmazonConnector(credentials, baseUrl, marketplaceIds);
+  }
+
+  if (!isAmazonProductionRegion(marketplace)) {
+    // Sandbox connection (or an unrecognized value -- treated the same,
+    // since staying in sandbox is the fail-safe direction here, not a
+    // guessed production host).
+    return new AmazonConnector(credentials, SP_API_EU_SANDBOX_BASE_URL, [SP_API_SANDBOX_MARKETPLACE_ID]);
+  }
+
+  const productionBaseUrl = resolveAmazonProductionBaseUrl(marketplace);
+  // A throwaway connector, used only to authenticate + call
+  // getMarketplaceParticipations() against the right regional host --
+  // marketplaceIds is irrelevant to that one call (see its own method doc).
+  const discoveryConnector = new AmazonConnector(credentials, productionBaseUrl, []);
+  const participations = await discoveryConnector.getMarketplaceParticipations();
+  const participatingMarketplaceIds = participations
+    .filter((p) => p.participation.isParticipating)
+    .map((p) => p.marketplace.id);
+
+  if (participatingMarketplaceIds.length === 0) {
+    throw new Error(
+      `Amazon seller for tenant ${tenantId} (region ${marketplace}) has no participating marketplaces -- ` +
+        `cannot pull orders. Checked ${productionBaseUrl}/sellers/v1/marketplaceParticipations.`,
+    );
+  }
+
+  return new AmazonConnector(credentials, productionBaseUrl, participatingMarketplaceIds);
 }
 
 /**
