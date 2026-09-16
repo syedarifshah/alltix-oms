@@ -1111,7 +1111,8 @@ own `createListing()`, so it's a separate connector-specific method too, not the
   below. Multi-warehouse/3PL support: the ledger-level piece (moving stock
   between two locations, §2.2's "Multi-location transfers") and the
   locations-management UI (`/locations` — create + rename a warehouse/3pl/fba/wfs
-  location; no delete, `type` fixed after creation, see that page's own doc
+  location, plus set/clear its optional ZIP code (see the nearest-location-routing
+  paragraph below); no delete, `type` fixed after creation, see that page's own doc
   comment) are now built. **Stock-aware multi-warehouse allocation — built**:
   `OrderService.allocateOrder()` (`packages/order-service/src/index.ts`) no longer
   checks only one location and backorders the instant it's short — it now tries
@@ -1129,12 +1130,42 @@ own `createListing()`, so it's a separate connector-specific method too, not the
   products, and locking in each order's own priority order could deadlock them
   against each other (`packages/order-service/test/multi-warehouse-allocation.test.ts`,
   plus the existing `allocation-concurrency.test.ts` "exactly 1 of 10" test still
-  passes unchanged). Two related, larger gaps remain explicitly open and were not
-  part of this change: nearest/cheapest-location-by-shipping-address routing (no
-  schema support at all yet) and per-SKU rule-based routing (blocked upstream —
-  `OrderReceivedPayload` carries no line-item data). Per-location fulfillment
-  routing beyond what the rules engine's `route_to_warehouse` action already does
-  is otherwise still open. Returns handling — **built**, see §2.2/§3. Rate-limit
+  passes unchanged). **Nearest-location-by-shipping-address routing — built**,
+  closing one of the two related gaps this section used to flag as explicitly open
+  (migration `0027_locations_postal_code.sql`, `extractUsShippingZip()`/
+  `rankByDistanceToShippingZip()` in `packages/order-service/src/index.ts`,
+  `/locations`' new per-row "Set ZIP" form): a tenant can now give a warehouse
+  location an optional US ZIP code, and `resolveCandidateLocations()` ranks its
+  non-preferred fallback candidates nearest-first to the order's own shipping ZIP
+  (great-circle distance via the `zipcodes` npm package's bundled US ZIP centroid
+  data — no geocoding API call, no new paid infra, same "don't stand up
+  infrastructure a single self-testing tenant hasn't earned yet" call already made
+  for BullMQ/Redis) instead of purely oldest-created-first. `preferred_location_id`
+  (a routing rule's explicit choice) is untouched by this and still wins outright.
+  The order's own shipping ZIP is read out of `orders.shipping_address`'s raw,
+  per-channel JSONB via `extractUsShippingZip()` — a small, deliberately
+  channel-aware field-path lookup (Amazon's `PostalCode`/`CountryCode`, Shopify's
+  `zip`/`countryCodeV2`, Walmart's `postalCode`/`country`, eBay's one-level-deeper
+  `contactAddress.postalCode`/`contactAddress.countryCode`), each confirmed against
+  that channel's own real or community-verified example response — see that
+  function's own doc comment for every source. **US-only, deliberately narrow**:
+  a non-US order, a location with no ZIP set, or an unrecognized ZIP all mean
+  "distance unknown," which falls back to the pre-existing oldest-created-first
+  order for that location (`Array.prototype.sort`'s ES2019+ stability guarantee is
+  what makes this a true fallback rather than a reshuffle — see
+  `rankByDistanceToShippingZip()`'s own doc comment) — this ranking only ever adds
+  information on top of the old default, it never removes or degrades it.
+  Distance is "as the crow flies," not real shipping/driving distance, per the
+  `zipcodes` package's own README. Fully unit- and integration-tested
+  (`packages/order-service/test/nearest-location-routing.test.ts` — pure
+  `extractUsShippingZip()`/`rankByDistanceToShippingZip()` cases needing no DB,
+  plus live-Postgres `allocateOrder()` cases proving nearer-but-newer beats
+  farther-but-older, preferred still wins over nearest, and every no-distance-info
+  case falls back unchanged). The other, larger related gap remains explicitly
+  open: per-SKU rule-based routing (blocked upstream — `OrderReceivedPayload`
+  carries no line-item data). Per-location fulfillment routing beyond what the
+  rules engine's `route_to_warehouse` action and this nearest-location ranking
+  already do is otherwise still open. Returns handling — **built**, see §2.2/§3. Rate-limit
   hardening, circuit breakers — **built**, see §4.4. Observability dashboards —
   **built**, see §13: Sentry is wired end-to-end across packages/web and every
   backend job/scheduler script, with every DSN left unset — no real Sentry account

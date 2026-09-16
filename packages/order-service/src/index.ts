@@ -1,4 +1,5 @@
 import type { Pool, PoolClient } from "pg";
+import * as zipcodes from "zipcodes";
 import { withTenant } from "@alltix/db";
 import {
   DomainEvent,
@@ -45,6 +46,113 @@ const SIMPLE_TRANSITION_EVENT: Partial<Record<OrderStatus, DomainEventName>> = {
   delivered: DomainEvent.OrderDelivered,
   refunded: DomainEvent.OrderRefunded,
 };
+
+/** Alpha-2/alpha-3 country codes this codebase treats as "US" for
+ *  {@link extractUsShippingZip} -- every channel's confirmed shipping-
+ *  address shape (see that function's own doc comment) renders the country
+ *  as one of these two, never a full country name. */
+const US_COUNTRY_CODES = new Set(["US", "USA"]);
+
+/**
+ * Reads a US ZIP code out of an order's raw, per-channel `shipping_address`
+ * JSONB, for {@link OrderService}'s private `resolveCandidateLocations` to
+ * rank warehouse candidates nearest-first (CLAUDE.md §8 Phase 4's
+ * "nearest-location-by-shipping-address routing" gap). Deliberately does
+ * NOT normalize the whole address into one shape -- this codebase has never
+ * done that for shipping_address (every channel connector's own
+ * normalizeXOrder() stores the channel's raw address object verbatim, e.g.
+ * ShopifyConnector's PII-gating comment) -- this only reaches in for the two
+ * fields (postal code, country) a ZIP-distance lookup needs, one
+ * channel-specific field path at a time, each confirmed against that
+ * channel's own real or community-verified example response:
+ *   - amazon: `PostalCode`/`CountryCode` (SP-API's shared Address schema,
+ *     confirmed via a community-generated Go SDK's own struct fields --
+ *     official docs were unfetchable, same friction already documented for
+ *     amazon-connector.ts's other unconfirmed shapes).
+ *   - shopify: `zip`/`countryCodeV2` (this codebase's own GraphQL query in
+ *     shopify-connector.ts's pullOrders(), a literal field this app already
+ *     requests).
+ *   - walmart: `postalCode`/`country` (developer.walmart.com's own
+ *     "Get an order" example response, fetched live).
+ *   - ebay: `contactAddress.postalCode`/`contactAddress.countryCode`,
+ *     one level deeper than the other three -- eBay's shipTo object nests a
+ *     contactAddress, confirmed via a real community-published example
+ *     Fulfillment API response (developer.ebay.com's own pages render this
+ *     shape only in prose, same friction ebay-connector.ts's other doc
+ *     comments already describe).
+ *
+ * US-only, deliberately narrow, the same "not built" precedent as every
+ * other international gap in this codebase: any other/missing/unrecognized
+ * country code, or a channel this function doesn't recognize, returns null
+ * -- meaning "distance unknown," not "assume US." A null return is the
+ * ordinary, expected case for a non-US order, not an error -- every caller
+ * already has a no-distance-info fallback (the pre-existing
+ * oldest-created-first order) and must treat null that way. */
+export function extractUsShippingZip(channel: string, shippingAddress: Record<string, unknown> | null): string | null {
+  if (!shippingAddress) return null;
+
+  let zip: unknown;
+  let country: unknown;
+  switch (channel) {
+    case "amazon":
+      zip = shippingAddress.PostalCode;
+      country = shippingAddress.CountryCode;
+      break;
+    case "shopify":
+      zip = shippingAddress.zip;
+      country = shippingAddress.countryCodeV2;
+      break;
+    case "walmart":
+      zip = shippingAddress.postalCode;
+      country = shippingAddress.country;
+      break;
+    case "ebay": {
+      const contactAddress = shippingAddress.contactAddress;
+      if (contactAddress && typeof contactAddress === "object") {
+        zip = (contactAddress as Record<string, unknown>).postalCode;
+        country = (contactAddress as Record<string, unknown>).countryCode;
+      }
+      break;
+    }
+    default:
+      return null;
+  }
+
+  if (typeof zip !== "string" || typeof country !== "string") return null;
+  if (!US_COUNTRY_CODES.has(country.toUpperCase())) return null;
+  const trimmed = zip.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * Ranks a tenant's non-preferred warehouse candidates nearest-first to an
+ * order's shipping ZIP, using the `zipcodes` npm package's bundled US ZIP
+ * centroid data for a great-circle ("as the crow flies," not real
+ * shipping/driving) distance -- no geocoding API call, no new paid infra,
+ * the same "don't stand up infrastructure a single self-testing tenant
+ * hasn't earned yet" call CLAUDE.md §4.4 already makes for BullMQ/Redis.
+ *
+ * A location with no `postal_code` set (nullable per migration
+ * 0027_locations_postal_code.sql -- most existing/pre-migration locations),
+ * or whose postal_code isn't a real US ZIP the `zipcodes` package
+ * recognizes, has unknown distance (`null`). `Array.prototype.sort` has been
+ * a STABLE sort since ES2019/V8 -- every unknown-distance location keeps its
+ * original oldest-created-first relative order (the query this function's
+ * only caller passes in is already `ORDER BY created_at ASC`) and sorts
+ * after every known-distance one, rather than being silently dropped or
+ * thrown to the front by an unstable sort. */
+export function rankByDistanceToShippingZip(
+  locations: Array<{ id: string; postal_code: string | null }>,
+  shippingZip: string,
+): string[] {
+  return locations
+    .map((location) => ({
+      id: location.id,
+      distance: location.postal_code ? zipcodes.distance(shippingZip, location.postal_code) : null,
+    }))
+    .sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity))
+    .map((location) => location.id);
+}
 
 /**
  * Normalizes orders from every channel into one shape and owns the order
@@ -483,8 +591,13 @@ export class OrderService {
    */
   private async allocateOrder(tenantId: string, orderId: string, expectedFromStatus: OrderStatus): Promise<OrderStatus> {
     const result = await withTenant(this.pool, tenantId, async (client) => {
-      const orderResult = await client.query<{ status: OrderStatus; preferred_location_id: string | null }>(
-        `SELECT status, preferred_location_id FROM orders WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+      const orderResult = await client.query<{
+        status: OrderStatus;
+        preferred_location_id: string | null;
+        channel: string;
+        shipping_address: Record<string, unknown> | null;
+      }>(
+        `SELECT status, preferred_location_id, channel, shipping_address FROM orders WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
         [orderId, tenantId],
       );
       const orderRow = orderResult.rows[0];
@@ -510,10 +623,12 @@ export class OrderService {
         return { status: "allocated" as const, locationId: null };
       }
 
+      const shippingZip = extractUsShippingZip(orderRow.channel, orderRow.shipping_address);
       const candidateLocationIds = await this.resolveCandidateLocations(
         client,
         tenantId,
         orderRow.preferred_location_id,
+        shippingZip,
       );
 
       // Sum requested quantity per product first (an order can have more
@@ -617,16 +732,26 @@ export class OrderService {
    *  orders.preferred_location_id) is tried first when present and must
    *  resolve to a real, tenant-owned, type='warehouse' location -- throws
    *  otherwise rather than silently falling back or silently excluding it
-   *  from the list. Every other tenant warehouse location follows,
-   *  oldest-created first (the original single-location default, now a
-   *  fallback rather than the only option) -- this is what lets
-   *  allocateOrder() try a second warehouse instead of backordering the
-   *  moment the preferred/default one is short. Throws if the tenant has
-   *  no warehouse location at all. */
+   *  from the list.
+   *
+   *  Every other tenant warehouse location follows, ranked NEAREST-FIRST to
+   *  `shippingZip` (the order's own shipping-address ZIP, see
+   *  {@link extractUsShippingZip}) when it's resolvable -- closing the
+   *  "nearest/cheapest-location-by-shipping-address routing (no schema
+   *  support at all yet)" gap CLAUDE.md §8 Phase 4 has flagged as open since
+   *  multi-warehouse allocation was first built. `shippingZip === null`
+   *  (a non-US order, an unrecognized/missing shipping address shape, or a
+   *  channel this codebase hasn't mapped -- see extractUsShippingZip's own
+   *  doc comment) falls back to the ORIGINAL oldest-created-first order
+   *  unchanged -- this ranking only ever adds information, it never removes
+   *  the old default. This is what lets allocateOrder() try a second
+   *  warehouse instead of backordering the moment the preferred/nearest one
+   *  is short. Throws if the tenant has no warehouse location at all. */
   private async resolveCandidateLocations(
     client: PoolClient,
     tenantId: string,
     preferredLocationId: string | null,
+    shippingZip: string | null,
   ): Promise<string[]> {
     let preferred: string | null = null;
     if (preferredLocationId) {
@@ -644,14 +769,18 @@ export class OrderService {
       preferred = preferredRow.id;
     }
 
-    const others = await client.query<{ id: string }>(
+    const othersResult = await client.query<{ id: string; postal_code: string | null }>(
       preferred
-        ? `SELECT id FROM locations WHERE tenant_id = $1 AND type = 'warehouse' AND id <> $2 ORDER BY created_at ASC`
-        : `SELECT id FROM locations WHERE tenant_id = $1 AND type = 'warehouse' ORDER BY created_at ASC`,
+        ? `SELECT id, postal_code FROM locations WHERE tenant_id = $1 AND type = 'warehouse' AND id <> $2 ORDER BY created_at ASC`
+        : `SELECT id, postal_code FROM locations WHERE tenant_id = $1 AND type = 'warehouse' ORDER BY created_at ASC`,
       preferred ? [tenantId, preferred] : [tenantId],
     );
 
-    const candidates = preferred ? [preferred, ...others.rows.map((r) => r.id)] : others.rows.map((r) => r.id);
+    const others = shippingZip
+      ? rankByDistanceToShippingZip(othersResult.rows, shippingZip)
+      : othersResult.rows.map((r) => r.id);
+
+    const candidates = preferred ? [preferred, ...others] : others;
     if (candidates.length === 0) {
       throw new Error(`Tenant ${tenantId} has no warehouse location to allocate against`);
     }

@@ -1,0 +1,17 @@
+-- Adds the piece CLAUDE.md §8 Phase 4 has flagged as an explicitly open gap
+-- since multi-warehouse allocation was built: "nearest/cheapest-location-by-
+-- shipping-address routing (no schema support at all yet)". This is that
+-- schema support -- a tenant-supplied US ZIP code for a warehouse location,
+-- letting OrderService.allocateOrder() rank its non-preferred fallback
+-- candidates nearest-first to an order's shipping address instead of purely
+-- oldest-created-first.
+--
+-- Nullable and free-text, deliberately: a location created before this
+-- migration (or one a tenant never bothers to set a ZIP for) simply has
+-- unknown distance to every order -- allocateOrder() falls back to the
+-- pre-existing oldest-created-first order for it, not an error. No format
+-- CHECK constraint either -- the `zipcodes` package this feature is built on
+-- (see OrderService's own doc comment) already treats an unrecognized value
+-- as "distance unknown" rather than throwing, so a constraint here would only
+-- reject input this codebase already handles gracefully downstream.
+ALTER TABLE locations ADD COLUMN postal_code TEXT;

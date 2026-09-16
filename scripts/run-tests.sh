@@ -44,6 +44,7 @@ SAFE_TESTS=(
   "packages/order-service/test/persist-and-allocate.test.ts"
   "packages/order-service/test/allocation-concurrency.test.ts"
   "packages/order-service/test/multi-warehouse-allocation.test.ts"
+  "packages/order-service/test/nearest-location-routing.test.ts"
   "packages/order-service/test/early-cancellation.test.ts"
   "packages/order-service/test/cancel-order.test.ts"
   "packages/order-service/test/lifecycle-transitions.test.ts"

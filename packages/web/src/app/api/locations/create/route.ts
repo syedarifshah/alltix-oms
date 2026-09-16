@@ -40,6 +40,11 @@ export async function POST(req: NextRequest): Promise<Response> {
   const formData = await req.formData();
   const name = String(formData.get("name") ?? "").trim();
   const type = String(formData.get("type") ?? "").trim();
+  // Optional -- see migration 0027_locations_postal_code.sql's own comment
+  // for why this is nullable/unvalidated rather than required or format-
+  // checked: a location with none just has unknown distance to every order,
+  // the same graceful fallback an unrecognized value already gets.
+  const postalCode = String(formData.get("postalCode") ?? "").trim() || null;
 
   if (!name || !type) {
     return redirectWithError(req, "/locations", "location_missing_fields");
@@ -50,7 +55,12 @@ export async function POST(req: NextRequest): Promise<Response> {
 
   try {
     await withTenant(getAppPool(), user.tenantId, (client) =>
-      client.query(`INSERT INTO locations (tenant_id, name, type) VALUES ($1, $2, $3)`, [user.tenantId, name, type]),
+      client.query(`INSERT INTO locations (tenant_id, name, type, postal_code) VALUES ($1, $2, $3, $4)`, [
+        user.tenantId,
+        name,
+        type,
+        postalCode,
+      ]),
     );
   } catch (err) {
     return redirectWithError(req, "/locations", `location_create_failed:${errorMessage(err)}`);

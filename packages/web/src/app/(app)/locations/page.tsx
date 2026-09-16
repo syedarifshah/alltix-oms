@@ -13,13 +13,19 @@ interface LocationRow {
   id: string;
   name: string;
   type: LocationType;
+  postal_code: string | null;
   created_at: string;
   product_count: string;
   total_on_hand: string;
 }
 
 interface LocationsPageProps {
-  searchParams: Promise<{ error?: string; location_created?: string; location_renamed?: string }>;
+  searchParams: Promise<{
+    error?: string;
+    location_created?: string;
+    location_renamed?: string;
+    location_postal_code_set?: string;
+  }>;
 }
 
 const LOCATION_TYPE_OPTIONS: Array<{ value: LocationType; label: string }> = [
@@ -40,7 +46,11 @@ const LOCATION_TYPE_OPTIONS: Array<{ value: LocationType; label: string }> = [
  * locations) and the rules engine's route_to_warehouse action (needs a real
  * location id to point at). Create + rename only -- see the rename route's
  * own doc comment for why `type` is fixed after creation and why there's no
- * delete.
+ * delete. A location's ZIP code (migration 0027_locations_postal_code.sql,
+ * set via its own dedicated SetPostalCodeForm/route below) is the newest
+ * editable field -- optional, feeds OrderService's nearest-location ranking
+ * (CLAUDE.md §8 Phase 4), and shares none of `type`'s immutability
+ * reasoning.
  *
  * The product/stock columns are a read-only summary straight off
  * inventory_levels (CLAUDE.md §2.2's derived rollup) -- purely informational,
@@ -59,7 +69,12 @@ export default async function LocationsPage({ searchParams }: LocationsPageProps
 
   const pool = getAppPool();
   const tenantId = await resolveTenantId(pool, authContext.clerkUserId);
-  const { error, location_created: locationCreated, location_renamed: locationRenamed } = await searchParams;
+  const {
+    error,
+    location_created: locationCreated,
+    location_renamed: locationRenamed,
+    location_postal_code_set: locationPostalCodeSet,
+  } = await searchParams;
 
   if (!tenantId) {
     return (
@@ -72,7 +87,7 @@ export default async function LocationsPage({ searchParams }: LocationsPageProps
 
   const locations = await withTenant(pool, tenantId, async (client) => {
     const result = await client.query<LocationRow>(
-      `SELECT loc.id, loc.name, loc.type, loc.created_at,
+      `SELECT loc.id, loc.name, loc.type, loc.postal_code, loc.created_at,
               count(il.product_id)::text AS product_count,
               coalesce(sum(il.on_hand), 0)::text AS total_on_hand
          FROM locations loc
@@ -86,10 +101,15 @@ export default async function LocationsPage({ searchParams }: LocationsPageProps
   return (
     <main className="page">
       <h1>Locations</h1>
-      <p className="subtitle">Warehouses, 3PLs, and FBA/WFS placeholders you can allocate, pick, and transfer stock between.</p>
+      <p className="subtitle">
+        Warehouses, 3PLs, and FBA/WFS placeholders you can allocate, pick, and transfer stock between. A warehouse
+        with a ZIP code set is preferred nearest-first when an order's shipping address resolves to a US ZIP;
+        leaving it blank keeps this location in the original oldest-added order.
+      </p>
 
       {locationCreated === "1" && <div className="alert alert-success">Location added.</div>}
       {locationRenamed === "1" && <div className="alert alert-success">Location renamed.</div>}
+      {locationPostalCodeSet === "1" && <div className="alert alert-success">Location ZIP code updated.</div>}
       {error && <div className="alert alert-danger">{describeError(error)}</div>}
 
       <details className="stack" style={{ marginBottom: 16 }}>
@@ -103,6 +123,7 @@ export default async function LocationsPage({ searchParams }: LocationsPageProps
               </option>
             ))}
           </select>
+          <input type="text" name="postalCode" placeholder="ZIP (optional)" style={{ width: 100 }} />
           <button type="submit">Add location</button>
         </form>
       </details>
@@ -116,10 +137,12 @@ export default async function LocationsPage({ searchParams }: LocationsPageProps
               <tr>
                 <th>Name</th>
                 <th>Type</th>
+                <th>ZIP</th>
                 <th>Products</th>
                 <th>Total on hand</th>
                 <th>Created</th>
                 <th>Rename</th>
+                <th>Set ZIP</th>
               </tr>
             </thead>
             <tbody>
@@ -129,11 +152,15 @@ export default async function LocationsPage({ searchParams }: LocationsPageProps
                   <td>
                     <span className="badge">{location.type}</span>
                   </td>
+                  <td>{location.postal_code ?? <span className="muted">not set</span>}</td>
                   <td>{location.product_count}</td>
                   <td>{location.total_on_hand}</td>
                   <td>{new Date(location.created_at).toISOString()}</td>
                   <td>
                     <RenameLocationForm locationId={location.id} currentName={location.name} />
+                  </td>
+                  <td>
+                    <SetPostalCodeForm locationId={location.id} currentPostalCode={location.postal_code} />
                   </td>
                 </tr>
               ))}
@@ -159,6 +186,33 @@ function RenameLocationForm({ locationId, currentName }: { locationId: string; c
   );
 }
 
+/** Plain HTML form, no client JS -- same convention as RenameLocationForm
+ *  above, and a separate form/route from it for the same reason
+ *  set-postal-code/route.ts's own doc comment gives. An empty submission is
+ *  a valid, deliberate "clear it back to unknown" action, so this has no
+ *  `required` attribute -- unlike RenameLocationForm's `name` field, which
+ *  can never legitimately be blank. */
+function SetPostalCodeForm({
+  locationId,
+  currentPostalCode,
+}: {
+  locationId: string;
+  currentPostalCode: string | null;
+}): ReactElement {
+  return (
+    <form action={`/api/locations/${locationId}/set-postal-code`} method="POST" className="row" style={{ gap: 6 }}>
+      <input
+        type="text"
+        name="postalCode"
+        defaultValue={currentPostalCode ?? ""}
+        placeholder="ZIP"
+        style={{ width: 90 }}
+      />
+      <button type="submit">Save</button>
+    </form>
+  );
+}
+
 function describeError(error: string): string {
   if (error === "location_missing_fields") return "Enter a name (and a type, if you're adding a location) before submitting.";
   if (error === "location_invalid_type") return "Choose one of the listed location types.";
@@ -168,6 +222,9 @@ function describeError(error: string): string {
   }
   if (error.startsWith("location_rename_failed:")) {
     return `Could not rename that location: ${error.slice("location_rename_failed:".length)}`;
+  }
+  if (error.startsWith("location_postal_code_failed:")) {
+    return `Could not update that location's ZIP code: ${error.slice("location_postal_code_failed:".length)}`;
   }
   return error;
 }
