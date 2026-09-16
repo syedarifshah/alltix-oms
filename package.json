@@ -32,7 +32,8 @@
     "walmart:order-sync-scheduler": "tsx scripts/walmart-order-sync-scheduler.ts",
     "walmart:sandbox-smoke-test": "tsx scripts/walmart-sandbox-smoke-test.ts",
     "ebay:order-sync-job": "tsx scripts/ebay-order-sync-job.ts",
-    "ebay:order-sync-scheduler": "tsx scripts/ebay-order-sync-scheduler.ts"
+    "ebay:order-sync-scheduler": "tsx scripts/ebay-order-sync-scheduler.ts",
+    "ebay:sandbox-smoke-test": "tsx scripts/ebay-sandbox-smoke-test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
