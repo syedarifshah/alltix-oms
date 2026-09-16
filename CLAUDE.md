@@ -551,6 +551,12 @@ listing creation" paragraph) — same synchronous-write reasoning as Amazon's/Sh
 own `createListing()`, so it's a separate connector-specific method too, not the shared
 `submitListing`/`getFeedStatus` pair.
 
+Channel #5 (Temu, §4.7) also does NOT implement this interface, same shape as eBay's own
+original build before `createListing()` existed — `authenticate`/`pullOrders`/
+`pushInventory`/`confirmShipment` only, no `submitListing`/`getFeedStatus`/
+`subscribeToEvents`, and (per Arif's own explicit scope decision) no outbound listing
+creation at all this pass either.
+
 ### 4.4 Handling API rate limits (critical — causes most production incidents)
 
 - Central **rate-limited job queue** per tenant, per marketplace, per endpoint —
@@ -1044,6 +1050,142 @@ own `createListing()`, so it's a separate connector-specific method too, not the
   credentials, exactly the status Amazon and Walmart each carried before their own
   first live pass.
 
+### 4.7 Temu Open Platform (channel #5 — Arif's explicit pick, "add temu")
+
+- **Why now, and what scope**: Arif's own explicit request ("add temu and HR & Payroll"),
+  clarified via an explicit follow-up decision: **"Full connector, like eBay"** — meaning
+  eBay's own ORIGINAL v1 scope (§4.6, before its later, separate `createListing()`
+  addition), not the full outbound-listing-capable connector eBay is today. So this is
+  `authenticate()` / `pullOrders()` / `pushInventory()` / `confirmShipment()` only — no
+  outbound listing creation this pass, even though Temu's own API surface has plenty of
+  listing-creation methods (`bg.local.goods.add` and friends) that were deliberately not
+  built.
+- **Research trail — the least accessible official documentation of any channel in this
+  codebase, worse than eBay's own merely-thin doc pages**: `partner[-us/-eu].temu.com/
+  documentation` is a pure JavaScript SPA — every page fetched during this connector's
+  research pass (including a literal, search-surfaced "Signature Method for API request"
+  page and a literal "bg.local.goods.stock.edit" reference page) returned only "You need
+  to enable JavaScript to run this app." No official Temu documentation content was
+  readable at all, by any method tried, this entire research pass — a strictly worse
+  starting position than eBay's (where the pages at least rendered, just thin).
+  - Pivoted to the real, installed community Python SDK `temu_api` (PyPI, v0.2.1,
+    `github.com/XIE7654/temu_api`) — installed into a scratch venv and its source read
+    directly. This is the PRIMARY confirmed source for the base URL pattern, the signing
+    algorithm, and every REQUEST parameter name in this connector — same "an installed
+    package's real source is more authoritative than a rendered doc page" precedent this
+    codebase's own Sentry integration first established.
+  - The installed SDK's own `request()` method returns raw `response.json()` with NO
+    envelope parsing of its own — meaning even the SDK doesn't confirm what a RESPONSE
+    actually looks like, success or failure. Every other source tried (a community Go
+    SDK whose doc pages truncated before showing full struct fields, a third-party
+    integration-platform doc site, a GitHub repo whose README named literal
+    example-response filenames) either rendered no example or — in one specific case
+    worth flagging — turned out to document a same-named but entirely UNRELATED
+    third-party Temu-product-SCRAPING API (idatariver.com's, not Temu's own Open
+    Platform), which would have been a wrong confirmation if used without checking.
+  - Net effect: this connector's REQUEST shapes are confirmed from real SDK source;
+    its RESPONSE shapes (the envelope, and every field on an order/line item) are this
+    codebase's best-effort inference from Temu's own consistent camelCase
+    request-naming convention and common Alibaba-TOP-API-gateway envelope shapes —
+    genuinely unconfirmed, not documented fact. See
+    `packages/channel-connectors/src/temu-connector.ts`'s own header comment and each
+    method's own doc comment for exactly what's confirmed where.
+- **Auth**: not OAuth — an `appKey`/`appSecret`/`accessToken` triple issued directly to a
+  Temu Open Platform application, with the `accessToken` used directly on every signed
+  request (confirmed: the installed SDK never exchanges or refreshes it). Closer in shape
+  to Shopify's static `shpat_...` token than to Amazon's/eBay's refresh-token exchange,
+  just three values instead of one. `authenticate()` calls `bg.open.accesstoken.info.get`
+  (the closest thing this SDK exposes to a verify-these-credentials-work call) and
+  returns a far-future placeholder `expiresAt`, same shape
+  `ShopifyConnector.authenticate()` uses for its own non-expiring token.
+- **Signing** (`buildTemuSignature`, confirmed verbatim from the installed SDK's
+  `BaseClient._get_sign()`): sort every param key alphabetically, concatenate each as
+  `key` immediately followed by `value` with no separators, strip spaces, wrap as
+  `appSecret + concatenated + appSecret`, MD5, uppercase hex. Every request also carries
+  `type` (the specific API method, e.g. `"bg.order.list.v2.get"`) — this is an
+  Alibaba-TOP-API-style single-endpoint-plus-`type`-param design (`POST
+  {baseUrl}/openapi/router` for everything), common among Chinese e-commerce open
+  platforms, unlike every other channel in this codebase's own distinct-URL-per-operation
+  REST shape.
+- **`pullOrders()`**: two calls per discovered order, mirroring this codebase's own Amazon
+  precedent exactly (§4.1: "order headers vs. a separate line-items call") —
+  `bg.order.list.v2.get` for headers filtered by `createAfter` (unix seconds, the closest
+  confirmed analog to every other connector's `since` cursor), then
+  `bg.order.detail.v2.get(parentOrderSn)` per header for line items. `pageSize` capped at
+  100 with no pagination loop beyond the first page — a real, documented gap, same status
+  as eBay's own 200-row/no-pagination narrowing. **Shipping address is deliberately not
+  fetched** — `bg.order.shippinginfo.v2.get` is a real, confirmed, separate THIRD call
+  this v1 pass doesn't make; `extractUsShippingZip()` (`packages/order-service/src/
+  index.ts`) has no `'temu'` case, so a Temu order's nearest-location ranking simply falls
+  back to the pre-existing oldest-created-first default rather than erroring.
+- **`pushInventory()` — structurally different from every other connector's**: Temu's
+  confirmed request shape is `bg.local.goods.stock.edit` with a required `goodsId` plus a
+  `skuStockTargetList` array of per-SKU entries under that one parent listing — not a flat
+  single-SKU identifier. Since nothing in this codebase calls `pushInventory()`
+  generically across channels (confirmed by grep before building this — every call site
+  is channel-specific), `productId` for Temu is DELIBERATELY a compound string,
+  `"<goodsId>:<skuId>"` (`parseTemuProductId`); a Temu `channel_listings` row stores
+  `goodsId` in `external_id` and `skuId` in `external_sku`. Uses `skuStockTargetList`
+  (absolute) over `skuStockChangeList` (relative), same "system of truth pushes absolute"
+  reasoning `ShopifyConnector.pushInventory()`'s own doc comment gives. **The single
+  least-confirmed request body in this entire connector**: the inner
+  `skuStockTargetList` entry's own field names (guessed as `skuId`/`targetStockQuantity`)
+  were not found in ANY source tried this research pass.
+- **`confirmShipment()`**: uses `bg.order.fulfillment.info.sync` — chosen over the two
+  other shipment-confirmation methods this API exposes
+  (`bg.logistics.shipment.v2.confirm`'s `sendRequestList`, or the
+  discover-then-confirm `bg.order.unshipped.package.get` +
+  `bg.logistics.shipped.package.confirm` pair) specifically because it's the only one
+  with flat, individually-confirmed top-level scalar fields and no unconfirmed nested
+  list — same "prefer the confirmed synchronous shape over an unconfirmed batch one"
+  reasoning behind Amazon's own Listings-Items-API-over-Feeds-API choice for
+  `pushInventory()` (§4.1). Two real, documented narrowings: `tracking.carrier` is
+  silently discarded (this endpoint's confirmed field set has no carrier-code parameter
+  at all), and `orderSn` is passed this method's whole-order `orderId` even though the
+  endpoint's own docstring literally labels that parameter a SUB-order number, not a
+  parent order number — an honestly-flagged, unconfirmed risk, not a resolved decision
+  (same "single-fulfillment assumption" narrowing every other connector's own
+  `confirmShipment()` already carries, just with a real naming-mismatch risk on top).
+- **No new migration needed** — Temu's three-value credential reuses existing
+  `channel_connections` columns exactly the way Walmart's/eBay's own connect routes
+  already reuse `lwa_client_id` for a non-Amazon client id: `lwa_client_id` = `appKey`
+  (also reused into `external_account_id`, same "no independent seller id" pattern
+  Walmart/eBay both established), `encrypted_client_secret` = `appSecret`,
+  `encrypted_access_token` (added by migration `0019_channel_connections_shopify.sql` for
+  Shopify's own static token) = `accessToken` — the identical "long-lived, high-value,
+  used directly" semantic Shopify's row already uses that column for, just under a
+  different channel.
+- **Wired into the app**, mirroring eBay's own wiring exactly: `/settings/channels` has a
+  plain "Connect Temu" form (App Key + App Secret + Access Token, all required every
+  submission, no OAuth redirect — same shape as Walmart's/Shopify's own static-credential
+  forms) that POSTs to `/api/channels/temu/connect`, which calls
+  `TemuConnector.authenticate()` live to reject a bad triple before persisting anything.
+  The scheduler (`packages/scheduler/src/{index,cron-runner}.ts`) runs a Temu order-sync
+  pass in parallel to the other four — `syncTemuOrders`/`runTemuOrderSyncJob`/
+  `startTemuOrderSyncScheduler`, a separate node-cron task and separate
+  `scripts/temu-order-sync-{job,scheduler}.ts` entrypoints. What actually triggers a sync
+  on this app's Vercel deployment is `GET /api/cron/temu-order-sync` (same `CRON_SECRET`
+  Bearer-token gate, same idempotency contract as the other four cron routes) plus its
+  `crons` entry in `vercel.json` (`30 6 * * *`, staggered 30 minutes after eBay's own
+  order-sync cron). `WarehouseService.confirmShipment()` dispatches to
+  `createTemuConnectorFromChannelConnection` on `order.channel === "temu"`, alongside the
+  other four branches. `recordSyncFailure`/`recordSyncSuccess`/`recordRateLimitTrip`'s
+  `channel` parameter type was widened to include `"temu"`.
+- **Does NOT implement the shared `ChannelConnector` interface** — same shape decision as
+  Amazon/eBay (§4.3): a plain class with only the four v1 methods, no
+  `submitListing()`/`getFeedStatus()`/`subscribeToEvents()`.
+- **UNVERIFIED IN ITS ENTIRETY, more so than any other channel in this codebase,
+  including eBay**: unlike eBay (where this repo's own network policy, not readability,
+  was the blocker — the doc pages at least rendered), Temu's documentation was simply
+  never readable by any method tried. No Temu credentials of any kind exist anywhere in
+  this codebase yet (see `.env.example`'s `TEMU_*` entries) — this is a well-researched
+  first draft, in the same "sandbox-first, never guess straight into production" spirit
+  every other connector's own first pass carries (§7, §11 item 5), not a proven
+  implementation. Pure mapping logic (`normalizeTemuOrder`/`normalizeTemuOrderLine`,
+  `buildTemuSignature`/`buildTemuRequestBody`, `parseTemuProductId`) is unit-tested
+  (`packages/channel-connectors/test/temu-connector.test.ts`, 19 tests) — everything past
+  that boundary stays unverified until run against real credentials.
+
 ## 5. Technology Stack
 
 | Layer | Choice | Why |
@@ -1178,9 +1320,9 @@ own `createListing()`, so it's a separate connector-specific method too, not the
     Phase 4 — not a change to the phase order itself, just worth deciding deliberately
     rather than by default. The `/reports` first pass above doesn't resolve this
     either way — it's cheap enough at today's volume that the decision can still wait.
-- **Phase 5 — Scale features (Months 9-12+)**: eBay — built ahead of the rest of this
-  phase, see §4.6 — /TikTok Shop/additional channels. Stock forecasting. B2B portal (if
-  pursuing Cin7-style ERP breadth). SOC 2 prep if
+- **Phase 5 — Scale features (Months 9-12+)**: eBay and Temu — both built ahead of the
+  rest of this phase, see §4.6/§4.7 — /TikTok Shop/additional channels. Stock
+  forecasting. B2B portal (if pursuing Cin7-style ERP breadth). SOC 2 prep if
   targeting mid-market.
 
 ## 9. Deployment & DevOps

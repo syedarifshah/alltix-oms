@@ -14,6 +14,7 @@ import {
   createShopifyConnectorFromChannelConnection,
   createWalmartConnectorFromChannelConnection,
   createEbayConnectorFromChannelConnection,
+  createTemuConnectorFromChannelConnection,
   type TrackingInfo,
 } from "@alltix/channel-connectors";
 import type { OrderService } from "@alltix/order-service";
@@ -856,6 +857,9 @@ export class WarehouseService {
       await connector.confirmShipment(order.external_order_id, tracking);
     } else if (order.channel === "ebay") {
       const connector = await createEbayConnectorFromChannelConnection(this.pool, tenantId);
+      await connector.confirmShipment(order.external_order_id, tracking);
+    } else if (order.channel === "temu") {
+      const connector = await createTemuConnectorFromChannelConnection(this.pool, tenantId);
       await connector.confirmShipment(order.external_order_id, tracking);
     } else {
       throw new Error(

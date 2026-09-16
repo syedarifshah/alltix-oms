@@ -5,4 +5,5 @@ export * from "./walmart-connector.js";
 export * from "./shopify-connector.js";
 export * from "./ebay-connector.js";
 export * from "./ebay-oauth.js";
+export * from "./temu-connector.js";
 export * from "./retry.js";

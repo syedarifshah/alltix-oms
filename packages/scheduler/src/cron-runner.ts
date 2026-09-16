@@ -6,6 +6,7 @@ import {
   runShopifyOrderSyncJob,
   runWalmartOrderSyncJob,
   runEbayOrderSyncJob,
+  runTemuOrderSyncJob,
   type TenantSyncResult,
 } from "./index.js";
 
@@ -495,6 +496,109 @@ export function startEbayOrderSyncScheduler(options: EbayOrderSyncSchedulerOptio
   console.log(
     JSON.stringify({
       event: "ebay_order_sync_scheduler_started",
+      cronExpression,
+      timezone: timezone ?? "system default",
+      at: new Date().toISOString(),
+    }),
+  );
+
+  return task;
+}
+
+// -- Temu counterparts. Same parallel-function call as the other three
+// above -- still not enough shared shape to justify a generic abstraction
+// with five channels wired this way, and temu_order_sync_run needs to stay
+// its own distinguishable log event same as the other four.
+
+const DEFAULT_TEMU_CRON_EXPRESSION = "*/5 * * * *"; // every 5 minutes, same conservative default as the other four
+
+export interface TemuOrderSyncSchedulerOptions {
+  appPool: Pool;
+  adminPool: Pool;
+  cronExpression?: string;
+  timezone?: string;
+  maxRetries?: number;
+  retryDelayMs?: number;
+}
+
+/** Temu counterpart to {@link runEbayOnceWithRetry} -- see its doc comment
+ *  for the retry contract (systemic-failure-only; a single tenant's failure
+ *  is already caught and returned as a non-throwing result inside
+ *  runTemuOrderSyncJob's own syncTemuTenant). */
+export async function runTemuOnceWithRetry(
+  appPool: Pool,
+  adminPool: Pool,
+  maxRetries: number = DEFAULT_MAX_RETRIES,
+  retryDelayMs: number = DEFAULT_RETRY_DELAY_MS,
+): Promise<void> {
+  const startedAt = Date.now();
+  const runId = new Date(startedAt).toISOString();
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      const results = await runTemuOrderSyncJob(appPool, adminPool);
+      console.log(
+        JSON.stringify({
+          event: "temu_order_sync_run",
+          runId,
+          attempt,
+          success: true,
+          durationMs: Date.now() - startedAt,
+          ...summarizeResults(results),
+        }),
+      );
+      return;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const willRetry = attempt <= maxRetries;
+      console.error(
+        JSON.stringify({
+          event: "temu_order_sync_run",
+          runId,
+          attempt,
+          success: false,
+          durationMs: Date.now() - startedAt,
+          error: message,
+          willRetry,
+        }),
+      );
+      if (!willRetry) {
+        captureError(err, { event: "temu_order_sync_run", runId, attempt });
+        return;
+      }
+      await sleep(retryDelayMs * attempt);
+    }
+  }
+}
+
+/** Temu counterpart to {@link startEbayOrderSyncScheduler} -- same
+ *  noOverlap reasoning (two overlapping passes could race to write the same
+ *  tenant's channel_connections.last_order_sync_at row). A separate
+ *  node-cron task from the other four, so all five channels' polling
+ *  cadences can be tuned independently and started/stopped on their own. */
+export function startTemuOrderSyncScheduler(options: TemuOrderSyncSchedulerOptions): ScheduledTask {
+  const {
+    appPool,
+    adminPool,
+    cronExpression = DEFAULT_TEMU_CRON_EXPRESSION,
+    timezone,
+    maxRetries = DEFAULT_MAX_RETRIES,
+    retryDelayMs = DEFAULT_RETRY_DELAY_MS,
+  } = options;
+
+  const task = schedule(cronExpression, () => runTemuOnceWithRetry(appPool, adminPool, maxRetries, retryDelayMs), {
+    name: "temu-order-sync",
+    noOverlap: true,
+    timezone,
+  });
+
+  task.on("execution:overlap", () => {
+    console.warn(JSON.stringify({ event: "temu_order_sync_skipped_overlap", at: new Date().toISOString() }));
+  });
+
+  console.log(
+    JSON.stringify({
+      event: "temu_order_sync_scheduler_started",
       cronExpression,
       timezone: timezone ?? "system default",
       at: new Date().toISOString(),

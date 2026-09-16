@@ -74,6 +74,16 @@ interface EbayConnectionRow extends FailureTrackingColumns {
   ebay_merchant_location_key: string | null;
 }
 
+/** Temu's row, like Walmart's/eBay's, has no independent seller id and no
+ *  marketplace concept worth showing -- external_account_id reuses the
+ *  tenant's own Temu appKey (see the connect route's own comment for why). */
+interface TemuConnectionRow extends FailureTrackingColumns {
+  external_account_id: string;
+  status: string;
+  created_at: string;
+  last_order_sync_at: string | null;
+}
+
 /** Sandbox vs. production is never stored as its own column (see
  *  packages/db/migrations/0012_channel_connections.sql) -- the connection's
  *  own lwa_client_id is compared against this process's known sandbox/
@@ -168,7 +178,7 @@ export default async function ChannelsSettingsPage({
     );
   }
 
-  const { connection, shopifyConnection, walmartConnection, ebayConnection } = await withTenant(
+  const { connection, shopifyConnection, walmartConnection, ebayConnection, temuConnection } = await withTenant(
     pool,
     tenantId,
     async (client) => {
@@ -207,11 +217,20 @@ export default async function ChannelsSettingsPage({
           ORDER BY created_at DESC
           LIMIT 1`,
       );
+      const temuResult = await client.query<TemuConnectionRow>(
+        `SELECT external_account_id, status, created_at, last_order_sync_at,
+                consecutive_failures, last_failure_at, last_failure_message
+           FROM channel_connections
+          WHERE channel = 'temu'
+          ORDER BY created_at DESC
+          LIMIT 1`,
+      );
       return {
         connection: amazonResult.rows[0] ?? null,
         shopifyConnection: shopifyResult.rows[0] ?? null,
         walmartConnection: walmartResult.rows[0] ?? null,
         ebayConnection: ebayResult.rows[0] ?? null,
+        temuConnection: temuResult.rows[0] ?? null,
       };
     },
   );
@@ -221,6 +240,7 @@ export default async function ChannelsSettingsPage({
   const isShopifyConnected = shopifyConnection?.status === "active";
   const isWalmartConnected = walmartConnection?.status === "active";
   const isEbayConnected = ebayConnection?.status === "active";
+  const isTemuConnected = temuConnection?.status === "active";
   const hasEbaySellingSetup =
     !!ebayConnection?.ebay_fulfillment_policy_id &&
     !!ebayConnection?.ebay_payment_policy_id &&
@@ -252,15 +272,17 @@ export default async function ChannelsSettingsPage({
     <main className="page">
       <h1>Channels</h1>
       <p className="subtitle">
-        Amazon, Shopify, Walmart, and eBay connectors. Walmart&apos;s and eBay&apos;s wiring is complete but
-        UNVERIFIED against real infrastructure (no self-serve sandbox exists for either the way Shopify/Amazon
-        have one, and this environment can&apos;t even reach eBay&apos;s API hosts at all) — connecting will
-        correctly fail here until real credentials exist and a real consent/token round trip has happened.
+        Amazon, Shopify, Walmart, eBay, and Temu connectors. Walmart&apos;s, eBay&apos;s, and Temu&apos;s wiring is
+        complete but UNVERIFIED against real infrastructure (no self-serve sandbox exists for any of the three the
+        way Shopify/Amazon have one, this environment can&apos;t even reach eBay&apos;s API hosts at all, and
+        Temu&apos;s own documentation could not be read by any method tried during its research pass) — connecting
+        will correctly fail here until real credentials exist and a real round trip has happened.
       </p>
 
       {connected === "amazon" && <div className="alert alert-success">Amazon connected.</div>}
       {connected === "walmart" && <div className="alert alert-success">Walmart connected.</div>}
       {connected === "ebay" && <div className="alert alert-success">eBay connected.</div>}
+      {connected === "temu" && <div className="alert alert-success">Temu connected.</div>}
       {connected === "ebay_policies" && <div className="alert alert-success">eBay business policies saved.</div>}
       {connected === "ebay_location" && <div className="alert alert-success">eBay merchant location created.</div>}
       {connected === "shopify" && (
@@ -282,10 +304,12 @@ export default async function ChannelsSettingsPage({
       {error?.startsWith("ebay_") && !error.startsWith("ebay_policies_") && !error.startsWith("ebay_location_") && (
         <div className="alert alert-danger">eBay connection failed ({error}).</div>
       )}
+      {error?.startsWith("temu_") && <div className="alert alert-danger">Temu connection failed ({error}).</div>}
       {error &&
         !error.startsWith("shopify_") &&
         !error.startsWith("walmart_") &&
         !error.startsWith("ebay_") &&
+        !error.startsWith("temu_") &&
         // Amazon's own error codes (e.g. "missing_callback_params",
         // "invalid_or_expired_state", "token_exchange_failed") were written
         // before any other channel had its own OAuth-redirect flow, so
@@ -472,6 +496,46 @@ export default async function ChannelsSettingsPage({
           <a href="/api/channels/ebay/connect">Connect eBay</a>
         )}
       </div>
+
+      <h2>Temu</h2>
+      <div className="card">
+        {temuConnection ? (
+          <div className="stack">
+            <div className="row">
+              <span className={isTemuConnected ? "badge badge-success" : "badge badge-danger"}>
+                {temuConnection.status}
+              </span>
+              <span className="muted">app key {temuConnection.external_account_id}</span>
+            </div>
+            <div className="muted">Connected since {new Date(temuConnection.created_at).toISOString()}</div>
+            <div className="muted">
+              Last order sync:{" "}
+              {temuConnection.last_order_sync_at
+                ? new Date(temuConnection.last_order_sync_at).toISOString()
+                : "never synced yet"}
+            </div>
+            <div className="alert alert-info" style={{ marginTop: 8, marginBottom: 0 }}>
+              UNVERIFIED against real Temu infrastructure, more so than any other channel here -- Temu&apos;s own
+              documentation could not be read by any method tried during this connector&apos;s research pass (see
+              TemuConnector&apos;s own class doc comment), and no Temu credentials of any kind exist anywhere in
+              this codebase yet. Order sync failures are no longer silent, though — see below if this connection
+              has started failing.
+            </div>
+            <SyncFailureBanner
+              status={temuConnection.status}
+              consecutive_failures={temuConnection.consecutive_failures}
+              last_failure_at={temuConnection.last_failure_at}
+              last_failure_message={temuConnection.last_failure_message}
+            />
+            {/* No OAuth reconnect redirect (same reasoning as Walmart's own
+                form here) -- reconnecting means re-submitting this form with
+                a fresh/corrected appKey+appSecret+accessToken triple. */}
+            <TemuConnectForm buttonLabel="Reconnect Temu" />
+          </div>
+        ) : (
+          <TemuConnectForm buttonLabel="Connect Temu" />
+        )}
+      </div>
     </main>
   );
 }
@@ -637,6 +701,39 @@ function EbayMerchantLocationForm(): ReactElement {
         <input type="text" name="country" placeholder="US" maxLength={2} required />
       </label>
       <button type="submit">Create merchant location</button>
+    </form>
+  );
+}
+
+/**
+ * Temu has no OAuth consent screen either -- an App Key, App Secret, and
+ * Access Token, issued directly to the tenant's own Temu Open Platform
+ * application, are typed into this plain HTML form and POSTed to
+ * /api/channels/temu/connect in one step, which authenticates the triple
+ * live before persisting anything (same "verify before persist" discipline
+ * as WalmartConnectForm above).
+ *
+ * All three fields are required every submission, including on reconnect --
+ * same "no leave-blank-to-keep-the-existing-secret affordance" as
+ * WalmartConnectForm, for the same reason (no separate cron-only fallback
+ * mode to fall back to if one field is left out).
+ */
+function TemuConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElement {
+  return (
+    <form action="/api/channels/temu/connect" method="POST" className="stack" style={{ marginTop: 8 }}>
+      <label>
+        App key
+        <input type="text" name="appKey" placeholder="Temu Open Platform app key" required />
+      </label>
+      <label>
+        App secret
+        <input type="password" name="appSecret" placeholder="Temu Open Platform app secret" required />
+      </label>
+      <label>
+        Access token
+        <input type="password" name="accessToken" placeholder="Temu Open Platform access token" required />
+      </label>
+      <button type="submit">{buttonLabel}</button>
     </form>
   );
 }
