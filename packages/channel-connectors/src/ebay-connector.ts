@@ -34,16 +34,21 @@ import { fetchWithBackoff } from "./retry.js";
 // method's own doc comment for exactly what was confirmed where.
 //
 // V1 SCOPE: authenticate() / pullOrders() / pushInventory() /
-// confirmShipment() only -- the same four methods Amazon and Walmart each
-// got built first, before either got outbound listing creation as a
-// separate, later, explicitly-picked task. No eBay listing-creation path is
-// built here, deliberately: eBay's own three-step Inventory API flow
-// (createOrReplaceInventoryItem -> createOffer -> publishOffer) needs
-// tenant-level business policies (payment/return/fulfillment policy ids)
-// and a merchantLocationKey this codebase has no onboarding flow for at
-// all yet -- a strictly bigger prerequisite gap than even Amazon's deferred
-// Product Type Definitions API scope. Revisit as its own task if/when
-// picked, the same way Amazon's/Walmart's listing creation was.
+// confirmShipment() -- the same four methods Amazon and Walmart each got
+// built first, before either got outbound listing creation as a separate,
+// later, explicitly-picked task -- PLUS createListing(), added once the
+// prerequisite gap this file used to describe as "out of scope entirely"
+// was itself closed (see fetchBusinessPolicies()/createMerchantLocation()
+// below and migration 0026_channel_connections_ebay_selling_setup.sql).
+// eBay's own three-step Inventory API flow (createOrReplaceInventoryItem ->
+// createOffer -> publishOffer) needs tenant-level business policies
+// (payment/return/fulfillment policy ids) and a merchantLocationKey --
+// this codebase does NOT create business policies on a tenant's behalf
+// (that's its own, bigger scope -- see fetchBusinessPolicies()'s own doc
+// comment for why), only reads the ones a tenant has already set up in
+// their own eBay account; merchant locations ARE created by this codebase
+// (createMerchantLocation()), since that prerequisite is small and bounded
+// enough to build in full, unlike business policies.
 
 const EBAY_API_PRODUCTION_BASE_URL = "https://api.ebay.com";
 /** Naming-convention inference, NOT individually doc-confirmed the way the
@@ -79,6 +84,19 @@ export interface EbayCredentials {
    *  token itself, with no Amazon-style path-segment identifier needed on
    *  any call this connector makes. */
   refreshToken: string;
+  /** The four fields createListing() needs and none of the other three
+   *  methods on this class do -- see migration
+   *  0026_channel_connections_ebay_selling_setup.sql's own comment for why
+   *  these are plain, unencrypted values (opaque ids, not secrets) and why
+   *  all four are optional here: a connection created before this feature
+   *  existed, or one that's never had its eBay Selling Setup form filled
+   *  in, legitimately has none of them yet. createListing() checks for all
+   *  four itself and fails with an actionable error rather than assuming
+   *  they're present. */
+  fulfillmentPolicyId?: string;
+  paymentPolicyId?: string;
+  returnPolicyId?: string;
+  merchantLocationKey?: string;
 }
 
 interface CachedToken {
@@ -170,6 +188,160 @@ export interface EbayInventoryItem {
   [key: string]: unknown;
 }
 
+/** One entry from GET /sell/account/v1/{fulfillment,payment,return}_policy
+ *  -- only `id`/`name` are declared (same "declare only what's mapped"
+ *  convention EbayOrder/EbayLineItem already use above); the real response
+ *  carries many more policy-type-specific fields (handling time, payment
+ *  methods, return window, etc.) this codebase never reads, since it only
+ *  ever lets a tenant PICK an existing policy, never edits or inspects one
+ *  beyond its name. */
+export interface EbayBusinessPolicySummary {
+  id: string;
+  name: string;
+}
+
+export interface EbayBusinessPolicies {
+  fulfillmentPolicies: EbayBusinessPolicySummary[];
+  paymentPolicies: EbayBusinessPolicySummary[];
+  returnPolicies: EbayBusinessPolicySummary[];
+}
+
+/** Response shape for all three GET .../​{fulfillment,payment,return}_policy
+ *  endpoints -- confirmed as `{fulfillmentPolicyId, name, ...}` for the
+ *  fulfillment case via that type's own `{fulfillmentPolicyId}` path
+ *  parameter on the sibling getFulfillmentPolicy (singular) endpoint
+ *  (developer.ebay.com's own Account API resource listing); the payment/
+ *  return equivalents (`paymentPolicyId`/`returnPolicyId`) follow the same
+ *  confirmed naming convention by direct analogy, not independently
+ *  doc-confirmed each. The plural wrapper field name
+ *  (`fulfillmentPolicies`/`paymentPolicies`/`returnPolicies`) is inferred
+ *  from eBay's own consistent REST pluralization pattern across this API
+ *  family, not confirmed from a literal rendered JSON example -- official
+ *  Account API doc pages fetched during this pass rendered as thin
+ *  navigation pages without one, the same limitation already documented
+ *  throughout this file for several other shapes. */
+interface EbayPolicyListResponse {
+  fulfillmentPolicies?: Array<{ fulfillmentPolicyId: string; name: string }>;
+  paymentPolicies?: Array<{ paymentPolicyId: string; name: string }>;
+  returnPolicies?: Array<{ returnPolicyId: string; name: string }>;
+}
+
+/** Input for {@link EbayConnector.createMerchantLocation} -- confirmed
+ *  minimum viable address shape (developer.ebay.com/api-docs/sell/static/
+ *  inventory/publishing-offers.html: "address with either (city +
+ *  stateOrProvince + country) OR (postalCode + country)") over-satisfied
+ *  here by always collecting all four plus addressLine1, since a real
+ *  merchant address realistically has all of them and eBay's own docs
+ *  don't say a fuller address is ever rejected. `country` is eBay's
+ *  2-letter country code (e.g. "US") -- not independently confirmed
+ *  against an enum list this pass, same "confirmed the shape, not every
+ *  valid value" caveat this file already carries for `shippingCarrierCode`
+ *  in confirmShipment(). */
+export interface EbayMerchantLocationInput {
+  name: string;
+  addressLine1: string;
+  city: string;
+  stateOrProvince: string;
+  postalCode: string;
+  country: string;
+}
+
+/** Input for {@link EbayConnector.createListing} -- deliberately narrower
+ *  than what a full-featured eBay listing tool would collect. `categoryId`
+ *  and `imageUrl` are plain tenant-supplied fields, not looked up or
+ *  validated by this codebase: eBay's category taxonomy (~20,000+
+ *  categories, marketplace-specific, its own separate Taxonomy API) and
+ *  image hosting (this codebase has no image-upload feature anywhere) are
+ *  each their own real scope this pass does not take on -- same "push a
+ *  gap the automation doesn't cover onto a form field the tenant fills in
+ *  themselves" pattern Walmart's own `productCategory` field already
+ *  established for this codebase. A wrong categoryId is rejected by eBay
+ *  itself at publishOffer() time (surfaced as this method's own `error`),
+ *  not validated here. */
+export interface EbayListingSubmission {
+  sellerSku: string;
+  title: string;
+  description: string;
+  imageUrl: string;
+  categoryId: string;
+  /** Money-scalar-compatible string, e.g. "19.99" -- same convention
+   *  AmazonListingSubmission.price/ShopifyListingSubmission.price already
+   *  use. USD only, same v1 simplification as every other channel's own
+   *  outbound listing path in this codebase. */
+  price: string;
+  quantity: number;
+}
+
+export interface EbayListingResult {
+  success: boolean;
+  listingId: string | null;
+  error: string | null;
+}
+
+/** PUT /sell/inventory/v1/inventory_item/{sku} request body shape for a
+ *  brand-new item (as opposed to pushInventory()'s own GET-then-merge
+ *  approach against an item that may already exist) -- condition fixed to
+ *  `"NEW"`, same "new-condition-only is this codebase's v1 scope
+ *  everywhere outbound listing creation appears" rule
+ *  AmazonListingSubmission's own doc comment already documents. */
+export interface CreateEbayInventoryItemBody {
+  condition: "NEW";
+  product: { title: string; description: string; imageUrls: string[] };
+  availability: { shipToLocationAvailability: { quantity: number } };
+}
+
+export function buildEbayInventoryItemBody(input: EbayListingSubmission): CreateEbayInventoryItemBody {
+  return {
+    condition: "NEW",
+    product: { title: input.title, description: input.description, imageUrls: [input.imageUrl] },
+    availability: { shipToLocationAvailability: { quantity: input.quantity } },
+  };
+}
+
+/** POST /sell/inventory/v1/offer request body shape -- field names
+ *  (categoryId, listingDescription, listingPolicies.{fulfillmentPolicyId,
+ *  paymentPolicyId, returnPolicyId}, merchantLocationKey, pricingSummary,
+ *  availableQuantity, format, marketplaceId) confirmed via
+ *  community-fetched generated API-client docs
+ *  (github.com/zVPS/ebay-sell-inventory-php-client's OfferApi.md) cross-
+ *  referenced against developer.ebay.com's own publishing-offers.html
+ *  prose description, since the official createOffer reference page itself
+ *  rendered as a thin navigation page without a literal request-body
+ *  example -- same cross-source confirmation discipline as every other
+ *  eBay shape in this file. `format: "FIXED_PRICE"` and
+ *  `marketplaceId: "EBAY_US"` are hardcoded -- no per-region/format concept
+ *  is threaded through this codebase's eBay wiring anywhere else either
+ *  (normalizeEbayOrder's own `channelMarketplace: ""`). */
+export interface CreateEbayOfferBody {
+  sku: string;
+  marketplaceId: "EBAY_US";
+  format: "FIXED_PRICE";
+  availableQuantity: number;
+  categoryId: string;
+  listingDescription: string;
+  listingPolicies: { fulfillmentPolicyId: string; paymentPolicyId: string; returnPolicyId: string };
+  merchantLocationKey: string;
+  pricingSummary: { price: { value: string; currency: "USD" } };
+}
+
+export function buildEbayOfferBody(
+  input: EbayListingSubmission,
+  listingPolicies: { fulfillmentPolicyId: string; paymentPolicyId: string; returnPolicyId: string },
+  merchantLocationKey: string,
+): CreateEbayOfferBody {
+  return {
+    sku: input.sellerSku,
+    marketplaceId: "EBAY_US",
+    format: "FIXED_PRICE",
+    availableQuantity: input.quantity,
+    categoryId: input.categoryId,
+    listingDescription: input.description,
+    listingPolicies,
+    merchantLocationKey,
+    pricingSummary: { price: { value: input.price, currency: "USD" } },
+  };
+}
+
 function readRequiredEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -203,8 +375,14 @@ export async function loadEbayCredentialsFromChannelConnection(pool: Pool, tenan
       lwa_client_id: string;
       encrypted_client_secret: Buffer;
       encrypted_refresh_token: Buffer;
+      ebay_fulfillment_policy_id: string | null;
+      ebay_payment_policy_id: string | null;
+      ebay_return_policy_id: string | null;
+      ebay_merchant_location_key: string | null;
     }>(
-      `SELECT lwa_client_id, encrypted_client_secret, encrypted_refresh_token
+      `SELECT lwa_client_id, encrypted_client_secret, encrypted_refresh_token,
+              ebay_fulfillment_policy_id, ebay_payment_policy_id,
+              ebay_return_policy_id, ebay_merchant_location_key
          FROM channel_connections
         WHERE channel = 'ebay' AND status = 'active'
         ORDER BY created_at DESC
@@ -221,7 +399,15 @@ export async function loadEbayCredentialsFromChannelConnection(pool: Pool, tenan
       decryptChannelSecret(client, row.encrypted_refresh_token),
     ]);
 
-    return { clientId: row.lwa_client_id, clientSecret, refreshToken };
+    return {
+      clientId: row.lwa_client_id,
+      clientSecret,
+      refreshToken,
+      fulfillmentPolicyId: row.ebay_fulfillment_policy_id ?? undefined,
+      paymentPolicyId: row.ebay_payment_policy_id ?? undefined,
+      returnPolicyId: row.ebay_return_policy_id ?? undefined,
+      merchantLocationKey: row.ebay_merchant_location_key ?? undefined,
+    };
   });
 }
 
@@ -237,11 +423,15 @@ export async function createEbayConnectorFromChannelConnection(pool: Pool, tenan
 
 /**
  * eBay Sell API connector -- implements authenticate(), pullOrders(),
- * pushInventory(), and confirmShipment(). Deliberately does NOT implement
- * the full ChannelConnector interface (no submitListing()/getFeedStatus())
- * -- see this file's header comment for why outbound listing creation is
- * out of scope entirely for this v1 pass, not just narrowed the way
- * Amazon's/Walmart's are. subscribeToEvents() has no eBay analog built
+ * pushInventory(), and confirmShipment(), plus createListing()/
+ * fetchBusinessPolicies()/createMerchantLocation() for outbound listing
+ * creation (see this file's header comment). Deliberately does NOT
+ * implement the full ChannelConnector interface (no submitListing()/
+ * getFeedStatus()) -- createListing() is a separate, non-interface method,
+ * the same shape decision Amazon's/Shopify's own createListing() each made
+ * (CLAUDE.md §4.3), since eBay's publishOffer() is genuinely synchronous,
+ * not a submit-then-poll feed the way Walmart's real submitListing()/
+ * getFeedStatus() pair is. subscribeToEvents() has no eBay analog built
  * here either, same "no-op for poll-only channels" status Walmart/Amazon
  * both carry (CLAUDE.md §4.2/§4.3).
  *
@@ -498,6 +688,183 @@ export class EbayConnector {
       const message = data.errors?.map((e) => `${e.errorId}: ${e.message}`).join("; ") ?? response.statusText;
       throw new Error(`eBay createShippingFulfillment failed: ${response.status} ${message}`);
     }
+  }
+
+  /**
+   * GET /sell/account/v1/{fulfillment,payment,return}_policy (three calls,
+   * `?marketplace_id=EBAY_US` each -- confirmed query param name via
+   * community-fetched generated API-client docs, since the official
+   * getFulfillmentPolicies reference page itself rendered thin) -- lets a
+   * tenant PICK from business policies they've already created in their
+   * own eBay seller account. This codebase does NOT create, edit, or
+   * delete a tenant's business policies (createFulfillmentPolicy et al.
+   * are real eBay Account API endpoints this connector never calls) --
+   * each policy type has its own real required-field surface (handling
+   * time, payment methods accepted, return window/cost, category-specific
+   * overrides) that amounts to its own onboarding flow, a strictly bigger
+   * scope than a merchant location's plain address (see
+   * createMerchantLocation() below, which this codebase DOES build in
+   * full). A tenant with no policies of a given type gets back an empty
+   * array for it, not an error -- createListing() is what actually
+   * enforces all three being chosen.
+   *
+   * Requires the `sell.account.readonly` scope added to EBAY_OAUTH_SCOPES
+   * for this feature -- see that constant's own doc comment for the
+   * reconnect-required caveat for any connection made before this scope
+   * existed.
+   */
+  async fetchBusinessPolicies(): Promise<EbayBusinessPolicies> {
+    const marketplaceId = "EBAY_US";
+    const [fulfillment, payment, returnPolicy] = await Promise.all([
+      this.authorizedFetch(`/sell/account/v1/fulfillment_policy?marketplace_id=${marketplaceId}`, { method: "GET" }),
+      this.authorizedFetch(`/sell/account/v1/payment_policy?marketplace_id=${marketplaceId}`, { method: "GET" }),
+      this.authorizedFetch(`/sell/account/v1/return_policy?marketplace_id=${marketplaceId}`, { method: "GET" }),
+    ]);
+
+    async function parseOrThrow(response: Response, label: string): Promise<EbayPolicyListResponse> {
+      const data = (await response.json().catch(() => ({}))) as EbayPolicyListResponse & EbayApiErrorResponse;
+      if (!response.ok) {
+        const message = data.errors?.map((e) => `${e.errorId}: ${e.message}`).join("; ") ?? response.statusText;
+        throw new Error(`eBay get${label}Policies failed: ${response.status} ${message}`);
+      }
+      return data;
+    }
+
+    const [fulfillmentData, paymentData, returnData] = await Promise.all([
+      parseOrThrow(fulfillment, "Fulfillment"),
+      parseOrThrow(payment, "Payment"),
+      parseOrThrow(returnPolicy, "Return"),
+    ]);
+
+    return {
+      fulfillmentPolicies: (fulfillmentData.fulfillmentPolicies ?? []).map((p) => ({ id: p.fulfillmentPolicyId, name: p.name })),
+      paymentPolicies: (paymentData.paymentPolicies ?? []).map((p) => ({ id: p.paymentPolicyId, name: p.name })),
+      returnPolicies: (returnData.returnPolicies ?? []).map((p) => ({ id: p.returnPolicyId, name: p.name })),
+    };
+  }
+
+  /**
+   * POST /sell/inventory/v1/location/{merchantLocationKey} -- confirmed
+   * endpoint/response shape (204 No Content on success, no body) via
+   * community-fetched generated API-client docs
+   * (github.com/sapientpro/ebay-inventory-sdk-php's LocationApi.md); the
+   * exact required-vs-optional field breakdown within the request body
+   * wasn't confirmed the same way, so this sends every field
+   * {@link EbayMerchantLocationInput} collects rather than guessing which
+   * are safe to omit -- overs-supplying an address field eBay doesn't
+   * strictly require is far lower-risk than omitting one it does.
+   * `merchantLocationKey` (path segment, max 36 chars per eBay's own docs)
+   * is caller-supplied, not generated here -- the API route calling this
+   * derives one from the tenant id.
+   */
+  async createMerchantLocation(
+    merchantLocationKey: string,
+    input: EbayMerchantLocationInput,
+  ): Promise<{ success: boolean; error: string | null }> {
+    const response = await this.authorizedFetch(`/sell/inventory/v1/location/${encodeURIComponent(merchantLocationKey)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: input.name,
+        locationTypes: ["WAREHOUSE"],
+        location: {
+          address: {
+            addressLine1: input.addressLine1,
+            city: input.city,
+            stateOrProvince: input.stateOrProvince,
+            postalCode: input.postalCode,
+            country: input.country,
+          },
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const data = (await response.json().catch(() => ({}))) as EbayApiErrorResponse;
+      const message = data.errors?.map((e) => `${e.errorId}: ${e.message}`).join("; ") ?? response.statusText;
+      return { success: false, error: `eBay createInventoryLocation failed: ${response.status} ${message}` };
+    }
+    return { success: true, error: null };
+  }
+
+  /**
+   * The three-step eBay Inventory API flow: PUT
+   * /sell/inventory/v1/inventory_item/{sku} (createOrReplaceInventoryItem,
+   * a brand-new item -- see {@link buildEbayInventoryItemBody}, distinct
+   * from pushInventory()'s own GET-then-merge approach against a
+   * possibly-already-existing item), POST /sell/inventory/v1/offer
+   * (createOffer -- see {@link buildEbayOfferBody}), then POST
+   * /sell/inventory/v1/offer/{offerId}/publish/ (publishOffer, no request
+   * body, path param only) -- confirmed step order and endpoint shapes
+   * from developer.ebay.com's own inventory-item-to-offer.html/
+   * publishing-offers.html overview pages, cross-referenced against
+   * community-fetched generated API-client docs for the literal field
+   * names neither official page rendered. Returns the new `listingId`
+   * (confirmed field name/type via the OfferResponseWithListingId type
+   * reference page) on success.
+   *
+   * Fails fast, before any network call, if this connector's credentials
+   * are missing any of the three business policy ids or the merchant
+   * location key (see {@link EbayCredentials}' own doc comment) -- a
+   * tenant hasn't finished the /settings/channels eBay Selling Setup form
+   * yet, and eBay's own publishOffer() would reject the offer anyway
+   * ("All three policies are required to publish offers..." per
+   * publishing-offers.html) but only after two prior calls already
+   * succeeded, leaving an unpublished offer behind. Checking here instead
+   * means a tenant sees one clear, actionable error immediately.
+   *
+   * Content-Language: en-US hardcoded on the inventory-item PUT, same
+   * "USD-only, no per-marketplace mapping" simplification pushInventory()
+   * already documents for this method's sibling.
+   */
+  async createListing(input: EbayListingSubmission): Promise<EbayListingResult> {
+    const { fulfillmentPolicyId, paymentPolicyId, returnPolicyId, merchantLocationKey } = this.credentials;
+    if (!fulfillmentPolicyId || !paymentPolicyId || !returnPolicyId || !merchantLocationKey) {
+      return {
+        success: false,
+        listingId: null,
+        error:
+          "eBay business policies and/or merchant location are not configured -- set them up under " +
+          "Settings -> Channels before creating a listing.",
+      };
+    }
+
+    const itemResponse = await this.authorizedFetch(
+      `/sell/inventory/v1/inventory_item/${encodeURIComponent(input.sellerSku)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "Content-Language": "en-US" },
+        body: JSON.stringify(buildEbayInventoryItemBody(input)),
+      },
+    );
+    if (!itemResponse.ok) {
+      const data = (await itemResponse.json().catch(() => ({}))) as EbayApiErrorResponse;
+      const message = data.errors?.map((e) => `${e.errorId}: ${e.message}`).join("; ") ?? itemResponse.statusText;
+      return { success: false, listingId: null, error: `eBay createOrReplaceInventoryItem failed: ${itemResponse.status} ${message}` };
+    }
+
+    const offerResponse = await this.authorizedFetch(`/sell/inventory/v1/offer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Language": "en-US" },
+      body: JSON.stringify(buildEbayOfferBody(input, { fulfillmentPolicyId, paymentPolicyId, returnPolicyId }, merchantLocationKey)),
+    });
+    const offerData = (await offerResponse.json().catch(() => ({}))) as { offerId?: string } & EbayApiErrorResponse;
+    if (!offerResponse.ok || !offerData.offerId) {
+      const message = offerData.errors?.map((e) => `${e.errorId}: ${e.message}`).join("; ") ?? offerResponse.statusText;
+      return { success: false, listingId: null, error: `eBay createOffer failed: ${offerResponse.status} ${message}` };
+    }
+
+    const publishResponse = await this.authorizedFetch(
+      `/sell/inventory/v1/offer/${encodeURIComponent(offerData.offerId)}/publish/`,
+      { method: "POST" },
+    );
+    const publishData = (await publishResponse.json().catch(() => ({}))) as { listingId?: string } & EbayApiErrorResponse;
+    if (!publishResponse.ok || !publishData.listingId) {
+      const message = publishData.errors?.map((e) => `${e.errorId}: ${e.message}`).join("; ") ?? publishResponse.statusText;
+      return { success: false, listingId: null, error: `eBay publishOffer failed: ${publishResponse.status} ${message}` };
+    }
+
+    return { success: true, listingId: publishData.listingId, error: null };
   }
 }
 

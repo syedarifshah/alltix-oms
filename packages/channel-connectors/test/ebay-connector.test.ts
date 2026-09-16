@@ -17,10 +17,13 @@ import assert from "node:assert/strict";
 import {
   normalizeEbayOrder,
   normalizeEbayOrderLine,
+  buildEbayInventoryItemBody,
+  buildEbayOfferBody,
   EbayConnector,
   EBAY_API_SANDBOX_BASE_URL,
   type EbayOrder,
   type EbayLineItem,
+  type EbayListingSubmission,
 } from "../src/ebay-connector.js";
 import { buildEbayAuthorizeUrl, parseEbayOAuthCallback, EBAY_OAUTH_SCOPES } from "../src/ebay-oauth.js";
 
@@ -206,4 +209,44 @@ test("parseEbayOAuthCallback returns null when code is missing", () => {
 test("parseEbayOAuthCallback returns null when state is missing", () => {
   const params = new URLSearchParams({ code: "auth-code-value" });
   assert.equal(parseEbayOAuthCallback(params), null);
+});
+
+function makeListingSubmission(overrides: Partial<EbayListingSubmission> = {}): EbayListingSubmission {
+  return {
+    sellerSku: "SKU-001",
+    title: "Test Product",
+    description: "A test product description.",
+    imageUrl: "https://example.com/image.jpg",
+    categoryId: "12345",
+    price: "19.99",
+    quantity: 10,
+    ...overrides,
+  };
+}
+
+test("buildEbayInventoryItemBody fixes condition to NEW and wraps imageUrl in a single-element array", () => {
+  const body = buildEbayInventoryItemBody(makeListingSubmission());
+  assert.equal(body.condition, "NEW");
+  assert.deepEqual(body.product, {
+    title: "Test Product",
+    description: "A test product description.",
+    imageUrls: ["https://example.com/image.jpg"],
+  });
+  assert.equal(body.availability.shipToLocationAvailability.quantity, 10);
+});
+
+test("buildEbayOfferBody hardcodes marketplaceId/format/currency and threads through the listing policies + merchant location key", () => {
+  const body = buildEbayOfferBody(
+    makeListingSubmission({ price: "29.99" }),
+    { fulfillmentPolicyId: "fp-1", paymentPolicyId: "pp-1", returnPolicyId: "rp-1" },
+    "warehouse-key-1",
+  );
+  assert.equal(body.sku, "SKU-001");
+  assert.equal(body.marketplaceId, "EBAY_US");
+  assert.equal(body.format, "FIXED_PRICE");
+  assert.equal(body.categoryId, "12345");
+  assert.equal(body.availableQuantity, 10);
+  assert.deepEqual(body.listingPolicies, { fulfillmentPolicyId: "fp-1", paymentPolicyId: "pp-1", returnPolicyId: "rp-1" });
+  assert.equal(body.merchantLocationKey, "warehouse-key-1");
+  assert.deepEqual(body.pricingSummary, { price: { value: "29.99", currency: "USD" } });
 });

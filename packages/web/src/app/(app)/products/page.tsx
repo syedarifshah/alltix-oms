@@ -22,6 +22,9 @@ interface ProductRow {
   amazon_listing_status: string | null;
   amazon_list_price: string | null;
   amazon_raw_payload: { asin?: string } | null;
+  ebay_listing_status: string | null;
+  ebay_listing_id: string | null;
+  ebay_list_price: string | null;
 }
 
 interface ProductsPageProps {
@@ -33,6 +36,7 @@ interface ProductsPageProps {
     walmart_listing_still_processing?: string;
     walmart_listing_status_checked?: string;
     amazon_listing_created?: string;
+    ebay_listing_created?: string;
   }>;
 }
 
@@ -66,6 +70,7 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
     walmart_listing_still_processing: walmartListingStillProcessing,
     walmart_listing_status_checked: walmartListingStatusChecked,
     amazon_listing_created: amazonListingCreated,
+    ebay_listing_created: ebayListingCreated,
   } = await searchParams;
 
   if (!tenantId) {
@@ -77,8 +82,13 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
     );
   }
 
-  const { products, hasActiveShopifyConnection, hasActiveWalmartConnection, hasActiveAmazonConnection } =
-    await withTenant(pool, tenantId, async (client) => {
+  const {
+    products,
+    hasActiveShopifyConnection,
+    hasActiveWalmartConnection,
+    hasActiveAmazonConnection,
+    hasEbaySellingSetup,
+  } = await withTenant(pool, tenantId, async (client) => {
       const productsResult = await client.query<ProductRow>(
         `SELECT p.id, p.internal_sku, p.name,
                 cl.listing_status AS shopify_listing_status,
@@ -90,7 +100,10 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
                 cw.raw_payload AS walmart_raw_payload,
                 ca.listing_status AS amazon_listing_status,
                 ca.list_price AS amazon_list_price,
-                ca.raw_payload AS amazon_raw_payload
+                ca.raw_payload AS amazon_raw_payload,
+                ce.listing_status AS ebay_listing_status,
+                ce.external_id AS ebay_listing_id,
+                ce.list_price AS ebay_list_price
            FROM products p
            LEFT JOIN channel_listings cl
              ON cl.product_id = p.id AND cl.tenant_id = p.tenant_id AND cl.channel = 'shopify'
@@ -98,6 +111,8 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
              ON cw.product_id = p.id AND cw.tenant_id = p.tenant_id AND cw.channel = 'walmart'
            LEFT JOIN channel_listings ca
              ON ca.product_id = p.id AND ca.tenant_id = p.tenant_id AND ca.channel = 'amazon'
+           LEFT JOIN channel_listings ce
+             ON ce.product_id = p.id AND ce.tenant_id = p.tenant_id AND ce.channel = 'ebay'
           ORDER BY p.internal_sku`,
       );
       const shopifyConnectionResult = await client.query(
@@ -109,11 +124,27 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
       const amazonConnectionResult = await client.query(
         `SELECT 1 FROM channel_connections WHERE channel = 'amazon' AND status = 'active' LIMIT 1`,
       );
+      // Unlike the other three channels, "can this tenant list on eBay"
+      // isn't just "is there an active connection" -- EbayConnector.
+      // createListing() also needs all four Selling Setup columns
+      // (migration 0026) filled in, so this checks for those directly
+      // rather than duplicating hasActiveEbayConnection AND a separate
+      // flag the way /settings/channels' own hasEbaySellingSetup does.
+      const ebaySellingSetupResult = await client.query(
+        `SELECT 1 FROM channel_connections
+          WHERE channel = 'ebay' AND status = 'active'
+            AND ebay_fulfillment_policy_id IS NOT NULL
+            AND ebay_payment_policy_id IS NOT NULL
+            AND ebay_return_policy_id IS NOT NULL
+            AND ebay_merchant_location_key IS NOT NULL
+          LIMIT 1`,
+      );
       return {
         products: productsResult.rows,
         hasActiveShopifyConnection: shopifyConnectionResult.rows.length > 0,
         hasActiveWalmartConnection: walmartConnectionResult.rows.length > 0,
         hasActiveAmazonConnection: amazonConnectionResult.rows.length > 0,
+        hasEbaySellingSetup: ebaySellingSetupResult.rows.length > 0,
       };
     });
 
@@ -150,6 +181,13 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
           quantity.
         </div>
       )}
+      {ebayListingCreated === "1" && (
+        <div className="alert alert-success">
+          Listing created and published on eBay (this call is synchronous, same as Amazon&apos;s offer above — no
+          &quot;check status&quot; step needed). Starting stock was synced from your current available-to-sell
+          quantity.
+        </div>
+      )}
       {error && <div className="alert alert-danger">{describeError(error)}</div>}
 
       <details className="stack" style={{ marginBottom: 16 }}>
@@ -182,6 +220,12 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
           <a href="/settings/channels">Channels settings page</a> before attaching an offer to an ASIN.
         </div>
       )}
+      {!hasEbaySellingSetup && (
+        <div className="alert alert-info">
+          No active eBay connection with a completed Selling Setup (business policies + merchant location) —
+          finish that on the <a href="/settings/channels">Channels settings page</a> before creating a listing.
+        </div>
+      )}
 
       {products.length === 0 ? (
         <p className="empty">No products yet.</p>
@@ -195,6 +239,7 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
                 <th>Shopify</th>
                 <th>Walmart</th>
                 <th>Amazon</th>
+                <th>eBay</th>
               </tr>
             </thead>
             <tbody>
@@ -273,6 +318,24 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
                       <span className="muted">not listed</span>
                     )}
                   </td>
+                  <td>
+                    {product.ebay_listing_status ? (
+                      <div className="stack">
+                        <span className={product.ebay_listing_status === "active" ? "badge badge-success" : "badge"}>
+                          {product.ebay_listing_status}
+                        </span>
+                        <span className="muted">
+                          sku {product.internal_sku}
+                          {product.ebay_list_price ? ` · $${product.ebay_list_price}` : ""}
+                          {product.ebay_listing_id ? ` · listing ${product.ebay_listing_id}` : ""}
+                        </span>
+                      </div>
+                    ) : hasEbaySellingSetup ? (
+                      <CreateEbayListingForm productId={product.id} />
+                    ) : (
+                      <span className="muted">not listed</span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -336,6 +399,34 @@ function CreateAmazonListingForm({ productId }: { productId: string }): ReactEle
   );
 }
 
+/** Plain HTML form, no client JS -- see CreateListingForm's own comment for
+ *  why. Unlike every other channel's form here, this one creates a
+ *  brand-new eBay item AND needs two fields no other channel's form
+ *  collects: categoryId and imageUrl, both plain tenant-supplied values
+ *  with no lookup/validation on this app's side (see
+ *  EbayListingSubmission's own doc comment in ebay-connector.ts for why --
+ *  eBay's category taxonomy and this codebase's total lack of an
+ *  image-hosting feature are each their own real, deliberately
+ *  out-of-scope pieces of work). Only rendered once /settings/channels'
+ *  eBay Selling Setup (business policies + merchant location) is complete
+ *  -- see hasEbaySellingSetup above -- since EbayConnector.createListing()
+ *  fails fast without it anyway; this just avoids showing a form that's
+ *  guaranteed to fail. Condition is fixed to "NEW" server-side, no field
+ *  for it here, same v1 scope as every other channel's own form. */
+function CreateEbayListingForm({ productId }: { productId: string }): ReactElement {
+  return (
+    <form action="/api/channels/ebay/listings" method="POST" className="stack" style={{ gap: 6 }}>
+      <input type="hidden" name="productId" value={productId} />
+      <input type="text" name="title" placeholder="Listing title" required style={{ width: 160 }} />
+      <input type="text" name="description" placeholder="Description" required style={{ width: 160 }} />
+      <input type="text" name="imageUrl" placeholder="Image URL" required style={{ width: 160 }} />
+      <input type="text" name="categoryId" placeholder="eBay category ID" required style={{ width: 120 }} />
+      <input type="text" name="price" placeholder="19.99" required style={{ width: 80 }} />
+      <button type="submit">List on eBay</button>
+    </form>
+  );
+}
+
 function describeError(error: string): string {
   if (error === "product_missing_fields") return "Enter both a SKU and a name before submitting.";
   if (error === "product_sku_already_exists") return "A product with that SKU already exists.";
@@ -392,6 +483,24 @@ function describeError(error: string): string {
   if (error.startsWith("amazon_listing_created_but_not_recorded:")) {
     return (
       `The offer was created on Amazon (asin ${error.slice("amazon_listing_created_but_not_recorded:".length)}) ` +
+      "but saving it here failed — check server logs; avoid creating it again from this page."
+    );
+  }
+  if (error === "ebay_listing_missing_fields") {
+    return "Enter a title, description, image URL, category ID, and price before submitting.";
+  }
+  if (error === "ebay_listing_invalid_price") return "Price must look like 19.99 (up to two decimal places).";
+  if (error === "ebay_listing_product_not_found") return "That product could not be found.";
+  if (error === "ebay_listing_already_exists") return "This product already has an eBay listing.";
+  if (error.startsWith("ebay_listing_no_connection:")) {
+    return `No active eBay connection (${error.slice("ebay_listing_no_connection:".length)}).`;
+  }
+  if (error.startsWith("ebay_listing_create_failed:")) {
+    return `eBay rejected the new listing: ${error.slice("ebay_listing_create_failed:".length)}`;
+  }
+  if (error.startsWith("ebay_listing_created_but_not_recorded:")) {
+    return (
+      `The listing was created on eBay (listing ${error.slice("ebay_listing_created_but_not_recorded:".length)}) ` +
       "but saving it here failed — check server logs; avoid creating it again from this page."
     );
   }

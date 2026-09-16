@@ -49,14 +49,32 @@ const EBAY_AUTHORIZE_SANDBOX_URL = "https://auth.sandbox.ebay.com/oauth2/authori
 export const EBAY_TOKEN_PRODUCTION_URL = "https://api.ebay.com/identity/v1/oauth2/token";
 export const EBAY_TOKEN_SANDBOX_URL = "https://api.sandbox.ebay.com/identity/v1/oauth2/token";
 
-/** The two OAuth scopes this codebase's eBay wiring actually needs -- write
- *  access to both, not the read-only `sell.fulfillment.readonly` variant
- *  the fulfillment API's own OpenAPI spec also lists as sufficient for
- *  getOrders alone, since EbayConnector.confirmShipment() (createShippingFulfillment)
- *  is a write against the same API family and needs the full scope. */
+/** Three OAuth scopes this codebase's eBay wiring needs -- write access to
+ *  `sell.fulfillment`/`sell.inventory` (not the read-only variants, since
+ *  EbayConnector.confirmShipment()/pushInventory()/createListing() are all
+ *  writes against those API families), plus the READ-ONLY
+ *  `sell.account.readonly` added for EbayConnector.fetchBusinessPolicies()
+ *  (CLAUDE.md §4.6's outbound-listing-creation section) -- this codebase
+ *  never creates or modifies a tenant's business policies, only reads the
+ *  ones they've already set up in their own eBay account to populate a
+ *  picker, so the read-only scope is deliberately the least-privilege
+ *  choice over the full `sell.account` (which also grants policy
+ *  creation/deletion this app never calls). Scope URL confirmed live
+ *  (ebaymcp.com/authentication/oauth-setup's scope list), matching the
+ *  literal `sell.fulfillment`/`sell.inventory` URL shape already confirmed
+ *  for the other two.
+ *
+ *  IMPORTANT: an eBay refresh token is scope-bound at the time of the
+ *  original consent -- adding a scope here does NOT retroactively grant it
+ *  to a tenant who connected before this scope existed; they must
+ *  reconnect (re-run the OAuth flow) for fetchBusinessPolicies() to work.
+ *  Not an issue for any real tenant today (no eBay connection has ever
+ *  been made against this codebase -- CLAUDE.md §4.6's own "UNVERIFIED IN
+ *  ITS ENTIRETY" status), but worth remembering the day one exists. */
 export const EBAY_OAUTH_SCOPES = [
   "https://api.ebay.com/oauth/api_scope/sell.fulfillment",
   "https://api.ebay.com/oauth/api_scope/sell.inventory",
+  "https://api.ebay.com/oauth/api_scope/sell.account.readonly",
 ];
 
 export interface EbayOAuthAppConfig {

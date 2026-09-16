@@ -543,13 +543,13 @@ Offer-Setup-by-Match write is feed-submit-then-poll with no synchronous equivale
 and `SyncResult` has no way to represent "submitted, not yet known to have
 succeeded or failed."
 
-Channel #4 (eBay, §4.6) does NOT implement this interface at all — not even partially
-the way Amazon/Shopify do (both still implement `authenticate`/`pullOrders`/
-`pushInventory`/`confirmShipment` for real, just not `submitListing`/`getFeedStatus`).
-`EbayConnector` is a standalone class with no listing-creation method of any shape,
-because eBay's outbound listing path needs tenant-level business policies and a
-merchant location this codebase has no onboarding flow for anywhere — see §4.6's own
-note on why that's out of scope entirely, not just narrowed.
+Channel #4 (eBay, §4.6) does NOT implement this interface — not even partially the way
+Amazon/Shopify do (both still implement `authenticate`/`pullOrders`/`pushInventory`/
+`confirmShipment` for real, just not `submitListing`/`getFeedStatus`). `EbayConnector`
+now DOES have a listing-creation method (`createListing()`, §4.6's own "Outbound
+listing creation" paragraph) — same synchronous-write reasoning as Amazon's/Shopify's
+own `createListing()`, so it's a separate connector-specific method too, not the shared
+`submitListing`/`getFeedStatus` pair.
 
 ### 4.4 Handling API rate limits (critical — causes most production incidents)
 
@@ -930,16 +930,67 @@ note on why that's out of scope entirely, not just narrowed.
   rejected by eBay's own enum validation. Single-fulfillment assumption (every line
   ships together, same tracking info applied to all) — same documented limitation
   Amazon's/Walmart's own confirmShipment() carry.
-- **No outbound listing creation at all** (deliberately, not just narrowed the way
-  Amazon's/Walmart's are): eBay's own three-step Inventory API flow
-  (`createOrReplaceInventoryItem` → `createOffer` → `publishOffer`) requires
-  tenant-level business policies (payment/return/fulfillment policy ids) and a
-  `merchantLocationKey` this codebase has no onboarding flow for anywhere — a strictly
-  bigger prerequisite gap than even Amazon's deferred Product Type Definitions API
-  scope. `EbayConnector` deliberately does not implement the shared
-  `ChannelConnector.submitListing`/`getFeedStatus` interface pair at all (unlike
-  Walmart's real implementation) for this reason — revisit as its own explicitly-picked
-  task, the same way Amazon's/Walmart's listing creation each were.
+- **Outbound listing creation — built, closing the prerequisite gap this section used
+  to flag as out of scope entirely** (`EbayConnector.createListing()`,
+  `fetchBusinessPolicies()`, `createMerchantLocation()`, migration
+  `0026_channel_connections_ebay_selling_setup.sql`, three new routes under
+  `/api/channels/ebay/{business-policies,location,listings}`, `/settings/channels`'
+  new "Selling setup" sub-section, `/products` page): eBay's own three-step Inventory
+  API flow (`createOrReplaceInventoryItem` → `createOffer` → `publishOffer`, confirmed
+  via developer.ebay.com's own direct quote: "All three policies are required to
+  publish offers and create active listings through the Inventory API") needs
+  tenant-level business policies (fulfillment/payment/return) and a merchant location
+  before it can succeed — this pass builds both prerequisites, split into two pieces
+  with deliberately different scope:
+  - **Business policies — fetch-existing only, never create**: `fetchBusinessPolicies()`
+    calls `GET /sell/account/v1/{fulfillment,payment,return}_policy?marketplace_id=EBAY_US`
+    (a new least-privilege `sell.account.readonly` scope added to
+    `EBAY_OAUTH_SCOPES` — note a refresh token issued before this scope existed is NOT
+    retroactively granted it; that tenant would need to reconnect, not a live issue
+    since no real eBay connection has ever existed against this codebase) to populate
+    three `<select>` pickers on `/settings/channels`; the tenant's choice is just
+    persisted (`POST /api/channels/ebay/business-policies`) to three new
+    `channel_connections` columns. This codebase will never call eBay's own
+    `createFulfillmentPolicy`/`createPaymentPolicy`/`createReturnPolicy` endpoints —
+    each has its own large required-field surface (handling time, payment methods,
+    return window, category-specific overrides) that would be its own separate
+    onboarding flow, a strictly bigger scope than the merchant location below (which IS
+    built in full). Response wrapper field names
+    (`fulfillmentPolicies`/`paymentPolicies`/`returnPolicies`, each entry with
+    `<x>PolicyId`/`name`) were inferred from eBay's own consistent REST pluralization
+    convention, not confirmed against a literal rendered JSON example — documented as
+    such in `fetchBusinessPolicies()`'s own comment.
+  - **Merchant location — built in full**, since it's just an address:
+    `createMerchantLocation()` calls `POST /sell/inventory/v1/location/{merchantLocationKey}`
+    (204 No Content on success; requires `location.address` with either
+    city+stateOrProvince+country or postalCode+country, confirmed via community-
+    generated PHP client docs since the official page rendered thin). The
+    `merchantLocationKey` itself (max 36 chars per eBay's own docs) is auto-derived
+    server-side as the tenant id with dashes stripped (32 chars), not collected from
+    the tenant — one location per tenant for v1, matching `channel_connections`' own
+    one-eBay-connection-per-tenant assumption.
+  - **Per-listing form fields narrowed the same way Walmart's `productCategory` already
+    is**: `categoryId` and `imageUrl` are plain, unvalidated, tenant-supplied fields on
+    the `/products` per-listing form — no eBay Taxonomy API integration (category
+    lookup) and no image-hosting feature exist or are built here.
+    `marketplaceId`/`format`/currency/`condition` are hardcoded server-side to
+    `"EBAY_US"`/`"FIXED_PRICE"`/USD/`"NEW"`, matching the established
+    USD/new-condition-only v1 scope every other channel's own outbound listing path
+    already uses.
+  - `EbayConnector.createListing()` fails fast (no network call) if any of the four
+    credential fields (three policy ids + merchant location key) is missing — the
+    `/products` page only renders the listing form once `hasEbaySellingSetup` is true,
+    so this is a defense-in-depth guard, not the primary UX.
+  - `channel_listings` row lands as `listing_status = 'active'` immediately (no
+    `'pending'` state) — like Amazon's/Shopify's own synchronous
+    `createListing()` methods, the outcome (a real eBay `listingId`) comes back in the
+    same call, nothing to poll for.
+  - **UNVERIFIED, same status as the rest of this connector**: this environment's
+    network block on `api.ebay.com`/`api.sandbox.ebay.com` (§4.6's own opening
+    paragraph) means none of `fetchBusinessPolicies()`/`createMerchantLocation()`/
+    `createListing()` has been exercised against live infrastructure — only the two new
+    pure body-building functions (`buildEbayInventoryItemBody`/`buildEbayOfferBody`) are
+    unit-tested (`packages/channel-connectors/test/ebay-connector.test.ts`, 30 tests).
 - **Wired into the app** (no new migration — reuses the same `channel_connections`
   columns Amazon's own row already uses: `lwa_client_id` for the OAuth client id,
   `encrypted_client_secret`/`encrypted_refresh_token` for the real refresh-token pair,

@@ -2,6 +2,7 @@ import type { ReactElement } from "react";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { withTenant } from "@alltix/db";
+import { createEbayConnectorFromChannelConnection, type EbayBusinessPolicies } from "@alltix/channel-connectors";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
@@ -58,12 +59,19 @@ interface WalmartConnectionRow extends FailureTrackingColumns {
 /** eBay's row, like Walmart's, has no independent seller id and no
  *  marketplace concept worth showing -- external_account_id reuses the
  *  tenant's own eBay OAuth clientId (see the callback route's own comment
- *  for why). */
+ *  for why). The four ebay_* columns (migration
+ *  0026_channel_connections_ebay_selling_setup.sql) are the prerequisites
+ *  EbayConnector.createListing() needs -- all nullable, since a freshly
+ *  OAuth-connected row hasn't filled in the Selling Setup forms below yet. */
 interface EbayConnectionRow extends FailureTrackingColumns {
   external_account_id: string;
   status: string;
   created_at: string;
   last_order_sync_at: string | null;
+  ebay_fulfillment_policy_id: string | null;
+  ebay_payment_policy_id: string | null;
+  ebay_return_policy_id: string | null;
+  ebay_merchant_location_key: string | null;
 }
 
 /** Sandbox vs. production is never stored as its own column (see
@@ -191,7 +199,9 @@ export default async function ChannelsSettingsPage({
       );
       const ebayResult = await client.query<EbayConnectionRow>(
         `SELECT external_account_id, status, created_at, last_order_sync_at,
-                consecutive_failures, last_failure_at, last_failure_message
+                consecutive_failures, last_failure_at, last_failure_message,
+                ebay_fulfillment_policy_id, ebay_payment_policy_id,
+                ebay_return_policy_id, ebay_merchant_location_key
            FROM channel_connections
           WHERE channel = 'ebay'
           ORDER BY created_at DESC
@@ -211,6 +221,32 @@ export default async function ChannelsSettingsPage({
   const isShopifyConnected = shopifyConnection?.status === "active";
   const isWalmartConnected = walmartConnection?.status === "active";
   const isEbayConnected = ebayConnection?.status === "active";
+  const hasEbaySellingSetup =
+    !!ebayConnection?.ebay_fulfillment_policy_id &&
+    !!ebayConnection?.ebay_payment_policy_id &&
+    !!ebayConnection?.ebay_return_policy_id &&
+    !!ebayConnection?.ebay_merchant_location_key;
+
+  // Business policies are fetched live from the tenant's own eBay account
+  // (EbayConnector.fetchBusinessPolicies(), see its own doc comment for why
+  // this app never creates policies itself) -- a real network call, unlike
+  // every other query on this page, so it's wrapped in its own try/catch:
+  // a tenant who's connected but whose token can't reach eBay right now
+  // (this environment's own network block, an expired/revoked token) should
+  // still see the rest of this page, just with an error message here
+  // instead of a populated dropdown. Only attempted once setup isn't
+  // already complete -- no reason to make this live call on every page
+  // load once a tenant has already made their choice.
+  let ebayPolicies: EbayBusinessPolicies | null = null;
+  let ebayPoliciesError: string | null = null;
+  if (isEbayConnected && !hasEbaySellingSetup) {
+    try {
+      const connector = await createEbayConnectorFromChannelConnection(pool, tenantId);
+      ebayPolicies = await connector.fetchBusinessPolicies();
+    } catch (err) {
+      ebayPoliciesError = err instanceof Error ? err.message : String(err);
+    }
+  }
 
   return (
     <main className="page">
@@ -225,6 +261,8 @@ export default async function ChannelsSettingsPage({
       {connected === "amazon" && <div className="alert alert-success">Amazon connected.</div>}
       {connected === "walmart" && <div className="alert alert-success">Walmart connected.</div>}
       {connected === "ebay" && <div className="alert alert-success">eBay connected.</div>}
+      {connected === "ebay_policies" && <div className="alert alert-success">eBay business policies saved.</div>}
+      {connected === "ebay_location" && <div className="alert alert-success">eBay merchant location created.</div>}
       {connected === "shopify" && (
         <div className="alert alert-success">
           Shopify connected.
@@ -239,7 +277,11 @@ export default async function ChannelsSettingsPage({
       )}
       {error?.startsWith("shopify_") && <div className="alert alert-danger">Shopify connection failed ({error}).</div>}
       {error?.startsWith("walmart_") && <div className="alert alert-danger">Walmart connection failed ({error}).</div>}
-      {error?.startsWith("ebay_") && <div className="alert alert-danger">eBay connection failed ({error}).</div>}
+      {error?.startsWith("ebay_policies_") && <div className="alert alert-danger">Saving eBay business policies failed ({error}).</div>}
+      {error?.startsWith("ebay_location_") && <div className="alert alert-danger">Creating the eBay merchant location failed ({error}).</div>}
+      {error?.startsWith("ebay_") && !error.startsWith("ebay_policies_") && !error.startsWith("ebay_location_") && (
+        <div className="alert alert-danger">eBay connection failed ({error}).</div>
+      )}
       {error &&
         !error.startsWith("shopify_") &&
         !error.startsWith("walmart_") &&
@@ -402,6 +444,29 @@ export default async function ChannelsSettingsPage({
               last_failure_message={ebayConnection.last_failure_message}
             />
             {!isEbayConnected && <a href="/api/channels/ebay/connect">Reconnect eBay</a>}
+            {isEbayConnected && !hasEbaySellingSetup && (
+              <div className="stack" style={{ marginTop: 12 }}>
+                <h3>Selling setup (required before creating eBay listings)</h3>
+                <p className="muted">
+                  eBay requires an offer to reference business policies and a merchant location already
+                  set up on your own eBay account before it can publish — this app does not create business
+                  policies on your behalf (create them once in Seller Hub if you haven&apos;t already, then
+                  pick them here), but it does create the merchant location for you below.
+                </p>
+                {ebayPoliciesError && (
+                  <div className="alert alert-danger">
+                    Could not load business policies from eBay: {ebayPoliciesError}
+                  </div>
+                )}
+                {ebayPolicies && <EbayBusinessPoliciesForm policies={ebayPolicies} />}
+                <EbayMerchantLocationForm />
+              </div>
+            )}
+            {isEbayConnected && hasEbaySellingSetup && (
+              <div className="muted" style={{ marginTop: 8 }}>
+                Selling setup complete — ready to create eBay listings from /products.
+              </div>
+            )}
           </div>
         ) : (
           <a href="/api/channels/ebay/connect">Connect eBay</a>
@@ -475,6 +540,103 @@ function WalmartConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElem
         <input type="password" name="clientSecret" placeholder="Walmart Marketplace API client secret" required />
       </label>
       <button type="submit">{buttonLabel}</button>
+    </form>
+  );
+}
+
+/**
+ * Lets a tenant pick, from business policies already fetched live from
+ * their own eBay account (page-level `ebayPolicies`, see
+ * EbayConnector.fetchBusinessPolicies()'s own doc comment), which one of
+ * each type EbayConnector.createListing() should use. POSTs to
+ * /api/channels/ebay/business-policies, which just persists the three
+ * chosen ids -- no further validation happens there, since eBay itself is
+ * the source of the option list a tenant is selecting from here.
+ */
+function EbayBusinessPoliciesForm({ policies }: { policies: EbayBusinessPolicies }): ReactElement {
+  return (
+    <form action="/api/channels/ebay/business-policies" method="POST" className="stack" style={{ marginTop: 8 }}>
+      <label>
+        Fulfillment policy
+        <select name="fulfillmentPolicyId" required defaultValue="">
+          <option value="" disabled>
+            {policies.fulfillmentPolicies.length === 0 ? "No fulfillment policies found on your eBay account" : "Select a fulfillment policy"}
+          </option>
+          {policies.fulfillmentPolicies.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Payment policy
+        <select name="paymentPolicyId" required defaultValue="">
+          <option value="" disabled>
+            {policies.paymentPolicies.length === 0 ? "No payment policies found on your eBay account" : "Select a payment policy"}
+          </option>
+          {policies.paymentPolicies.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Return policy
+        <select name="returnPolicyId" required defaultValue="">
+          <option value="" disabled>
+            {policies.returnPolicies.length === 0 ? "No return policies found on your eBay account" : "Select a return policy"}
+          </option>
+          {policies.returnPolicies.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <button type="submit">Save business policies</button>
+    </form>
+  );
+}
+
+/**
+ * Creates a real eBay merchant location (EbayConnector.createMerchantLocation(),
+ * a genuine write against eBay's Inventory API, unlike the business
+ * policies form above which only picks from what already exists) -- see
+ * that method's own doc comment for the confirmed-vs-inferred field
+ * breakdown. The merchant location key itself is generated by the API
+ * route from the tenant id, not collected here -- a tenant only supplies
+ * the address a real warehouse actually has.
+ */
+function EbayMerchantLocationForm(): ReactElement {
+  return (
+    <form action="/api/channels/ebay/location" method="POST" className="stack" style={{ marginTop: 8 }}>
+      <label>
+        Location name
+        <input type="text" name="name" placeholder="Main Warehouse" required />
+      </label>
+      <label>
+        Address line 1
+        <input type="text" name="addressLine1" placeholder="123 Main St" required />
+      </label>
+      <label>
+        City
+        <input type="text" name="city" placeholder="Springfield" required />
+      </label>
+      <label>
+        State/province
+        <input type="text" name="stateOrProvince" placeholder="IL" required />
+      </label>
+      <label>
+        Postal code
+        <input type="text" name="postalCode" placeholder="62701" required />
+      </label>
+      <label>
+        Country (2-letter code)
+        <input type="text" name="country" placeholder="US" maxLength={2} required />
+      </label>
+      <button type="submit">Create merchant location</button>
     </form>
   );
 }
