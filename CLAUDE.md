@@ -19,6 +19,12 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
     ENTIRETY pending a real Walmart seller/Solution Provider account (no self-serve
     sandbox exists to substitute — see §4.2). Everything else in this MVP definition
     (ledger, order pull/normalize, pick/pack, order-routing rules, billing) is built.
+- **HR & Payroll — Arif's explicit pick, "add HR & payroll"**: a module inside
+  alltix-oms, for tenants — not a separate product. Scope locked to three layers,
+  all in this pass except the third: (1) employee directory + time tracking, no wage
+  math; (2) gross wage calculation (hours × rate), no tax withholding; (3) a real
+  payroll-processor integration, explicitly deferred to its own separately-scoped
+  future task given jurisdiction-specific legal complexity. See §14.
 
 Do not expand this scope without an explicit decision — every module below assumes it.
 
@@ -1455,6 +1461,92 @@ from there.
   including the `[ALERT]`-tagged `recordSyncFailure`/`recordRateLimitTrip` tests,
   passes unchanged). Creating a real project and setting the DSNs in `.env.example`'s
   Observability section is the remaining step before this is proven, not built.
+
+## 14. HR & Payroll Module (§0's locked decision — a module, not a separate product)
+
+- **Why/scope**: this platform's own MVP customers (small-to-mid multichannel
+  sellers, §0) run warehouse/fulfillment staff who need clocking-in and gross-pay
+  visibility, but not full payroll processing (tax withholding, filings) — that's a
+  correctly-scoped-out, jurisdiction-specific problem (task #34, deliberately not
+  started this pass). This module ships the two layers that are NOT
+  jurisdiction-specific: an employee directory + time tracking, and a gross wage
+  calculation (hours × rate, no withholding) computed live over the tracked time.
+- **Schema (`0028_hr_payroll_employees_and_time_entries.sql`)** — two new tables,
+  same tenant-scoped RLS treatment (tenant_id + `USING`/`WITH CHECK` policy +
+  `FORCE ROW LEVEL SECURITY` + `GRANT ... TO app_user`) as every other table in this
+  schema (§2's own pattern):
+  - `employees` — `name`, `role` (free TEXT, not a fixed enum — this codebase's MVP
+    customers already have their own job-title vocabulary; a fixed list just grows an
+    "Other" escape hatch), `location_id` (nullable FK to `locations` — not every
+    employee is tied to one warehouse), `hourly_rate` (nullable `NUMERIC(10,2)` — an
+    employee can exist for time tracking alone before wage data is entered),
+    `status` ('active'/'inactive').
+  - `time_entries` — one row per shift, whichever way it was captured. Deliberately
+    **one canonical shape**, not a separate "manual hours" field alongside
+    clock_in/clock_out: a manually-entered shift still gets real clock_in/clock_out
+    timestamps (the UI computes `clock_out = clock_in + N hours` when someone keys in
+    "8 hours" instead of punching in/out), so gross-wage calculation and every other
+    downstream reader sees one shape instead of branching on `entry_source` (kept
+    purely as UI/audit provenance, 'clock' vs 'manual'). `clock_out IS NULL` means
+    still clocked in — an open shift, not a zero-length one — enforced alongside a
+    `CHECK (clock_out IS NULL OR clock_out > clock_in)`. `location_id` is nullable and
+    independent of `employees.location_id` (a shift can be worked covering a
+    different location than an employee's usual one).
+  - **No `pay_periods`/`payroll_runs` table in this pass** — gross wage calculation
+    (task #33) is a live query over an arbitrary tenant-chosen date range (hours
+    derived from `time_entries`, rate from `employees.hourly_rate`), mirroring the
+    existing `/reports` page's period-selector pattern, rather than a stored
+    payroll-run state machine. A "what's been run vs. not" state machine is
+    speculative until real payroll processing (task #34) actually needs to track
+    that — adding it now would be building ahead of a requirement that doesn't exist
+    yet.
+  - `updated_at` follows this codebase's established convention (confirmed via
+    `order-service`/`inventory-service`'s own UPDATE statements) of the
+    application setting `updated_at = now()` explicitly per UPDATE — no DB trigger.
+- **App wiring — `/hr` (employee directory + time tracking)**: form-POST-then-
+  redirect-with-`?error=` mutations, same convention as `/locations`/`/products`/
+  `/rules` (see those pages' own doc comments) — no client JS anywhere in this app.
+  `POST /api/hr/employees/create` / `[id]/update` manage the directory (`name` isn't
+  editable after creation — no request for it yet, unlike `role`/`location_id`/
+  `hourly_rate`/`status`, which are all freely editable; marking an employee
+  'inactive' rather than deleting, same "workflow record" precedent as
+  locations/orders/picklists). `POST /api/hr/time-entries/clock-in` /
+  `[id]/clock-out` drive the per-employee "Clock in"/"Clock out" button pair (only
+  one button renders per employee, whichever their current open-shift state calls
+  for); `clock-in` refuses a second concurrent open shift for the same employee
+  (`SELECT ... FOR UPDATE` inside the same transaction as the INSERT) so task #33's
+  hours sum can never double-count an overlapping pair. `POST
+  /api/hr/time-entries/manual` adds a shift after the fact — still a real
+  clock_in/clock_out pair (`clockIn` + `hours` computes `clockOut` server-side), not
+  a separate shape; flagged there as a known limitation that `datetime-local`'s
+  timezone-free string is parsed in the *server's* local timezone, not the
+  browser's, since no tenant-timezone setting exists anywhere in this schema yet.
+- **App wiring — `/hr/payroll` (task #33, gross wage calculation)**: a read-only
+  report, same "plain Postgres query, not a separate read-optimized store" call
+  `/reports` already makes (see its own doc comment) — `from`/`to` date-range GET
+  params (`<input type="date">`, no client JS), defaulting to the trailing 14 days.
+  Sums `time_entries` duration per employee via `extract(epoch FROM (clock_out -
+  clock_in)) / 3600.0`, `FILTER (WHERE clock_out IS NOT NULL)` so a shift still
+  open at query time is excluded from the hours sum (its duration isn't knowable
+  yet) rather than silently truncated to "so far" — that employee still appears in
+  the table with an "N still open" badge instead of being dropped. Gross pay =
+  hours × `employees.hourly_rate`; an employee with hours but no rate set shows "no
+  rate set" and is excluded from the total rather than treated as $0 — conflating
+  "zero dollars" with "rate unknown" would be a real payroll error, not a rounding
+  one.
+- **Tests**: `packages/db/test/hr-rls.test.ts` — DB-layer tenant-isolation proof for
+  both new tables (SELECT/UPDATE/INSERT cross-tenant, mirroring
+  `channel-connections-rls.test.ts`'s own rigor), plus the two schema invariants the
+  design leans on: `hourly_rate` nullable (an employee can exist for time tracking
+  alone) and the `clock_out > clock_in` CHECK constraint. No page-level/route-level
+  test suite exists for `/hr`/`/hr/payroll` yet — same gap `/locations` already has
+  (there's no HTTP API test harness for a plain form-POST page in this codebase at
+  all currently); verified instead via `tsc -b`, `next build`, and a manual
+  `psql` smoke test of the payroll aggregate query's SQL (FILTER clauses, the
+  `extract(epoch ...)` hours computation) against real rows.
+- Real payroll-processor integration (task #34) is intentionally out of scope for
+  this module entirely, pending its own dedicated research/scoping pass given
+  jurisdiction-specific legal complexity.
 
 ---
 

@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc --noEmit -p .",
-    "test": "node --import tsx --test test/channel-connections-rls.test.ts"
+    "test": "node --import tsx --test test/channel-connections-rls.test.ts test/hr-rls.test.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

@@ -38,6 +38,7 @@ SAFE_TESTS=(
   "packages/channel-connectors/test/temu-connector.test.ts"
   "packages/channel-connectors/test/retry.test.ts"
   "packages/db/test/channel-connections-rls.test.ts"
+  "packages/db/test/hr-rls.test.ts"
   "packages/rules-engine/test/evaluate-golden.test.ts"
   "packages/rules-engine/test/resolve-actions-priority.test.ts"
   "packages/rules-engine/test/order-received-integration.test.ts"

@@ -204,6 +204,39 @@ export interface AutomationRuleAction {
   value: unknown;
 }
 
+export type EmployeeStatus = "active" | "inactive";
+
+export interface Employee {
+  id: string;
+  tenantId: string;
+  name: string;
+  role: string;
+  locationId: string | null;
+  hourlyRate: number | null;
+  status: EmployeeStatus;
+  createdAt: string;
+}
+
+/** 'clock' = live clock-in/clock-out; 'manual' = a shift keyed in after the
+ *  fact (still gets real clockIn/clockOut timestamps -- see migration
+ *  0028_hr_payroll_employees_and_time_entries.sql's own doc comment for why
+ *  there's no separate "manual hours" shape). Kept purely as UI/audit
+ *  provenance. */
+export type TimeEntrySource = "clock" | "manual";
+
+export interface TimeEntry {
+  id: string;
+  tenantId: string;
+  employeeId: string;
+  locationId: string | null;
+  clockIn: string;
+  /** null means still clocked in -- an open shift, not a zero-length one. */
+  clockOut: string | null;
+  entrySource: TimeEntrySource;
+  notes: string | null;
+  createdAt: string;
+}
+
 export interface AutomationRule {
   id: string;
   tenantId: string;
