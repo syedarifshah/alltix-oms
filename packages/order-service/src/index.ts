@@ -852,60 +852,86 @@ export class OrderService {
    * documented, not solved, same as the gap originally was.
    */
   async persistPulledOrders(tenantId: string, orders: NormalizedOrder[]): Promise<PersistPulledOrdersResult> {
-    const { insertedOrders, earlyCancelledOrderIds, skippedExternalOrderIds } = await withTenant(
+    const { insertedOrders, earlyCancelledOrderIds, skippedExternalOrderIds, failedOrders } = await withTenant(
       this.pool,
       tenantId,
       async (client) => {
         const insertedOrders: Array<{ id: string; order: NormalizedOrder }> = [];
         const earlyCancelledOrderIds: string[] = [];
         const skippedExternalOrderIds: string[] = [];
+        // PRODUCTION BUG FIX (found diagnosing a real "No channel_listings
+        // match" Shopify sync failure): one order in a pulled batch failing
+        // insertOrderLines() -- e.g. a line item with no SKU set, so its
+        // fallback externalSku (the line's own gid, see
+        // normalizeShopifyOrderLine's doc comment) can never match a
+        // channel_listings row -- used to throw straight out of this loop,
+        // which aborted the ENTIRE withTenant transaction: every OTHER
+        // order in the same pull window was silently rolled back too, not
+        // just the bad one, and kept being silently re-lost on every retry
+        // until that one order was fixed. A SAVEPOINT per order isolates
+        // that: a failure rolls back only that order's own (already-
+        // executed) INSERT, and the loop continues -- every other order in
+        // the batch still commits normally when this transaction commits.
+        const failedOrders: Array<{ externalOrderId: string; error: string }> = [];
 
         for (const order of orders) {
-          const inserted = await client.query<{ id: string }>(
-            `INSERT INTO orders
-               (tenant_id, channel, external_order_id, status, customer, shipping_address, placed_at, raw_payload)
-             VALUES ($1, $2, $3, 'received', $4, $5, $6, $7)
-             ON CONFLICT (tenant_id, channel, external_order_id) DO NOTHING
-             RETURNING id`,
-            [
-              tenantId,
-              order.channel,
-              order.externalOrderId,
-              JSON.stringify(order.customer),
-              JSON.stringify(order.shippingAddress),
-              order.placedAt,
-              JSON.stringify(order.rawPayload),
-            ],
-          );
-
-          const orderRow = inserted.rows[0];
-          if (!orderRow) {
-            skippedExternalOrderIds.push(order.externalOrderId);
-            continue;
-          }
-
-          await insertOrderLines(client, tenantId, orderRow.id, order);
-          await incrementOrdersProcessedUsage(client, tenantId);
-
-          const earlyCancellation = await client.query<{ id: string }>(
-            `DELETE FROM early_channel_cancellations
-             WHERE tenant_id = $1 AND channel = $2 AND external_order_id = $3
-             RETURNING id`,
-            [tenantId, order.channel, order.externalOrderId],
-          );
-          if (earlyCancellation.rows.length > 0) {
-            await client.query(
-              `UPDATE orders SET status = 'cancelled', updated_at = now() WHERE id = $1 AND tenant_id = $2`,
-              [orderRow.id, tenantId],
+          await client.query("SAVEPOINT persist_one_order");
+          try {
+            const inserted = await client.query<{ id: string }>(
+              `INSERT INTO orders
+                 (tenant_id, channel, external_order_id, status, customer, shipping_address, placed_at, raw_payload)
+               VALUES ($1, $2, $3, 'received', $4, $5, $6, $7)
+               ON CONFLICT (tenant_id, channel, external_order_id) DO NOTHING
+               RETURNING id`,
+              [
+                tenantId,
+                order.channel,
+                order.externalOrderId,
+                JSON.stringify(order.customer),
+                JSON.stringify(order.shippingAddress),
+                order.placedAt,
+                JSON.stringify(order.rawPayload),
+              ],
             );
-            earlyCancelledOrderIds.push(orderRow.id);
-            continue;
-          }
 
-          insertedOrders.push({ id: orderRow.id, order });
+            const orderRow = inserted.rows[0];
+            if (!orderRow) {
+              skippedExternalOrderIds.push(order.externalOrderId);
+              await client.query("RELEASE SAVEPOINT persist_one_order");
+              continue;
+            }
+
+            await insertOrderLines(client, tenantId, orderRow.id, order);
+            await incrementOrdersProcessedUsage(client, tenantId);
+
+            const earlyCancellation = await client.query<{ id: string }>(
+              `DELETE FROM early_channel_cancellations
+               WHERE tenant_id = $1 AND channel = $2 AND external_order_id = $3
+               RETURNING id`,
+              [tenantId, order.channel, order.externalOrderId],
+            );
+            if (earlyCancellation.rows.length > 0) {
+              await client.query(
+                `UPDATE orders SET status = 'cancelled', updated_at = now() WHERE id = $1 AND tenant_id = $2`,
+                [orderRow.id, tenantId],
+              );
+              earlyCancelledOrderIds.push(orderRow.id);
+              await client.query("RELEASE SAVEPOINT persist_one_order");
+              continue;
+            }
+
+            insertedOrders.push({ id: orderRow.id, order });
+            await client.query("RELEASE SAVEPOINT persist_one_order");
+          } catch (err) {
+            await client.query("ROLLBACK TO SAVEPOINT persist_one_order");
+            failedOrders.push({
+              externalOrderId: order.externalOrderId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
         }
 
-        return { insertedOrders, earlyCancelledOrderIds, skippedExternalOrderIds };
+        return { insertedOrders, earlyCancelledOrderIds, skippedExternalOrderIds, failedOrders };
       },
     );
 
@@ -930,6 +956,34 @@ export class OrderService {
 
       await this.transition(tenantId, orderId, "received", "validated");
       await this.transition(tenantId, orderId, "validated", "allocated");
+    }
+
+    // Every order that succeeded above has already committed (the SAVEPOINT
+    // dance above runs inside the withTenant() transaction that has already
+    // returned/committed by this point) and been published/allocated -- so
+    // this throw can't lose or roll any of that back. Its only job is
+    // signaling: every existing caller (packages/scheduler/src/index.ts's
+    // syncTenant()/syncShopifyTenant()/etc.) wraps this call in try/catch and
+    // treats "no throw" as "call recordSyncSuccess() and advance
+    // last_order_sync_at"; silently swallowing a partial failure here would
+    // make the scheduler mark this run a full success (and move the sync
+    // cursor past the bad order) even though one or more orders never made
+    // it into the system. Throwing keeps that contract intact -- the batch
+    // is a success overall only when every order in it actually persisted.
+    //
+    // Known residual behavior (deliberately not solved here, see CLAUDE.md
+    // §4.4's Shopify update): because the cursor doesn't advance on this
+    // throw, a *permanently* bad order (e.g. a Shopify line item that will
+    // never get a SKU) keeps getting re-pulled and re-failing on every sync
+    // until it's resolved at the source -- eventually tripping the same
+    // circuit breaker a real connection-health failure would. That's a
+    // data-quality problem, not a connection problem, and ideally the two
+    // would be classified differently; today they aren't.
+    if (failedOrders.length > 0) {
+      throw new Error(
+        `${failedOrders.length} of ${orders.length} order(s) in this batch failed to persist: ` +
+          failedOrders.map((f) => `${f.externalOrderId} (${f.error})`).join("; "),
+      );
     }
 
     return {

@@ -869,6 +869,51 @@ creation at all this pass either.
     it was actually hit in practice. Still unverified: whether a *repeat* registration
     for an already-subscribed topic+uri is a no-op or a rejected `userError` — the live
     test above only ever registered once per tenant.
+  - **Update — real production incident, batch-wide rollback bug (found diagnosing a
+    live "No channel_listings match ... cannot resolve product_id for order_lines"
+    failure banner on `/settings/channels`)**: the SKU-less/unmapped-order case one
+    paragraph above ("correctly failed loudly and rolled back") turned out to be
+    rolling back more than just the one bad order. `OrderService.persistPulledOrders()`
+    processes an entire pulled batch inside one `withTenant()` transaction; before this
+    fix, one order's `insertOrderLines()` throw propagated straight out of the loop and
+    aborted that whole transaction, silently losing every *other*, perfectly good order
+    pulled in the same sync window too — not just the unresolvable one. Worse, because
+    `last_order_sync_at` is only advanced on a fully successful call (§2.3-adjacent
+    cursor semantics — `syncShopifyTenant()` in `packages/scheduler/src/index.ts` moves
+    it only after `persistPulledOrders()` returns without throwing), the exact same
+    batch — bad order included — got re-pulled and re-failed on every subsequent sync
+    run, repeating the loss indefinitely instead of just once.
+    - **Fix**: each order in the batch now runs inside its own Postgres `SAVEPOINT`
+      (`persist_one_order`), released on success and rolled back to (not out of the
+      whole transaction) on failure. Failures are collected instead of thrown mid-loop,
+      so the loop always finishes the batch. Every order-received event/state-machine
+      walk for the *successful* orders still runs (and their `orders` rows have already
+      committed, since they were `RELEASE`d, not rolled back) before
+      `persistPulledOrders()` throws one aggregated error at the very end if
+      `failedOrders.length > 0` — preserving the existing contract every scheduler call
+      site (`packages/scheduler/src/index.ts`) depends on: no throw means
+      `recordSyncSuccess()` + cursor advance, a throw means `recordSyncFailure()` + the
+      cursor stays put. `PersistPulledOrdersResult`'s shape is unchanged (still throw,
+      not a partial-result return) to keep that contract exactly as-is. Regression
+      coverage: `packages/order-service/test/batch-partial-failure.test.ts` — proves a
+      good order both *before and after* the bad one in the same batch still persists
+      and allocates, that the bad order's own `orders` row (and `order_lines`) leave no
+      orphan, and that the call still throws so failure stays visible.
+    - **Known residual behavior — deliberately not solved by this fix**: a
+      *permanently* unresolvable order (e.g. the specific Shopify order this incident
+      traces to, whose line item has no SKU set — likely one of Shopify's own demo/
+      sample products, see `normalizeShopifyOrderLine`'s doc comment on the `sku ?? id`
+      GID fallback in `shopify-connector.ts`) still can't advance the cursor past
+      itself, since it never stops failing on its own. Every *other* order now safely
+      gets through, but that one order will keep tripping `recordSyncFailure()` on every
+      sync run until it's resolved at the source (set a real SKU on that Shopify variant,
+      or otherwise remove/ignore that order in Shopify) — and enough consecutive
+      failures still eventually flips the connection to `status = 'error'`
+      (`recordSyncFailure`'s own doc comment), the same as a genuine connection-health
+      failure would, even though this is a data-quality problem specific to one order.
+      Distinguishing "one bad order" from "the whole connection is broken" for
+      circuit-breaker purposes is a real gap, intentionally left open rather than
+      redesigned as part of this fix.
 - **Outbound listing creation** (`ShopifyConnector.createListing()`, `POST
   /api/channels/shopify/listings`, `/products` page): closes part of the "Not
   implemented" gap above for Shopify specifically — a tenant can now push an existing

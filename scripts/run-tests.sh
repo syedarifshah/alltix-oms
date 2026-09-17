@@ -48,6 +48,7 @@ SAFE_TESTS=(
   "packages/order-service/test/multi-warehouse-allocation.test.ts"
   "packages/order-service/test/nearest-location-routing.test.ts"
   "packages/order-service/test/early-cancellation.test.ts"
+  "packages/order-service/test/batch-partial-failure.test.ts"
   "packages/order-service/test/cancel-order.test.ts"
   "packages/order-service/test/lifecycle-transitions.test.ts"
   "packages/scheduler/test/sync-failure-tracking.test.ts"
