@@ -183,9 +183,13 @@ export default async function RulesPage({ searchParams }: RulesPageProps): Promi
           </div>
         </div>
         <div className="form-row">
-          <label htmlFor="conditions">Conditions — JSON array of field/op/value objects, e.g.:</label>
+          <label htmlFor="conditions">
+            Conditions — JSON array of field/op/value objects (&quot;eq&quot;, &quot;in&quot;, or
+            &quot;contains&quot; for &quot;this SKU is somewhere in the order&quot; against{" "}
+            <code>lineSkus</code>), e.g.:
+          </label>
           <pre className="mono" style={{ margin: 0 }}>
-            {`[{"field": "channel", "op": "eq", "value": "amazon"}]`}
+            {`[{"field": "channel", "op": "eq", "value": "amazon"},\n {"field": "lineSkus", "op": "contains", "value": "WIDGET-RED"}]`}
           </pre>
           <textarea id="conditions" name="conditions" rows={3} defaultValue="[]" className="mono" />
         </div>

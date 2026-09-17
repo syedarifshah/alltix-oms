@@ -856,7 +856,7 @@ export class OrderService {
       this.pool,
       tenantId,
       async (client) => {
-        const insertedOrders: Array<{ id: string; order: NormalizedOrder }> = [];
+        const insertedOrders: Array<{ id: string; order: NormalizedOrder; lines: ResolvedOrderLine[] }> = [];
         const earlyCancelledOrderIds: string[] = [];
         const skippedExternalOrderIds: string[] = [];
         // PRODUCTION BUG FIX (found diagnosing a real "No channel_listings
@@ -901,7 +901,7 @@ export class OrderService {
               continue;
             }
 
-            await insertOrderLines(client, tenantId, orderRow.id, order);
+            const resolvedLines = await insertOrderLines(client, tenantId, orderRow.id, order);
             await incrementOrdersProcessedUsage(client, tenantId);
 
             const earlyCancellation = await client.query<{ id: string }>(
@@ -920,7 +920,7 @@ export class OrderService {
               continue;
             }
 
-            insertedOrders.push({ id: orderRow.id, order });
+            insertedOrders.push({ id: orderRow.id, order, lines: resolvedLines });
             await client.query("RELEASE SAVEPOINT persist_one_order");
           } catch (err) {
             await client.query("ROLLBACK TO SAVEPOINT persist_one_order");
@@ -939,13 +939,14 @@ export class OrderService {
       await this.publish(tenantId, DomainEvent.OrderCancelled, { orderId });
     }
 
-    for (const { id: orderId, order } of insertedOrders) {
+    for (const { id: orderId, order, lines } of insertedOrders) {
       const payload: OrderReceivedPayload = {
         orderId,
         channel: order.channel,
         channelMarketplace: order.channelMarketplace,
         externalOrderId: order.externalOrderId,
         shippingAddress: order.shippingAddress,
+        lineSkus: lines.map((line) => line.internalSku),
       };
       await this.publish(tenantId, DomainEvent.OrderReceived, payload);
 
@@ -1017,26 +1018,47 @@ async function incrementOrdersProcessedUsage(client: PoolClient, tenantId: strin
   );
 }
 
+/** One order_lines row's worth of resolved product identity, handed back to
+ *  persistPulledOrders() so it can build OrderReceivedPayload.lineSkus (see
+ *  that field's doc comment) without a second round-trip re-querying what
+ *  insertOrderLines() already just looked up. */
+interface ResolvedOrderLine {
+  productId: string;
+  internalSku: string;
+  quantity: number;
+}
+
 /**
  * Resolves each line's product via channel_listings (channel + external_sku
- * -> product_id, CLAUDE.md §2.1) and inserts it. Fails loudly (aborting the
- * whole batch's transaction) rather than silently dropping a line on an
- * unresolved SKU -- a real seller catalog must be synced into
- * channel_listings before its orders can be persisted with lines intact.
+ * -> product_id, CLAUDE.md §2.1) and inserts it. Fails loudly -- rolling
+ * back only this one order (see persistPulledOrders()'s SAVEPOINT comment,
+ * not the whole batch's transaction as this used to before the real
+ * production Shopify-sync incident that fix addressed) -- rather than
+ * silently dropping a line on an unresolved SKU: a real seller catalog must
+ * be synced into channel_listings before its orders can be persisted with
+ * lines intact. Also joins `products` for `internal_sku` -- not needed for
+ * the INSERT itself, only so the caller can report the platform-canonical
+ * SKU (not each channel's own external_sku) on OrderReceivedPayload.
  */
 async function insertOrderLines(
   client: PoolClient,
   tenantId: string,
   orderId: string,
   order: NormalizedOrder,
-): Promise<void> {
+): Promise<ResolvedOrderLine[]> {
+  const resolved: ResolvedOrderLine[] = [];
+
   for (const line of order.lines) {
-    const listing = await client.query<{ product_id: string }>(
-      `SELECT product_id FROM channel_listings WHERE channel = $1 AND external_sku = $2 LIMIT 1`,
+    const listing = await client.query<{ product_id: string; internal_sku: string }>(
+      `SELECT cl.product_id, p.internal_sku
+         FROM channel_listings cl
+         JOIN products p ON p.id = cl.product_id
+        WHERE cl.channel = $1 AND cl.external_sku = $2
+        LIMIT 1`,
       [order.channel, line.externalSku],
     );
-    const productId = listing.rows[0]?.product_id;
-    if (!productId) {
+    const row = listing.rows[0];
+    if (!row) {
       throw new Error(
         `No channel_listings match for channel=${order.channel} external_sku=${line.externalSku} ` +
           `(order ${order.externalOrderId}) -- cannot resolve product_id for order_lines`,
@@ -1045,7 +1067,10 @@ async function insertOrderLines(
     await client.query(
       `INSERT INTO order_lines (tenant_id, order_id, product_id, quantity, unit_price, fulfillment_type)
        VALUES ($1, $2, $3, $4, $5, $6)`,
-      [tenantId, orderId, productId, line.quantity, line.unitPrice, line.fulfillmentType],
+      [tenantId, orderId, row.product_id, line.quantity, line.unitPrice, line.fulfillmentType],
     );
+    resolved.push({ productId: row.product_id, internalSku: row.internal_sku, quantity: line.quantity });
   }
+
+  return resolved;
 }

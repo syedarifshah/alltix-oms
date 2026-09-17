@@ -1394,11 +1394,36 @@ creation at all this pass either.
   `extractUsShippingZip()`/`rankByDistanceToShippingZip()` cases needing no DB,
   plus live-Postgres `allocateOrder()` cases proving nearer-but-newer beats
   farther-but-older, preferred still wins over nearest, and every no-distance-info
-  case falls back unchanged). The other, larger related gap remains explicitly
-  open: per-SKU rule-based routing (blocked upstream — `OrderReceivedPayload`
-  carries no line-item data). Per-location fulfillment routing beyond what the
-  rules engine's `route_to_warehouse` action and this nearest-location ranking
-  already do is otherwise still open. Returns handling — **built**, see §2.2/§3. Rate-limit
+  case falls back unchanged). **Per-SKU rule-based routing — built**, closing
+  the other related gap this section used to flag as blocked upstream:
+  `OrderReceivedPayload` (`packages/shared/src/events.ts`) now carries a
+  `lineSkus: string[]` field alongside its existing channel/marketplace/
+  shipping fields — one entry per order line, each the platform-canonical
+  `products.internal_sku` (not each channel's own `external_sku`), resolved
+  by `insertOrderLines()` (`packages/order-service/src/index.ts`) at the same
+  point it already resolves `product_id` via `channel_listings`, so this cost
+  no extra query. The rules engine (`packages/rules-engine/src/index.ts`)
+  gained a matching `"contains"` condition operator — the mirror image of the
+  existing `"in"` (there, a scalar field is checked against a list of
+  candidate values; here, an array field like `lineSkus` is checked for
+  whether it contains one candidate value) — so a rule like
+  `{"field":"lineSkus","op":"contains","value":"WIDGET-RED"}` combined with
+  the existing `route_to_warehouse` action routes an order by which product
+  is in it, the same way an existing rule already routes by channel. Fires
+  identically for the same product regardless of which channel's own SKU
+  spelling the order arrived under, since it keys off `internal_sku`, not
+  `external_sku` — proven directly in
+  `packages/rules-engine/test/sku-routing-integration.test.ts` (one seeded
+  product listed under two different channels' SKUs, two synthetic orders
+  from each channel, both route). `/rules`' condition-JSON help text
+  documents the new operator. Not a new action type, not a new trigger event,
+  and not an OR/any-of-N-SKUs condition (conditions stay an implicit AND
+  list, unchanged — matching multiple SKUs with OR still means one rule per
+  SKU, a real but deliberately unaddressed limitation, same scope discipline
+  as every other pass in this file). Per-location fulfillment routing beyond
+  what the rules engine's `route_to_warehouse` action, this nearest-location
+  ranking, and per-SKU routing already do is otherwise still open. Returns
+  handling — **built**, see §2.2/§3. Rate-limit
   hardening, circuit breakers — **built**, see §4.4. Observability dashboards —
   **built**, see §13: Sentry is wired end-to-end across packages/web and every
   backend job/scheduler script, with every DSN left unset — no real Sentry account

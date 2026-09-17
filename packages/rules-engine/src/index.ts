@@ -50,6 +50,15 @@ function matchesConditions(conditions: AutomationRuleCondition[], payload: unkno
         return actual === condition.value;
       case "in":
         return Array.isArray(condition.value) && condition.value.includes(actual);
+      // The mirror image of "in": there, `actual` is a scalar checked
+      // against a list in `condition.value` (e.g. channel in [...]). Here,
+      // `actual` (e.g. order.received's lineSkus, CLAUDE.md §8's "per-SKU
+      // rule-based routing") is the array, and `condition.value` is the
+      // single scalar being looked for in it (e.g. "does this order contain
+      // SKU X"). Added specifically for that field, but not hardcoded to
+      // it -- any array-valued field/scalar-value pair works the same way.
+      case "contains":
+        return Array.isArray(actual) && actual.includes(condition.value);
       default:
         // An unrecognized operator can never match -- fail closed (a rule
         // that can never fire is a config bug to notice, not a rule that

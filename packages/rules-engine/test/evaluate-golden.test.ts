@@ -1,7 +1,7 @@
 // Golden-file tests (CLAUDE.md §7) for RulesEngine.evaluate() -- pure
 // condition matching, fixed event input -> expected match output. Covers
-// every operator/shape this pass implements: eq, in, dotted-path field
-// access, multi-condition AND semantics, empty-conditions-matches-
+// every operator/shape this pass implements: eq, in, contains, dotted-path
+// field access, multi-condition AND semantics, empty-conditions-matches-
 // unconditionally, and an unrecognized operator failing closed. No DB.
 //
 // Run with: npm run test --workspace=@alltix/rules-engine -- evaluate-golden
@@ -91,8 +91,51 @@ test("a rule with no conditions matches unconditionally", () => {
 });
 
 test("an unrecognized operator fails closed -- never matches", () => {
+  const rule = makeRule({ conditions: [{ field: "channel", op: "regex", value: "^ama" }] });
+  assert.equal(RulesEngine.evaluate(makeEvent({ channel: "amazon" }), [rule])[0]?.matched, false);
+});
+
+// contains -- per-SKU rule-based routing (CLAUDE.md §8's Phase 4 gap):
+// order.received's lineSkus is an array field, the mirror image of "in"'s
+// scalar-in-array shape.
+test("contains: matches when the array field includes the condition's scalar value", () => {
+  const rule = makeRule({ conditions: [{ field: "lineSkus", op: "contains", value: "WIDGET-RED" }] });
+  assert.equal(
+    RulesEngine.evaluate(makeEvent({ lineSkus: ["WIDGET-BLUE", "WIDGET-RED"] }), [rule])[0]?.matched,
+    true,
+  );
+  assert.equal(
+    RulesEngine.evaluate(makeEvent({ lineSkus: ["WIDGET-BLUE"] }), [rule])[0]?.matched,
+    false,
+  );
+});
+
+test("contains: an empty lineSkus array never matches, doesn't throw", () => {
+  const rule = makeRule({ conditions: [{ field: "lineSkus", op: "contains", value: "WIDGET-RED" }] });
+  assert.equal(RulesEngine.evaluate(makeEvent({ lineSkus: [] }), [rule])[0]?.matched, false);
+});
+
+test("contains: a non-array field (wrong shape) fails closed rather than throwing", () => {
   const rule = makeRule({ conditions: [{ field: "channel", op: "contains", value: "ama" }] });
   assert.equal(RulesEngine.evaluate(makeEvent({ channel: "amazon" }), [rule])[0]?.matched, false);
+});
+
+test("contains combines with eq under the same implicit AND every other operator uses", () => {
+  const rule = makeRule({
+    conditions: [
+      { field: "channel", op: "eq", value: "amazon" },
+      { field: "lineSkus", op: "contains", value: "WIDGET-RED" },
+    ],
+  });
+  assert.equal(
+    RulesEngine.evaluate(makeEvent({ channel: "amazon", lineSkus: ["WIDGET-RED"] }), [rule])[0]?.matched,
+    true,
+  );
+  assert.equal(
+    RulesEngine.evaluate(makeEvent({ channel: "walmart", lineSkus: ["WIDGET-RED"] }), [rule])[0]?.matched,
+    false,
+    "right SKU, wrong channel",
+  );
 });
 
 test("evaluate() returns every rule with its own outcome, not just the matches", () => {

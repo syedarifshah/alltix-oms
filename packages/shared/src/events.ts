@@ -48,15 +48,30 @@ export interface DomainEventEnvelope<TPayload = unknown> {
  *  Deliberately minimal: everything here is already on hand at the point
  *  persistPulledOrders() publishes it (no extra query needed), and covers
  *  the fields a first order-routing rule plausibly conditions on (channel,
- *  marketplace, shipping destination). Other events' payloads stay
- *  untyped (`unknown`) until a real subscriber needs them -- no
- *  speculative typing ahead of an actual consumer. */
+ *  marketplace, shipping destination, and -- see `lineSkus` below -- which
+ *  products are in the order). Other events' payloads stay untyped
+ *  (`unknown`) until a real subscriber needs them -- no speculative typing
+ *  ahead of an actual consumer. */
 export interface OrderReceivedPayload {
   orderId: string;
   channel: string;
   channelMarketplace: string;
   externalOrderId: string;
   shippingAddress: Record<string, unknown> | null;
+  /** Closes the roadmap's "per-SKU rule-based routing" gap (CLAUDE.md §8
+   *  Phase 4): one entry per order line, each the platform-canonical
+   *  `products.internal_sku` -- not each channel's own external_sku -- so a
+   *  rule like `{"field":"lineSkus","op":"contains","value":"WIDGET-RED"}`
+   *  matches an order for that product the same way whether it came in from
+   *  Amazon, Shopify, or any other channel, rather than a seller having to
+   *  write one condition per channel's own SKU spelling for the same
+   *  product. Not deduped and not aligned index-for-index with any other
+   *  field -- a 2-line order with the same SKU twice reports it twice; a
+   *  condition only ever asks "is this SKU present," so the duplicate is
+   *  harmless, not a bug to fix. Empty for an order somehow published with
+   *  zero lines (shouldn't happen today, but a rule conditioning on
+   *  `lineSkus` should still fail closed, not throw, for one). */
+  lineSkus: string[];
 }
 
 /** Payload for `order.split_for_backorder` -- see DomainEvent.OrderSplitForBackorder's
