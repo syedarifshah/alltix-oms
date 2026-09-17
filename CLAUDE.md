@@ -992,9 +992,25 @@ creation at all this pass either.
 - **Fulfillment API**: `GET /sell/fulfillment/v1/order` pulls orders,
   `filter=creationdate:[<since>..]` for the since-cursor (confirmed literal filter
   syntax from developers.ebay.com's discovering-unfulfilled-orders.html static guide),
-  `limit=200` with **no pagination beyond the first page** — a real, documented gap
-  (the response's own `next`/`href` fields aren't followed), not a theoretical one.
-  `lineItemCost` is the line's **total**, not a per-unit price (confirmed via the
+  `limit=200` per page (eBay's own documented max). **Update — pagination now
+  built**, closing the real (not theoretical) gap this section used to flag: a
+  tenant with more than 200 new orders since their last sync used to silently lose
+  the rest until a later run's own cursor happened to land past them.
+  `pullOrders()` now loops on the response's own `next` field (checked only for
+  truthiness, never fetched as a literal URL — see the method's own doc comment for
+  why: blindly following a response-supplied host is the same class of bug the real
+  Amazon SP-API 403 incident, CLAUDE.md's own §4.1 update, already came from once),
+  bounded by `EBAY_ORDERS_MAX_PAGES` (250 pages × `EBAY_ORDERS_PAGE_SIZE` 200 =
+  50,000 orders — deliberately the same figure as §0's own monthly ceiling) as a
+  hard safety cap against a malformed/looping response, not expected to ever be hit
+  in practice. Unit-tested against a stubbed `global.fetch`
+  (`packages/channel-connectors/test/ebay-connector.test.ts`, the same
+  stub-and-restore-in-`finally` discipline `retry.test.ts` already established) —
+  multi-page collection, stopping on a page with no `next`, stopping on a page that
+  claims `next` but returns zero orders (defensive), and the safety cap itself —
+  the first live-fetch-mocked coverage this connector class has had, everything
+  else in this file still being pure-function-only per this section's own opening
+  paragraph. `lineItemCost` is the line's **total**, not a per-unit price (confirmed via the
   type's own field description: "calculated by multiplying the single unit price by
   the number of units purchased") — `normalizeEbayOrderLine()` divides by `quantity`
   to get `unitPrice`. `sku` isn't always populated on a real line item (a real

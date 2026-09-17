@@ -67,6 +67,17 @@ export const EBAY_API_SANDBOX_BASE_URL = "https://api.sandbox.ebay.com";
  *  own TOKEN_REFRESH_SKEW_MS. */
 const TOKEN_REFRESH_SKEW_MS = 60_000;
 
+/** eBay's own documented max page size for GET /sell/fulfillment/v1/order.
+ *  Exported so pullOrders()'s pagination loop is testable against it
+ *  directly rather than a test re-typing the literal 200. */
+export const EBAY_ORDERS_PAGE_SIZE = 200;
+
+/** Hard cap on how many pages pullOrders() will follow in one call -- see
+ *  that method's own doc comment for why this exists and why 250 (not a
+ *  round "big enough" guess: 250 * EBAY_ORDERS_PAGE_SIZE = 50,000, the same
+ *  figure as CLAUDE.md §0's monthly order ceiling). */
+export const EBAY_ORDERS_MAX_PAGES = 250;
+
 export interface EbayCredentials {
   clientId: string;
   clientSecret: string;
@@ -155,6 +166,12 @@ export interface EbayLineItem {
   lineItemCost?: { value: string; currency: string };
 }
 
+/** `next`/`href` are eBay's standard REST collection-pagination fields --
+ *  confirmed present (both populated with a full next-page URL) on a real,
+ *  community-fetched example GetOrdersResponse. pullOrders() only checks
+ *  `next` for truthiness (see its own doc comment for why it never fetches
+ *  the literal URL) -- `href` and `total` are declared here for
+ *  completeness/documentation but not read anywhere. */
 interface GetOrdersResponse {
   orders?: EbayOrder[];
   total?: number;
@@ -536,29 +553,63 @@ export class EbayConnector {
    * range (no separate sandbox-vs-production literal-trigger quirk to
    * special-case here).
    *
-   * limit=200 (eBay's documented max page size for this endpoint) with no
-   * further pagination beyond the first page -- a real, documented, NOT
-   * FIXED narrowing: `next`/`href` pagination fields exist on the response
-   * (confirmed via the community-fetched real example response) but aren't
-   * followed here. A tenant with more than 200 new orders since their last
-   * sync would silently miss the rest until next run picks up wherever
-   * `since` lands then -- acceptable at this codebase's target scale
-   * (CLAUDE.md §0: 500-50,000 orders/month) but a real gap, not a
-   * theoretical one, worth fixing before this matters in practice.
+   * PAGINATION -- previously a real, documented, NOT-fixed gap: this used
+   * to fetch only the first EBAY_ORDERS_PAGE_SIZE-order page and ignore the
+   * response's own `next`/`href` fields entirely, so a tenant with more new
+   * orders than that since their last sync silently lost the rest until a
+   * later run's own `since` cursor happened to land past them (a real gap
+   * at this codebase's target scale, CLAUDE.md §0: up to 50,000
+   * orders/month -- one seller's single busy day could plausibly exceed
+   * 200 new orders). Now loops on `data.next` (confirmed present on a real,
+   * community-fetched example response -- see GetOrdersResponse's own
+   * comment) until either a page comes back with no `next`, or a page comes
+   * back with zero orders despite claiming one (defensive: a malformed/
+   * looping response must not spin forever). Deliberately does NOT fetch
+   * the literal `next` URL eBay returns -- that URL embeds eBay's own host,
+   * and blindly following a response-supplied absolute URL is exactly the
+   * class of bug the real Amazon SP-API 403 production incident this
+   * codebase already fixed once came from (a connector silently talking to
+   * the wrong host). Instead, `next`'s presence is only ever treated as a
+   * boolean "is there another page," and the next page is requested the
+   * same way every other page is: through authorizedFetch(), against
+   * this.baseUrl, with the offset advanced by one page's worth. Bounded by
+   * EBAY_ORDERS_MAX_PAGES as a hard safety cap -- not expected to ever be
+   * hit at this codebase's target scale (250 pages * 200/page = 50,000
+   * orders, deliberately the same figure as CLAUDE.md §0's own monthly
+   * ceiling), but a cap that can never be hit isn't a cap; hitting it logs a
+   * warning and returns what was collected rather than looping forever or
+   * throwing away an otherwise-successful sync.
    */
   async pullOrders(since: Date): Promise<NormalizedOrder[]> {
     const filter = `creationdate:[${since.toISOString()}..]`;
-    const query = new URLSearchParams({ filter, limit: "200" });
+    const allOrders: EbayOrder[] = [];
 
-    const response = await this.authorizedFetch(`/sell/fulfillment/v1/order?${query.toString()}`, { method: "GET" });
-    const data = (await response.json()) as GetOrdersResponse & EbayApiErrorResponse;
+    for (let page = 0; page < EBAY_ORDERS_MAX_PAGES; page++) {
+      const offset = page * EBAY_ORDERS_PAGE_SIZE;
+      const query = new URLSearchParams({ filter, limit: String(EBAY_ORDERS_PAGE_SIZE), offset: String(offset) });
 
-    if (!response.ok) {
-      const message = data.errors?.map((e) => `${e.errorId}: ${e.message}`).join("; ") ?? response.statusText;
-      throw new Error(`eBay getOrders failed: ${response.status} ${message}`);
+      const response = await this.authorizedFetch(`/sell/fulfillment/v1/order?${query.toString()}`, { method: "GET" });
+      const data = (await response.json()) as GetOrdersResponse & EbayApiErrorResponse;
+
+      if (!response.ok) {
+        const message = data.errors?.map((e) => `${e.errorId}: ${e.message}`).join("; ") ?? response.statusText;
+        throw new Error(`eBay getOrders failed: ${response.status} ${message}`);
+      }
+
+      const pageOrders = data.orders ?? [];
+      allOrders.push(...pageOrders);
+
+      if (!data.next || pageOrders.length === 0) {
+        return allOrders.map(normalizeEbayOrder);
+      }
     }
 
-    return (data.orders ?? []).map(normalizeEbayOrder);
+    console.warn(
+      `eBay getOrders: hit the ${EBAY_ORDERS_MAX_PAGES}-page pagination safety cap (${allOrders.length} orders) ` +
+        `without exhausting \`next\` -- returning what was collected instead of looping further. ` +
+        `If this fires in practice, the cap (not the loop) needs raising.`,
+    );
+    return allOrders.map(normalizeEbayOrder);
   }
 
   /**
