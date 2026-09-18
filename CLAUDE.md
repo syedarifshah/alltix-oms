@@ -1461,20 +1461,24 @@ eBay/Temu v1" scope decision.
   TikTok Shop is the first channel in this codebase where a real, independent per-shop
   identifier (`shop_cipher`) actually exists, so this is `external_account_id` finally
   being used for what its name says, not a repurposing.
-- **NOT yet wired into the app** — unlike every other channel in this codebase
-  (§4.1–§4.7), this pass is scoped to the connector package only:
-  `packages/channel-connectors/src/tiktok-connector.ts` plus its unit tests
-  (`packages/channel-connectors/test/tiktok-connector.test.ts`, 21 tests — pure
-  signing/normalization logic, same split as every other connector's own test file).
-  There is no `/settings/channels` "Connect TikTok Shop" form, no
-  `createTikTokConnectorFromChannelConnection` caller anywhere in the scheduler, no
-  `GET /api/cron/tiktok-order-sync` route, and no `vercel.json` cron entry yet — the
-  same "connector built, app wiring is separate follow-up work" stage every other
-  channel passed through before its own "Wired into the app" paragraph could be
-  written. `loadTikTokCredentialsFromChannelConnection`/
-  `createTikTokConnectorFromChannelConnection` exist and are ready for that wiring
-  pass to call, mirroring every other channel's own two-source credential pattern
-  (env for scripts/manual testing, `channel_connections` for a real tenant).
+- - **Wired into the app**, mirroring Temu's own wiring exactly: `/settings/channels` has
+  a plain "Connect TikTok Shop" form (App Key + App Secret + Access Token + Refresh
+  Token + Shop Cipher — five fields, more than any other channel's own form, because
+  TikTok Shop's credential model genuinely has five independent parts, see above — all
+  required every submission, no OAuth redirect) that POSTs to
+  `/api/channels/tiktok/connect`, which calls `TikTokConnector.authenticate()` live to
+  reject a bad credential set before persisting anything. The scheduler
+  (`packages/scheduler/src/{index,cron-runner}.ts`) runs a TikTok Shop order-sync pass
+  in parallel to the other five — `syncTikTokOrders`/`runTikTokOrderSyncJob`/
+  `startTikTokOrderSyncScheduler`, a separate node-cron task and separate
+  `scripts/tiktok-order-sync-{job,scheduler}.ts` entrypoints. What actually triggers a
+  sync on this app's Vercel deployment is `GET /api/cron/tiktok-order-sync` (same
+  `CRON_SECRET` Bearer-token gate, same idempotency contract as the other five cron
+  routes) plus its `vercel.json` entry, staggered 30 minutes after Temu's own
+  (`0 7 * * *`, following the existing 30-minute-stagger convention).
+  `WarehouseService.confirmShipment()` (`packages/warehouse-service/src/index.ts`) also
+  dispatches to `createTikTokConnectorFromChannelConnection` for `order.channel ===
+  "tiktok"`, same as every other channel.
 - **UNVERIFIED IN ITS ENTIRETY**, same status Temu's own connector carries and for the
   same reason: no TikTok credentials of any kind exist anywhere in this codebase yet
   (see `.env.example`'s `TIKTOK_*` entries), no confirmed self-serve sandbox exists to
@@ -1483,7 +1487,8 @@ eBay/Temu v1" scope decision.
   `normalizeTikTokOrderLine`, `buildTikTokSignature`, `parseTikTokProductId`) is
   unit-tested; everything past that boundary (`authenticate`, `pullOrders`,
   `pushInventory`, `confirmShipment`) stays unverified until run against real
-  credentials.
+  credentials. Being "wired into the app" here means the plumbing (UI/scheduler/cron)
+  exists and compiles, not that a real TikTok Shop sync has ever succeeded.
 
 ## 5. Technology Stack
 
@@ -1644,11 +1649,12 @@ eBay/Temu v1" scope decision.
     Phase 4 — not a change to the phase order itself, just worth deciding deliberately
     rather than by default. The `/reports` first pass above doesn't resolve this
     either way — it's cheap enough at today's volume that the decision can still wait.
-- - **Phase 5 — Scale features (Months 9-12+)**: eBay, Temu, and TikTok Shop — all three
-  built ahead of the rest of this phase, see §4.6/§4.7/§4.8 (TikTok Shop's connector is
-  built but, unlike eBay's/Temu's, not yet wired into the app — see §4.8's own note) —
-  /additional channels. Stock forecasting. B2B portal (if pursuing Cin7-style ERP
-  breadth). SOC 2 prep if targeting mid-market.
+- - - **Phase 5 — Scale features (Months 9-12+)**: eBay, Temu, and TikTok Shop — all three
+  built and wired into the app ahead of the rest of this phase, see §4.6/§4.7/§4.8 (all
+  three remain UNVERIFIED against real infrastructure — no live credentials/sandbox for
+  any of them yet, see each section's own note) — /additional channels. Stock
+  forecasting. B2B portal (if pursuing Cin7-style ERP breadth). SOC 2 prep if targeting
+  mid-market.
 
 ## 9. Deployment & DevOps
 

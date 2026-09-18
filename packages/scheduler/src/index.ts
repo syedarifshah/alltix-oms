@@ -8,6 +8,7 @@ import {
   createWalmartConnectorFromChannelConnection,
   createEbayConnectorFromChannelConnection,
   createTemuConnectorFromChannelConnection,
+  createTikTokConnectorFromChannelConnection,
   RateLimitExhaustedError,
   type NormalizedShopifyProductVariant,
 } from "@alltix/channel-connectors";
@@ -133,7 +134,7 @@ export const RATE_LIMIT_COOLDOWN_MS = 15 * 60 * 1000;
 export async function recordSyncFailure(
   appPool: Pool,
   tenantId: string,
-  channel: "amazon" | "shopify" | "walmart" | "ebay" | "temu",
+  channel: "amazon" | "shopify" | "walmart" | "ebay" | "temu" | "tiktok",
   message: string,
 ): Promise<void> {
   await withTenant(appPool, tenantId, async (client) => {
@@ -197,7 +198,7 @@ export async function recordSyncFailure(
 export async function recordSyncSuccess(
   appPool: Pool,
   tenantId: string,
-  channel: "amazon" | "shopify" | "walmart" | "ebay" | "temu",
+  channel: "amazon" | "shopify" | "walmart" | "ebay" | "temu" | "tiktok",
 ): Promise<void> {
   await withTenant(appPool, tenantId, (client) =>
     client.query(
@@ -241,7 +242,7 @@ export async function recordSyncSuccess(
 export async function recordRateLimitTrip(
   appPool: Pool,
   tenantId: string,
-  channel: "amazon" | "shopify" | "walmart" | "ebay" | "temu",
+  channel: "amazon" | "shopify" | "walmart" | "ebay" | "temu" | "tiktok",
   retryAfterMs: number | null,
 ): Promise<void> {
   const cooldownMs = Math.max(RATE_LIMIT_COOLDOWN_MS, retryAfterMs ?? 0);
@@ -786,6 +787,102 @@ async function syncTemuTenant(appPool: Pool, orderService: OrderService, tenantI
   }
 }
 
+/**
+ * TikTok Shop's channel #6 counterpart to {@link syncTemuOrders} -- same
+ * shape again (discover every tenant with an active 'tiktok'
+ * channel_connection, sync each sequentially, never let one tenant's
+ * failure stop the rest). Kept as its own parallel function for the same
+ * duplication-vs-abstraction call syncShopifyOrders's/syncTemuOrders's own
+ * doc comments already made, now with a sixth channel wired this way and
+ * still no shared shape worth extracting.
+ *
+ * UNVERIFIED IN PRACTICE, same status Temu's own sync function carries and
+ * for the same reason -- see TikTokConnector's own class doc comment in
+ * tiktok-connector.ts for the full research trail. No TikTok credentials of
+ * any kind exist anywhere in this codebase yet, so every tenant this
+ * discovers (if any) will currently fail before ever reaching
+ * createTikTokConnectorFromChannelConnection() at all.
+ */
+export async function syncTikTokOrders(params: SyncAmazonOrdersParams): Promise<TenantSyncResult[]> {
+  const { appPool, adminPool, eventBus } = params;
+
+  const orderService = new OrderService(appPool, eventBus);
+  const rulesEngine = new RulesEngine(appPool);
+  rulesEngine.attach(eventBus);
+
+  const tenants = await adminPool.query<{ tenant_id: string }>(
+    `SELECT DISTINCT tenant_id FROM channel_connections
+      WHERE channel = 'tiktok' AND status = 'active'
+        AND (rate_limited_until IS NULL OR rate_limited_until <= now())`,
+  );
+
+  const results: TenantSyncResult[] = [];
+  for (const { tenant_id: tenantId } of tenants.rows) {
+    results.push(await syncTikTokTenant(appPool, orderService, tenantId));
+  }
+  return results;
+}
+
+/** TikTok counterpart to {@link runTemuOrderSyncJob} -- see its doc comment. */
+export async function runTikTokOrderSyncJob(appPool: Pool, adminPool: Pool): Promise<TenantSyncResult[]> {
+  return syncTikTokOrders({ appPool, adminPool, eventBus: new InProcessEventBus() });
+}
+
+/** TikTok counterpart to {@link syncTemuTenant} -- identical error-isolation
+ *  contract (never throws; a bad/missing credential or connector error
+ *  becomes a failed result, not a stopped loop). No isSandbox()/canned-
+ *  lookback branch here either -- createTikTokConnectorFromChannelConnection
+ *  is always constructed against TIKTOK_API_BASE_URL (no confirmed sandbox
+ *  host exists for TikTok -- see TikTokConnector's own class doc comment). */
+async function syncTikTokTenant(appPool: Pool, orderService: OrderService, tenantId: string): Promise<TenantSyncResult> {
+  const syncStartedAt = new Date();
+
+  try {
+    const lastSync = await withTenant(appPool, tenantId, (client) =>
+      client.query<{ last_order_sync_at: string | null }>(
+        `SELECT last_order_sync_at FROM channel_connections
+          WHERE tenant_id = $1 AND channel = 'tiktok' AND status = 'active'
+          ORDER BY created_at DESC LIMIT 1`,
+        [tenantId],
+      ),
+    );
+    const lastOrderSyncAt = lastSync.rows[0]?.last_order_sync_at;
+    const since = lastOrderSyncAt ? new Date(lastOrderSyncAt) : new Date(syncStartedAt.getTime() - DEFAULT_LOOKBACK_MS);
+
+    const connector = await createTikTokConnectorFromChannelConnection(appPool, tenantId);
+    const pulled = await connector.pullOrders(since);
+    const persisted = await orderService.persistPulledOrders(tenantId, pulled);
+
+    // Same start-time-not-now reasoning as syncTemuTenant()/syncTenant() --
+    // migration 0015's comment applies identically here.
+    await withTenant(appPool, tenantId, (client) =>
+      client.query(
+        `UPDATE channel_connections SET last_order_sync_at = $1, updated_at = now()
+          WHERE tenant_id = $2 AND channel = 'tiktok' AND status = 'active'`,
+        [syncStartedAt.toISOString(), tenantId],
+      ),
+    );
+    await recordSyncSuccess(appPool, tenantId, "tiktok");
+
+    return { tenantId, success: true, ...persisted, error: null };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`TikTok Shop order sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
+    // Same cross-run failure tracking as syncTemuTenant() -- see
+    // recordSyncFailure()'s doc comment. Doubly expected to fire for every
+    // TikTok-connected tenant right now, given the UNVERIFIED status above --
+    // same intended behavior every other channel's own doc comment already
+    // gives for an identical situation.
+    await recordSyncFailure(appPool, tenantId, "tiktok", message);
+    // Same cross-run circuit breaker as syncTenant() -- see
+    // recordRateLimitTrip()'s doc comment.
+    if (err instanceof RateLimitExhaustedError) {
+      await recordRateLimitTrip(appPool, tenantId, "tiktok", err.retryAfterMs);
+    }
+    return { tenantId, success: false, insertedOrderIds: [], skippedExternalOrderIds: [], error: message };
+  }
+}
+
 /** Every product/channel_listings row this catalog-sync job maintains uses
  *  this same location for its baseline stock -- see syncShopifyCatalogForTenant's
  *  doc comment. Deliberately the exact string
@@ -1003,9 +1100,12 @@ export {
   runEbayOnceWithRetry,
   startTemuOrderSyncScheduler,
   runTemuOnceWithRetry,
+  startTikTokOrderSyncScheduler,
+  runTikTokOnceWithRetry,
   type AmazonOrderSyncSchedulerOptions,
   type ShopifyOrderSyncSchedulerOptions,
   type WalmartOrderSyncSchedulerOptions,
   type EbayOrderSyncSchedulerOptions,
   type TemuOrderSyncSchedulerOptions,
+  type TikTokOrderSyncSchedulerOptions,
 } from "./cron-runner.js";

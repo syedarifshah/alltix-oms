@@ -84,6 +84,18 @@ interface TemuConnectionRow extends FailureTrackingColumns {
   last_order_sync_at: string | null;
 }
 
+/** TikTok Shop's row, like Temu's, has no marketplace concept worth showing --
+ *  external_account_id is the tenant's own shop_cipher (see the connect
+ *  route's own comment: unlike every other channel's own reuse of this
+ *  column, shop_cipher is a genuine, independent per-shop identifier, so
+ *  this is the one channel where the column holds what its name says). */
+interface TikTokConnectionRow extends FailureTrackingColumns {
+  external_account_id: string;
+  status: string;
+  created_at: string;
+  last_order_sync_at: string | null;
+}
+
 /** Sandbox vs. production is never stored as its own column (see
  *  packages/db/migrations/0012_channel_connections.sql) -- the connection's
  *  own lwa_client_id is compared against this process's known sandbox/
@@ -178,7 +190,7 @@ export default async function ChannelsSettingsPage({
     );
   }
 
-  const { connection, shopifyConnection, walmartConnection, ebayConnection, temuConnection } = await withTenant(
+  const { connection, shopifyConnection, walmartConnection, ebayConnection, temuConnection, tiktokConnection } = await withTenant(
     pool,
     tenantId,
     async (client) => {
@@ -225,12 +237,21 @@ export default async function ChannelsSettingsPage({
           ORDER BY created_at DESC
           LIMIT 1`,
       );
+      const tiktokResult = await client.query<TikTokConnectionRow>(
+        `SELECT external_account_id, status, created_at, last_order_sync_at,
+                consecutive_failures, last_failure_at, last_failure_message
+           FROM channel_connections
+          WHERE channel = 'tiktok'
+          ORDER BY created_at DESC
+          LIMIT 1`,
+      );
       return {
         connection: amazonResult.rows[0] ?? null,
         shopifyConnection: shopifyResult.rows[0] ?? null,
         walmartConnection: walmartResult.rows[0] ?? null,
         ebayConnection: ebayResult.rows[0] ?? null,
         temuConnection: temuResult.rows[0] ?? null,
+        tiktokConnection: tiktokResult.rows[0] ?? null,
       };
     },
   );
@@ -241,6 +262,7 @@ export default async function ChannelsSettingsPage({
   const isWalmartConnected = walmartConnection?.status === "active";
   const isEbayConnected = ebayConnection?.status === "active";
   const isTemuConnected = temuConnection?.status === "active";
+  const isTikTokConnected = tiktokConnection?.status === "active";
   const hasEbaySellingSetup =
     !!ebayConnection?.ebay_fulfillment_policy_id &&
     !!ebayConnection?.ebay_payment_policy_id &&
@@ -272,17 +294,19 @@ export default async function ChannelsSettingsPage({
     <main className="page">
       <h1>Channels</h1>
       <p className="subtitle">
-        Amazon, Shopify, Walmart, eBay, and Temu connectors. Walmart&apos;s, eBay&apos;s, and Temu&apos;s wiring is
-        complete but UNVERIFIED against real infrastructure (no self-serve sandbox exists for any of the three the
-        way Shopify/Amazon have one, this environment can&apos;t even reach eBay&apos;s API hosts at all, and
-        Temu&apos;s own documentation could not be read by any method tried during its research pass) — connecting
-        will correctly fail here until real credentials exist and a real round trip has happened.
+        Amazon, Shopify, Walmart, eBay, Temu, and TikTok Shop connectors. Walmart&apos;s, eBay&apos;s, Temu&apos;s,
+        and TikTok Shop&apos;s wiring is complete but UNVERIFIED against real infrastructure (no self-serve sandbox
+        exists for any of the four the way Shopify/Amazon have one, this environment can&apos;t even reach
+        eBay&apos;s API hosts at all, and neither Temu&apos;s nor TikTok&apos;s own documentation could be read by
+        any method tried during their research passes) — connecting will correctly fail here until real credentials
+        exist and a real round trip has happened.
       </p>
 
       {connected === "amazon" && <div className="alert alert-success">Amazon connected.</div>}
       {connected === "walmart" && <div className="alert alert-success">Walmart connected.</div>}
       {connected === "ebay" && <div className="alert alert-success">eBay connected.</div>}
       {connected === "temu" && <div className="alert alert-success">Temu connected.</div>}
+      {connected === "tiktok" && <div className="alert alert-success">TikTok Shop connected.</div>}
       {connected === "ebay_policies" && <div className="alert alert-success">eBay business policies saved.</div>}
       {connected === "ebay_location" && <div className="alert alert-success">eBay merchant location created.</div>}
       {connected === "shopify" && (
@@ -305,11 +329,13 @@ export default async function ChannelsSettingsPage({
         <div className="alert alert-danger">eBay connection failed ({error}).</div>
       )}
       {error?.startsWith("temu_") && <div className="alert alert-danger">Temu connection failed ({error}).</div>}
+      {error?.startsWith("tiktok_") && <div className="alert alert-danger">TikTok Shop connection failed ({error}).</div>}
       {error &&
         !error.startsWith("shopify_") &&
         !error.startsWith("walmart_") &&
         !error.startsWith("ebay_") &&
         !error.startsWith("temu_") &&
+        !error.startsWith("tiktok_") &&
         // Amazon's own error codes (e.g. "missing_callback_params",
         // "invalid_or_expired_state", "token_exchange_failed") were written
         // before any other channel had its own OAuth-redirect flow, so
@@ -536,6 +562,46 @@ export default async function ChannelsSettingsPage({
           <TemuConnectForm buttonLabel="Connect Temu" />
         )}
       </div>
+
+      <h2>TikTok Shop</h2>
+      <div className="card">
+        {tiktokConnection ? (
+          <div className="stack">
+            <div className="row">
+              <span className={isTikTokConnected ? "badge badge-success" : "badge badge-danger"}>
+                {tiktokConnection.status}
+              </span>
+              <span className="muted">shop cipher {tiktokConnection.external_account_id}</span>
+            </div>
+            <div className="muted">Connected since {new Date(tiktokConnection.created_at).toISOString()}</div>
+            <div className="muted">
+              Last order sync:{" "}
+              {tiktokConnection.last_order_sync_at
+                ? new Date(tiktokConnection.last_order_sync_at).toISOString()
+                : "never synced yet"}
+            </div>
+            <div className="alert alert-info" style={{ marginTop: 8, marginBottom: 0 }}>
+              UNVERIFIED against real TikTok Shop infrastructure, same status as Temu&apos;s own connection above --
+              TikTok&apos;s own documentation could not be read by any method tried during this connector&apos;s
+              research pass (see TikTokConnector&apos;s own class doc comment), and no TikTok credentials of any
+              kind exist anywhere in this codebase yet. Order sync failures are no longer silent, though — see
+              below if this connection has started failing.
+            </div>
+            <SyncFailureBanner
+              status={tiktokConnection.status}
+              consecutive_failures={tiktokConnection.consecutive_failures}
+              last_failure_at={tiktokConnection.last_failure_at}
+              last_failure_message={tiktokConnection.last_failure_message}
+            />
+            {/* No OAuth reconnect redirect (same reasoning as Temu's own
+                form here) -- reconnecting means re-submitting this form with
+                a fresh/corrected credential set. */}
+            <TikTokConnectForm buttonLabel="Reconnect TikTok Shop" />
+          </div>
+        ) : (
+          <TikTokConnectForm buttonLabel="Connect TikTok Shop" />
+        )}
+      </div>
     </main>
   );
 }
@@ -732,6 +798,48 @@ function TemuConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElement
       <label>
         Access token
         <input type="password" name="accessToken" placeholder="Temu Open Platform access token" required />
+      </label>
+      <button type="submit">{buttonLabel}</button>
+    </form>
+  );
+}
+
+/**
+ * TikTok Shop has no OAuth consent screen wired here either (same "typed
+ * directly into a plain form" shape as TemuConnectForm above) -- but five
+ * fields instead of three, because TikTok Shop's own credential model
+ * genuinely has five independent parts (see TikTokCredentials' own doc
+ * comment in tiktok-connector.ts): App Key, App Secret, Access Token,
+ * Refresh Token, and Shop Cipher (a real, independent per-shop identifier --
+ * one App Key/Access Token pair can cover multiple TikTok shops, each with
+ * its own cipher).
+ *
+ * All five fields are required every submission, including on reconnect --
+ * same "no leave-blank-to-keep-the-existing-secret affordance" as
+ * TemuConnectForm/WalmartConnectForm, for the same reason.
+ */
+function TikTokConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElement {
+  return (
+    <form action="/api/channels/tiktok/connect" method="POST" className="stack" style={{ marginTop: 8 }}>
+      <label>
+        App key
+        <input type="text" name="appKey" placeholder="TikTok Shop Open Platform app key" required />
+      </label>
+      <label>
+        App secret
+        <input type="password" name="appSecret" placeholder="TikTok Shop Open Platform app secret" required />
+      </label>
+      <label>
+        Access token
+        <input type="password" name="accessToken" placeholder="TikTok Shop Open Platform access token" required />
+      </label>
+      <label>
+        Refresh token
+        <input type="password" name="refreshToken" placeholder="TikTok Shop Open Platform refresh token" required />
+      </label>
+      <label>
+        Shop cipher
+        <input type="text" name="shopCipher" placeholder="Shop cipher (per-shop identifier)" required />
       </label>
       <button type="submit">{buttonLabel}</button>
     </form>

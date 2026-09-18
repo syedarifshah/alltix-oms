@@ -19,6 +19,7 @@
     "amazon:seed-test-product-catalog": "tsx scripts/seed-test-product-catalog.ts",
     "amazon:pull-orders-smoke-test": "tsx scripts/amazon-pull-orders-smoke-test.ts",
     "amazon:push-inventory-smoke-test": "tsx scripts/amazon-push-inventory-smoke-test.ts",
+    "amazon:create-listing-smoke-test": "tsx scripts/amazon-create-listing-smoke-test.ts",
     "amazon:oauth-token-exchange-isolation-test": "tsx scripts/amazon-oauth-token-exchange-isolation-test.ts",
     "amazon:order-sync-job": "tsx scripts/amazon-order-sync-job.ts",
     "amazon:order-sync-scheduler": "tsx scripts/amazon-order-sync-scheduler.ts",
@@ -35,7 +36,9 @@
     "ebay:order-sync-scheduler": "tsx scripts/ebay-order-sync-scheduler.ts",
     "ebay:sandbox-smoke-test": "tsx scripts/ebay-sandbox-smoke-test.ts",
     "temu:order-sync-job": "tsx scripts/temu-order-sync-job.ts",
-    "temu:order-sync-scheduler": "tsx scripts/temu-order-sync-scheduler.ts"
+    "temu:order-sync-scheduler": "tsx scripts/temu-order-sync-scheduler.ts",
+    "tiktok:order-sync-job": "tsx scripts/tiktok-order-sync-job.ts",
+    "tiktok:order-sync-scheduler": "tsx scripts/tiktok-order-sync-scheduler.ts"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",

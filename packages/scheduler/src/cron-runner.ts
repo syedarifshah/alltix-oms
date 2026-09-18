@@ -7,6 +7,7 @@ import {
   runWalmartOrderSyncJob,
   runEbayOrderSyncJob,
   runTemuOrderSyncJob,
+  runTikTokOrderSyncJob,
   type TenantSyncResult,
 } from "./index.js";
 
@@ -599,6 +600,110 @@ export function startTemuOrderSyncScheduler(options: TemuOrderSyncSchedulerOptio
   console.log(
     JSON.stringify({
       event: "temu_order_sync_scheduler_started",
+      cronExpression,
+      timezone: timezone ?? "system default",
+      at: new Date().toISOString(),
+    }),
+  );
+
+  return task;
+}
+
+// -- TikTok Shop counterparts. Same parallel-function call as the other
+// five above -- still not enough shared shape to justify a generic
+// abstraction with six channels wired this way, and
+// tiktok_order_sync_run needs to stay its own distinguishable log event
+// same as the other five.
+
+const DEFAULT_TIKTOK_CRON_EXPRESSION = "*/5 * * * *"; // every 5 minutes, same conservative default as the other five
+
+export interface TikTokOrderSyncSchedulerOptions {
+  appPool: Pool;
+  adminPool: Pool;
+  cronExpression?: string;
+  timezone?: string;
+  maxRetries?: number;
+  retryDelayMs?: number;
+}
+
+/** TikTok counterpart to {@link runTemuOnceWithRetry} -- see its doc comment
+ *  for the retry contract (systemic-failure-only; a single tenant's failure
+ *  is already caught and returned as a non-throwing result inside
+ *  runTikTokOrderSyncJob's own syncTikTokTenant). */
+export async function runTikTokOnceWithRetry(
+  appPool: Pool,
+  adminPool: Pool,
+  maxRetries: number = DEFAULT_MAX_RETRIES,
+  retryDelayMs: number = DEFAULT_RETRY_DELAY_MS,
+): Promise<void> {
+  const startedAt = Date.now();
+  const runId = new Date(startedAt).toISOString();
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      const results = await runTikTokOrderSyncJob(appPool, adminPool);
+      console.log(
+        JSON.stringify({
+          event: "tiktok_order_sync_run",
+          runId,
+          attempt,
+          success: true,
+          durationMs: Date.now() - startedAt,
+          ...summarizeResults(results),
+        }),
+      );
+      return;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const willRetry = attempt <= maxRetries;
+      console.error(
+        JSON.stringify({
+          event: "tiktok_order_sync_run",
+          runId,
+          attempt,
+          success: false,
+          durationMs: Date.now() - startedAt,
+          error: message,
+          willRetry,
+        }),
+      );
+      if (!willRetry) {
+        captureError(err, { event: "tiktok_order_sync_run", runId, attempt });
+        return;
+      }
+      await sleep(retryDelayMs * attempt);
+    }
+  }
+}
+
+/** TikTok counterpart to {@link startTemuOrderSyncScheduler} -- same
+ *  noOverlap reasoning (two overlapping passes could race to write the same
+ *  tenant's channel_connections.last_order_sync_at row). A separate
+ *  node-cron task from the other five, so all six channels' polling
+ *  cadences can be tuned independently and started/stopped on their own. */
+export function startTikTokOrderSyncScheduler(options: TikTokOrderSyncSchedulerOptions): ScheduledTask {
+  const {
+    appPool,
+    adminPool,
+    cronExpression = DEFAULT_TIKTOK_CRON_EXPRESSION,
+    timezone,
+    maxRetries = DEFAULT_MAX_RETRIES,
+    retryDelayMs = DEFAULT_RETRY_DELAY_MS,
+  } = options;
+
+  const task = schedule(cronExpression, () => runTikTokOnceWithRetry(appPool, adminPool, maxRetries, retryDelayMs), {
+    name: "tiktok-order-sync",
+    noOverlap: true,
+    timezone,
+  });
+
+  task.on("execution:overlap", () => {
+    console.warn(JSON.stringify({ event: "tiktok_order_sync_skipped_overlap", at: new Date().toISOString() }));
+  });
+
+  console.log(
+    JSON.stringify({
+      event: "tiktok_order_sync_scheduler_started",
       cronExpression,
       timezone: timezone ?? "system default",
       at: new Date().toISOString(),

@@ -36,6 +36,7 @@ SAFE_TESTS=(
   "packages/channel-connectors/test/walmart-connector.test.ts"
   "packages/channel-connectors/test/ebay-connector.test.ts"
   "packages/channel-connectors/test/temu-connector.test.ts"
+  "packages/channel-connectors/test/tiktok-connector.test.ts"
   "packages/channel-connectors/test/retry.test.ts"
   "packages/db/test/channel-connections-rls.test.ts"
   "packages/db/test/hr-rls.test.ts"
