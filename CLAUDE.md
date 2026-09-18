@@ -425,17 +425,33 @@ since **that same real connection immediately surfaced a real production bug**:
   real seller's actual order data post-fix — that confirmation happens on the next
   scheduled sync (or a manual trigger) after this ships to production.
 
-**Unverified until production**: two more pieces of Amazon integration are
-implemented and confirmed to reach live SP-API infrastructure with a correct request
-shape (or, for `createListing()`, cross-confirmed from real community examples), but
-can't be proven to actually succeed until run against a real seller account —
+**Update — `createListing()` now confirmed against real SP-API sandbox
+infrastructure** (`npm run amazon:create-listing-smoke-test`, NA sandbox host, same
+one `pushInventory()`'s own sandbox pass already used): a real `PUT
+requirements=LISTING_OFFER_ONLY` request against a fake sandbox ASIN/SKU succeeded
+end to end — LWA auth, the `merchant_suggested_asin`/`condition_type`/
+`purchasable_offer`/`fulfillment_availability` request shape, and a real HTTP success
+response all confirmed live, on the first attempt (no bugs found this pass, unlike
+eBay's own equivalent push — see §4.6). Same caveat `pushInventory()`'s own sandbox
+pass already carries: the SP-API sandbox round-trips the request shape and an HTTP
+success without persisting a real, queryable listing, so a live production
+ASIN/account is still the only way to prove an actual listing goes publicly live —
+not pursued this pass, since that would mean creating a real, purchasable Amazon
+offer under the connected seller's real account, a materially different risk than a
+disposable sandbox call.
+
+**Still unverified until run against a real order in production**:
 
 - `AmazonConnector.confirmShipment()` — the static sandbox has no matching test
-  scenario for this operation on this account; see its doc comment in
-  `packages/channel-connectors/src/amazon-connector.ts` for what was tried.
-- `AmazonConnector.createListing()` — this environment's network policy blocks
-  `api.amazon.com` outright, so not even a sandbox call has been possible; see the
-  bullet above.
+  scenario for this operation on this account (confirmed across multiple attempts,
+  including Amazon's own documented example values); see its doc comment in
+  `packages/channel-connectors/src/amazon-connector.ts` for what was tried. Unlike
+  `createListing()`, there's no safe sandbox-only way to close this gap — a genuine
+  success path can only be proven against a real order that has actually shipped,
+  which isn't something to fabricate for a test (falsely confirming shipment on an
+  order that didn't really ship is a real customer-facing action, not a disposable
+  sandbox call). This will verify itself organically the next time a real Amazon
+  order ships through this app in production, rather than being a task to force.
 
 ### 4.2 Walmart Marketplace API (build second — structurally different, feed/poll-heavy)
 
@@ -602,6 +618,10 @@ original build before `createListing()` existed — `authenticate`/`pullOrders`/
 `pushInventory`/`confirmShipment` only, no `submitListing`/`getFeedStatus`/
 `subscribeToEvents`, and (per Arif's own explicit scope decision) no outbound listing
 creation at all this pass either.
+
+Channel #6 (TikTok Shop, §4.8) is the same shape again — `authenticate`/`pullOrders`/
+`pushInventory`/`confirmShipment` only, per Arif's own explicit "Full connector, like
+eBay/Temu v1" scope decision.
 
 ### 4.4 Handling API rate limits (critical — causes most production incidents)
 
@@ -1027,9 +1047,13 @@ creation at all this pass either.
   already there rather than constructing a full replace body from scratch, since this
   codebase has no confirmed-against-a-literal-example shape for the `product`/
   `condition`/`packageWeightAndSize` fields a from-scratch body would need). A SKU with
-  an existing published offer may not show the new quantity live on eBay even though
+    an existing published offer may not show the new quantity live on eBay even though
   this call succeeds — a real, documented narrowing, same spirit as Amazon's/Walmart's
-  own "MFN/DEFAULT fulfillment channel only" `pushInventory()` scope.
+  own "MFN/DEFAULT fulfillment channel only" `pushInventory()` scope. **Confirmed
+  against real eBay Sandbox infrastructure** — see the "Update — confirmed live
+  against real eBay Sandbox infrastructure" paragraph at the end of this section for
+  the full trace, including a real bug this exact method's own GET call had (no
+  `Accept-Language` header at all, not even the wrong one).
 - **`confirmShipment()`**: `GET` the order for its line items, then
   `POST /sell/fulfillment/v1/order/{orderId}/shipping_fulfillment` — endpoint pattern
   and body field names (`lineItems`, `shippedDate`, `shipmentTrackingNumber`,
@@ -1098,12 +1122,14 @@ creation at all this pass either.
     `'pending'` state) — like Amazon's/Shopify's own synchronous
     `createListing()` methods, the outcome (a real eBay `listingId`) comes back in the
     same call, nothing to poll for.
-  - **UNVERIFIED, same status as the rest of this connector**: this environment's
-    network block on `api.ebay.com`/`api.sandbox.ebay.com` (§4.6's own opening
-    paragraph) means none of `fetchBusinessPolicies()`/`createMerchantLocation()`/
-    `createListing()` has been exercised against live infrastructure — only the two new
-    pure body-building functions (`buildEbayInventoryItemBody`/`buildEbayOfferBody`) are
-    unit-tested (`packages/channel-connectors/test/ebay-connector.test.ts`, 30 tests).
+  -   - **Confirmed against real eBay Sandbox infrastructure** — `fetchBusinessPolicies()`,
+    `createMerchantLocation()`, and `createListing()` have all now been run for real
+    (see the "Update — confirmed live" paragraph at the end of this section for the
+    full trace, including two real bugs this pass found and fixed in
+    `createListing()`'s own three-step write). The two pure body-building functions
+    (`buildEbayInventoryItemBody`/`buildEbayOfferBody`) stay unit-tested as before
+    (`packages/channel-connectors/test/ebay-connector.test.ts`), now asserting the
+    hardcoded-aspects fix described below too.
 - **Wired into the app** (no new migration — reuses the same `channel_connections`
   columns Amazon's own row already uses: `lwa_client_id` for the OAuth client id,
   `encrypted_client_secret`/`encrypted_refresh_token` for the real refresh-token pair,
@@ -1131,31 +1157,74 @@ creation at all this pass either.
   to `createEbayConnectorFromChannelConnection` on `order.channel === "ebay"`,
   alongside the other three branches. `recordSyncFailure`/`recordSyncSuccess`/
   `recordRateLimitTrip`'s `channel` parameter type was widened to include `"ebay"`.
-- **UNVERIFIED IN ITS ENTIRETY, more so than any other channel in this codebase**: this
-  environment's outbound network policy blocks **both** `api.ebay.com` and
-  `api.sandbox.ebay.com` entirely (confirmed directly — a token-exchange `curl` to each
-  host was rejected at the proxy level, the same class of block already documented for
-  `api.amazon.com`), on top of there being no eBay sandbox/production credentials
-  anywhere in this codebase yet (same "no self-serve sandbox" starting position
-  Walmart's connector carried, see `.env.example`'s `EBAY_SANDBOX_*` entries). So
-  nothing eBay-related has been exercised against live infrastructure of any kind, not
-  even once — unlike Amazon (proven against its SP-API sandbox) or Shopify (proven
-  against a real dev store), and even more unverified than Walmart's own wiring (which
-  at least confirmed its single most important request shape against one official doc
-  page's literal rendered JSON example). Several of this connector's own shapes were
-  cross-confirmed across multiple independent sources (official doc pages, a real
-  OpenAPI spec file mirror on GitHub, and community-written generated API-client docs)
-  specifically because individual eBay doc pages fetched during this pass were
-  frequently thin/templated and didn't render literal examples the way Amazon's/
-  Walmart's better-preserved pages did — see each method's own doc comment in
-  `packages/channel-connectors/src/ebay-connector.ts` for exactly what was confirmed
-  where. Pure request/response mapping logic (`normalizeEbayOrder`/
-  `normalizeEbayOrderLine`, plus `ebay-oauth.ts`'s URL-building/parsing) is unit-tested
-  (`packages/channel-connectors/test/ebay-connector.test.ts`) — everything past that
-  boundary (`authenticate`, `pullOrders`, `pushInventory`, `confirmShipment`, the OAuth
-  token exchange) stays a well-researched first draft until run against real
-  credentials, exactly the status Amazon and Walmart each carried before their own
-  first live pass.
+- - **Update — confirmed live against real eBay Sandbox infrastructure, closing out
+  the "UNVERIFIED IN ITS ENTIRETY" status this section used to carry**: the network
+  block described below is specific to the sandboxed AI coding-agent environment this
+  connector was originally built in, not a real limitation of eBay's own APIs — run
+  from a genuine developer machine with real eBay Sandbox credentials
+  (`EBAY_SANDBOX_*` populated, a real refresh token obtained via the authorization-
+  code round trip), `npm run ebay:sandbox-smoke-test` reaches `api.sandbox.ebay.com`
+  cleanly. **Five of the connector's six methods are now confirmed working against
+  live infrastructure**: `authenticate()` (refresh-token exchange), `pullOrders()`
+  (round-trips cleanly; a fresh sandbox seller account has no orders until a test-buyer
+  purchase exists, so this returns zero rather than being provably exhaustive),
+  `fetchBusinessPolicies()`, `createMerchantLocation()`, `createListing()` (a real
+  `listingId` returned), and `pushInventory()`. Only `confirmShipment()` remains
+  unverified — it needs a real sandbox order, meaning a second test-buyer account
+  actually completing a purchase, which was deliberately not pursued this pass as a
+  materially bigger, less certain lift than everything else here (see the sandbox-UI
+  unreliability note below); it stays a well-researched first draft, exactly the
+  status every other method in this connector carried before this pass.
+  - **Sandbox setup itself needed a workaround, not just credentials**: a fresh
+    sandbox seller account has no Business Policies (fulfillment/payment/return)
+    configured by default, and `fetchBusinessPolicies()` failed with a misleading
+    `400 20403: Invalid .` (an empty field name in eBay's own error template) until
+    one policy of each type existed. eBay's sandbox web UI could not create them —
+    both the legacy "My eBay Active" page and Seller Hub returned outright errors
+    (a load failure and a 404, respectively), confirming eBay's own "Sandbox
+    Supported/Unsupported Features" disclaimer is real for this feature. Worked
+    around with a one-off local script calling eBay's Account API directly
+    (`POST /sell/account/v1/program/opt_in` + one `POST` each to
+    `{fulfillment,payment,return}_policy`) — not part of this codebase, a one-time
+    manual setup step the same way a real tenant's own eBay seller account would
+    already have these configured through eBay's normal (non-sandbox) seller tools.
+  - **PRODUCTION BUG #1, found and fixed**: every Inventory API write this connector
+    makes (`createOrReplaceInventoryItem` PUT, `createOffer` POST, `publishOffer`
+    POST) — and, it turned out, `pushInventory()`'s own read-before-merge GET too —
+    needs an `Accept-Language` header in addition to `Content-Language`; this
+    connector only ever sent the latter. eBay's own error
+    (`400 25709: Invalid value for header Accept-Language`) is misleading — it reads
+    the same whether the header is present-but-wrong or missing outright, which cost
+    real debugging time before the fix was found. Fixed on all four call sites (three
+    writes plus `pushInventory()`'s GET) — this would have broken `createListing()`
+    and `pushInventory()` for every real tenant, not just this test, so this is a
+    genuine production-bug fix, not a smoke-test artifact.
+  - **PRODUCTION BUG #2, found and fixed, narrower in scope**: `publishOffer()`
+    rejected the smoke test's first listing category (Cell Phones & Smartphones,
+    `categoryId 9355`) four times in a row, each for a different missing required
+    "item specific" (Brand, then Storage Capacity, then Model, then Color) — eBay's
+    Inventory API validates these per-category, and this connector had no handling
+    for them at all. `buildEbayInventoryItemBody()` now hardcodes three generic
+    values (`Brand: "Unbranded"`, `"Storage Capacity": "64 GB"`, `Model: "Does not
+    apply"` — all eBay's own recognized conventions for a generic/inapplicable
+    value) as a narrow v1 default, same spirit as this method's existing hardcoded
+    `condition`/`marketplaceId`/`format`. **This is explicitly not a general fix**:
+    a category could still reject for a different required aspect this hardcoded
+    set doesn't cover (Color and Network are both plausible for other categories),
+    since this codebase still has no Taxonomy-API-driven variable aspects system —
+    deliberately out of scope, per this section's own "Per-listing form fields"
+    bullet above. After four required-aspect rounds in a row for one category, the
+    smoke test itself was switched to a genuinely zero-required-aspect category
+    (Postcards, `categoryId 262042`) found by querying eBay's own Taxonomy API
+    (`get_category_suggestions` + `get_item_aspects_for_category`) rather than
+    continuing to guess — a real tenant listing into a dense category (electronics,
+    apparel) will still hit this same wall and need their own category-appropriate
+    aspects collected, which this codebase does not do.
+  - Pure request/response mapping logic (`normalizeEbayOrder`/`normalizeEbayOrderLine`,
+    plus `ebay-oauth.ts`'s URL-building/parsing, plus the two aspect-hardcoding
+    body-builders) stays unit-tested
+    (`packages/channel-connectors/test/ebay-connector.test.ts`) alongside this live
+    verification, not in place of it.
 
 ### 4.7 Temu Open Platform (channel #5 — Arif's explicit pick, "add temu")
 
@@ -1292,6 +1361,129 @@ creation at all this pass either.
   `buildTemuSignature`/`buildTemuRequestBody`, `parseTemuProductId`) is unit-tested
   (`packages/channel-connectors/test/temu-connector.test.ts`, 19 tests) — everything past
   that boundary stays unverified until run against real credentials.
+
+  ### 4.8 TikTok Shop Open Platform (channel #6 — Arif's explicit pick, "add tiktok shop connector")
+
+- **Why now, and what scope**: same "next expansion once the abstraction had proven
+  itself" reasoning as eBay's and Temu's own additions (§4.6/§4.7) — Arif's explicit
+  request, clarified via an explicit follow-up AskUserQuestion decision: **"Full
+  connector, like eBay/Temu v1"** — `authenticate()`/`pullOrders()`/`pushInventory()`/
+  `confirmShipment()` only, no outbound listing creation, does not implement the shared
+  `ChannelConnector` interface (§4.3).
+- **Research trail — the official docs had the same "unreadable JS SPA" problem Temu's
+  own did, worked around the same way**: `partner.tiktokshop.com/docv2/...` is a pure
+  JavaScript SPA — every page fetched this pass (including literal, search-surfaced
+  pages titled "Sign your API request" and "Get Package Detail") returned only
+  navigation chrome, no documentation content.
+  - PRIMARY confirmed source: a real, detailed technical integration spike written up
+    as a GitHub issue (`github.com/openlinker-project/openlinker#2882`), dated the same
+    week as this research pass — base URLs, the OAuth token exchange/refresh flow, the
+    full request-signing algorithm, and a broad endpoint inventory (orders, packages,
+    inventory, returns). The single best source found for this connector, comparable
+    in detail to eBay's own official doc pages and materially better than anything
+    found for Temu.
+  - CROSS-CONFIRMED, not taken on one source alone: base URLs and the
+    app_key/access_token/shop_cipher credential model both independently match a
+    second, unrelated source — the Go package `github.com/jianjungki/tiktok`, read via
+    `pkg.go.dev`'s plain server-rendered documentation (unlike the official SPA, this
+    actually renders). That Go package's own literal endpoint paths
+    (`/api/fulfillment/...`) were deliberately NOT used — they don't match the
+    versioned `/{category}/{YYYYMM}/{action}` shape the openlinker spike documents as
+    current, reading instead as an older/legacy API generation. Two more sources
+    (npm's `tiktok-shop-sdk`, EcomPHP's `tiktokshop-php`) corroborated the credential
+    model's shape without themselves exposing readable endpoint/signing detail.
+  - What's NOT confirmed by anything found this pass: literal response field names for
+    an order/line item (every source gave endpoint paths and the credential/signing
+    model, none rendered an actual example JSON response) — same gap Temu's own
+    connector carries. See `tiktok-connector.ts`'s own header comment and each
+    type/method's own doc comment for exactly what's confirmed where.
+- **Auth**: a genuine OAuth refresh flow, closer to Amazon's/eBay's own shape than to
+  Temu's static token — but structurally unusual in its own way: `GET
+  https://auth.tiktok-shops.com/api/v2/token/refresh` with `app_key`/`app_secret`/
+  `refresh_token`/`grant_type=refresh_token` as a **plain, unsigned query string**
+  against a separate auth host, not the signed-request convention every business-API
+  call uses. Access token reported ~7-day expiry, refresh token ~365 days (both read
+  from the response, never hardcoded). The access token travels on every business-API
+  call via the `x-tts-access-token` header — not `Authorization`, not the signed query
+  string.
+- **A fifth credential value, unique among this codebase's channels**: `shop_cipher` —
+  a genuinely independent per-shop identifier (one `app_key`/`access_token` pair can
+  cover multiple shops, each with its own cipher, obtained from
+  `/authorization/202309/shops`), required as a query param on most business-API calls
+  (the spike names ~7 exempt endpoint families, none of which this v1 connector calls).
+- **Signing** (`buildTikTokSignature`, confirmed from the openlinker spike's own
+  step-by-step description, not independently re-verified against a second worked
+  example the way Temu's MD5 algorithm was confirmed against real SDK source): sort
+  every non-array-valued query param alphabetically, concatenate as `key` immediately
+  followed by `value` with no separators, **prepend the request PATH** (unlike Temu's/
+  eBay's own signing, the URL path itself is part of what's signed), append the raw
+  JSON request body for a non-GET call, wrap as `appSecret + <string> + appSecret`,
+  **HMAC-SHA256** keyed with `appSecret` (not Temu's MD5), lowercase hex.
+- **`pullOrders()`**: `POST /order/202309/orders/search` (paginated via
+  `next_page_token`, bounded by a 250-page safety cap same spirit as eBay's own
+  `EBAY_ORDERS_MAX_PAGES`), body `filter.update_time_ge` (unix seconds) as the closest
+  confirmed analog to every other connector's `since` cursor — the field NAME is
+  confirmed from the spike, its exact position inside a `filter` object is this
+  codebase's own inferred shape. Falls back to `GET /order/202309/orders?ids=...`
+  (batched 50 ids/call, a commonly-cited but not officially-confirmed limit) only for
+  orders the search response didn't already include line items for, per-batch
+  error-isolated the same way Temu's own per-order detail lookup is.
+- **`pushInventory()` — the single least-confirmed request body in this connector**,
+  same "flag it, don't hide it" precedent Temu's own `skuStockTargetList` sets: `POST
+  /product/202309/products/{productId}/inventory/update`, body
+  `{ skus: [{ id: skuId, inventory: [{ warehouse_id, quantity }] }] }` — no source
+  found this pass rendered a literal example of this endpoint. `productId` is a
+  compound `"<productId>:<skuId>"` string (`parseTikTokProductId`), same pattern
+  Temu's own `parseTemuProductId` established — and this connector needs a THIRD value
+  beyond that pair: `warehouse_id`, read from a single tenant-wide
+  `TIKTOK_DEFAULT_WAREHOUSE_ID` env var rather than a second compound-id scheme,
+  correct only for a seller with one TikTok-registered warehouse (a real, documented
+  v1 narrowing).
+- **`confirmShipment()` — this connector's other major unconfirmed piece**: TikTok's
+  own fulfillment model treats an order and its package(s) as genuinely distinct
+  objects (an order can be combined/split/uncombined into one or more packages, per
+  the spike), and no endpoint to resolve an orderId to its package id(s) was found
+  rendered anywhere this pass. `POST /fulfillment/202309/packages/{orderId}/ship`
+  passes this method's own whole-order id directly into the package-ship endpoint's
+  `{id}` segment, on the unconfirmed assumption that a simple, never-combined-or-split
+  order's package id equals its order id — a genuine, unresolved risk, not a resolved
+  design decision, same honesty standard Temu's own `orderSn`/sub-order-sn risk is held
+  to. `tracking.carrier` is passed straight into `shipping_provider_id` with no
+  mapping/validation against whatever provider-id scheme TikTok actually expects — no
+  confirmed lookup/enum was found, same gap eBay's own `confirmShipment()` carries.
+- **No new migration needed** — reuses existing `channel_connections` columns:
+  `lwa_client_id` = `appKey`, `encrypted_client_secret` = `appSecret`,
+  `encrypted_access_token` = `accessToken`, `encrypted_refresh_token` = `refreshToken`,
+  `external_account_id` = `shop_cipher`. That last one is a genuinely BETTER semantic
+  fit than every other channel's own reuse of this column — Amazon/Walmart/eBay/Temu
+  all reuse `external_account_id` to hold their OWN client/app id ("no independent
+  seller id exists to put here instead," each connector's own doc comment says) —
+  TikTok Shop is the first channel in this codebase where a real, independent per-shop
+  identifier (`shop_cipher`) actually exists, so this is `external_account_id` finally
+  being used for what its name says, not a repurposing.
+- **NOT yet wired into the app** — unlike every other channel in this codebase
+  (§4.1–§4.7), this pass is scoped to the connector package only:
+  `packages/channel-connectors/src/tiktok-connector.ts` plus its unit tests
+  (`packages/channel-connectors/test/tiktok-connector.test.ts`, 21 tests — pure
+  signing/normalization logic, same split as every other connector's own test file).
+  There is no `/settings/channels` "Connect TikTok Shop" form, no
+  `createTikTokConnectorFromChannelConnection` caller anywhere in the scheduler, no
+  `GET /api/cron/tiktok-order-sync` route, and no `vercel.json` cron entry yet — the
+  same "connector built, app wiring is separate follow-up work" stage every other
+  channel passed through before its own "Wired into the app" paragraph could be
+  written. `loadTikTokCredentialsFromChannelConnection`/
+  `createTikTokConnectorFromChannelConnection` exist and are ready for that wiring
+  pass to call, mirroring every other channel's own two-source credential pattern
+  (env for scripts/manual testing, `channel_connections` for a real tenant).
+- **UNVERIFIED IN ITS ENTIRETY**, same status Temu's own connector carries and for the
+  same reason: no TikTok credentials of any kind exist anywhere in this codebase yet
+  (see `.env.example`'s `TIKTOK_*` entries), no confirmed self-serve sandbox exists to
+  test against safely, and this is a well-researched first draft, not a proven
+  implementation. Pure mapping/signing logic (`normalizeTikTokOrder`/
+  `normalizeTikTokOrderLine`, `buildTikTokSignature`, `parseTikTokProductId`) is
+  unit-tested; everything past that boundary (`authenticate`, `pullOrders`,
+  `pushInventory`, `confirmShipment`) stays unverified until run against real
+  credentials.
 
 ## 5. Technology Stack
 
@@ -1452,10 +1644,11 @@ creation at all this pass either.
     Phase 4 — not a change to the phase order itself, just worth deciding deliberately
     rather than by default. The `/reports` first pass above doesn't resolve this
     either way — it's cheap enough at today's volume that the decision can still wait.
-- **Phase 5 — Scale features (Months 9-12+)**: eBay and Temu — both built ahead of the
-  rest of this phase, see §4.6/§4.7 — /TikTok Shop/additional channels. Stock
-  forecasting. B2B portal (if pursuing Cin7-style ERP breadth). SOC 2 prep if
-  targeting mid-market.
+- - **Phase 5 — Scale features (Months 9-12+)**: eBay, Temu, and TikTok Shop — all three
+  built ahead of the rest of this phase, see §4.6/§4.7/§4.8 (TikTok Shop's connector is
+  built but, unlike eBay's/Temu's, not yet wired into the app — see §4.8's own note) —
+  /additional channels. Stock forecasting. B2B portal (if pursuing Cin7-style ERP
+  breadth). SOC 2 prep if targeting mid-market.
 
 ## 9. Deployment & DevOps
 

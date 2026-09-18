@@ -6,4 +6,5 @@ export * from "./shopify-connector.js";
 export * from "./ebay-connector.js";
 export * from "./ebay-oauth.js";
 export * from "./temu-connector.js";
+export * from "./tiktok-connector.js";
 export * from "./retry.js";
