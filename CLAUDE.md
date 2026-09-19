@@ -1047,7 +1047,7 @@ eBay/Temu v1" scope decision.
   already there rather than constructing a full replace body from scratch, since this
   codebase has no confirmed-against-a-literal-example shape for the `product`/
   `condition`/`packageWeightAndSize` fields a from-scratch body would need). A SKU with
-    an existing published offer may not show the new quantity live on eBay even though
+  an existing published offer may not show the new quantity live on eBay even though
   this call succeeds — a real, documented narrowing, same spirit as Amazon's/Walmart's
   own "MFN/DEFAULT fulfillment channel only" `pushInventory()` scope. **Confirmed
   against real eBay Sandbox infrastructure** — see the "Update — confirmed live
@@ -1061,12 +1061,37 @@ eBay/Temu v1" scope decision.
   in prose rather than a literal rendered example (unlike Amazon's/Walmart's own
   confirmShipment() bodies). `shippingCarrierCode` is set directly from
   `tracking.carrier` with **no mapping/validation against eBay's own carrier-code
-  enum** — unlike Amazon's confirmShipment(), which deliberately uses the
-  always-valid `'Other'` + carrierName combination, no equivalent always-valid
-  fallback was confirmed for eBay this pass, so an arbitrary carrier string may be
-  rejected by eBay's own enum validation. Single-fulfillment assumption (every line
-  ships together, same tracking info applied to all) — same documented limitation
-  Amazon's/Walmart's own confirmShipment() carry.
+  enum**. **Narrowed further this pass**: eBay's own `ShippingFulfillmentDetails` type
+  page confirms this field is a plain `string`, not a REST-API-level fixed enum — but
+  says valid values must be looked up per-marketplace via the *legacy* Trading API's
+  `GeteBayDetails` (`DetailName=ShippingServiceDetails`) call, a genuinely separate
+  auth flow/credential shape from the REST OAuth token this connector otherwise uses
+  entirely. No universal fallback (no `"Other"`/`"OTHER"`) is documented as always
+  valid anywhere — unlike Amazon's confirmShipment(), which deliberately uses the
+  confirmed always-valid `'Other'` + carrierName combination, eBay has no equivalent
+  escape hatch; the only literal example carrier value any official page rendered was
+  `"USPS"`. In this app, `tracking.carrier` comes straight from a free-text "Carrier
+  (e.g. UPS)" field on `/picklists` (`PackOrderForm`) — untouched, unvalidated. Fixing
+  this properly means adding the legacy Trading API's `GeteBayDetails` call, a real
+  scope increase, not attempted here. Single-fulfillment assumption (every line ships
+  together, same tracking info applied to all) — same documented limitation Amazon's/
+  Walmart's own confirmShipment() carry.
+- **Getting a real sandbox order to test `confirmShipment()` against is itself an
+  open, externally-blocked problem, not something more of this codebase's own code can
+  solve**: eBay's own developer community (multiple forum threads checked directly)
+  confirms sandbox order-creation for Fulfillment API testing is a known, long-standing
+  pain point with no officially confirmed working method — one thread's own author,
+  after failing both the API route (`AddOrder`-style Trading API calls not reaching
+  fulfillment) and the sandbox website (checkout errors), reported resorting to testing
+  against real production instead. This matches what this section's own "Sandbox setup
+  itself needed a workaround" note below already found for Business Policies (My eBay
+  Active and Seller Hub both erroring in sandbox) — eBay's sandbox is confirmed
+  unreliable for more than one seller-side workflow, not just this one. Until either
+  eBay ships a working sandbox path or this channel goes live against a real production
+  order, `confirmShipment()` stays a well-researched, unverified first draft — the
+  same status Temu's and TikTok's connectors carry, for a related but distinct reason
+  (those two lack readable official docs at all; this one has readable docs but a
+  broken sandbox for exactly the scenario that would prove it).
 - **Outbound listing creation — built, closing the prerequisite gap this section used
   to flag as out of scope entirely** (`EbayConnector.createListing()`,
   `fetchBusinessPolicies()`, `createMerchantLocation()`, migration
@@ -1122,7 +1147,7 @@ eBay/Temu v1" scope decision.
     `'pending'` state) — like Amazon's/Shopify's own synchronous
     `createListing()` methods, the outcome (a real eBay `listingId`) comes back in the
     same call, nothing to poll for.
-  -   - **Confirmed against real eBay Sandbox infrastructure** — `fetchBusinessPolicies()`,
+  - **Confirmed against real eBay Sandbox infrastructure** — `fetchBusinessPolicies()`,
     `createMerchantLocation()`, and `createListing()` have all now been run for real
     (see the "Update — confirmed live" paragraph at the end of this section for the
     full trace, including two real bugs this pass found and fixed in
@@ -1157,7 +1182,7 @@ eBay/Temu v1" scope decision.
   to `createEbayConnectorFromChannelConnection` on `order.channel === "ebay"`,
   alongside the other three branches. `recordSyncFailure`/`recordSyncSuccess`/
   `recordRateLimitTrip`'s `channel` parameter type was widened to include `"ebay"`.
-- - **Update — confirmed live against real eBay Sandbox infrastructure, closing out
+- **Update — confirmed live against real eBay Sandbox infrastructure, closing out
   the "UNVERIFIED IN ITS ENTIRETY" status this section used to carry**: the network
   block described below is specific to the sandboxed AI coding-agent environment this
   connector was originally built in, not a real limitation of eBay's own APIs — run
@@ -1362,7 +1387,7 @@ eBay/Temu v1" scope decision.
   (`packages/channel-connectors/test/temu-connector.test.ts`, 19 tests) — everything past
   that boundary stays unverified until run against real credentials.
 
-  ### 4.8 TikTok Shop Open Platform (channel #6 — Arif's explicit pick, "add tiktok shop connector")
+### 4.8 TikTok Shop Open Platform (channel #6 — Arif's explicit pick, "add tiktok shop connector")
 
 - **Why now, and what scope**: same "next expansion once the abstraction had proven
   itself" reasoning as eBay's and Temu's own additions (§4.6/§4.7) — Arif's explicit
@@ -1461,7 +1486,7 @@ eBay/Temu v1" scope decision.
   TikTok Shop is the first channel in this codebase where a real, independent per-shop
   identifier (`shop_cipher`) actually exists, so this is `external_account_id` finally
   being used for what its name says, not a repurposing.
-- - **Wired into the app**, mirroring Temu's own wiring exactly: `/settings/channels` has
+- **Wired into the app**, mirroring Temu's own wiring exactly: `/settings/channels` has
   a plain "Connect TikTok Shop" form (App Key + App Secret + Access Token + Refresh
   Token + Shop Cipher — five fields, more than any other channel's own form, because
   TikTok Shop's credential model genuinely has five independent parts, see above — all
@@ -1649,7 +1674,7 @@ eBay/Temu v1" scope decision.
     Phase 4 — not a change to the phase order itself, just worth deciding deliberately
     rather than by default. The `/reports` first pass above doesn't resolve this
     either way — it's cheap enough at today's volume that the decision can still wait.
-- - - **Phase 5 — Scale features (Months 9-12+)**: eBay, Temu, and TikTok Shop — all three
+- **Phase 5 — Scale features (Months 9-12+)**: eBay, Temu, and TikTok Shop — all three
   built and wired into the app ahead of the rest of this phase, see §4.6/§4.7/§4.8 (all
   three remain UNVERIFIED against real infrastructure — no live credentials/sandbox for
   any of them yet, see each section's own note) — /additional channels. Stock

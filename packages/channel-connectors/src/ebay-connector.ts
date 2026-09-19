@@ -303,14 +303,37 @@ export interface EbayListingResult {
  *  AmazonListingSubmission's own doc comment already documents. */
 export interface CreateEbayInventoryItemBody {
   condition: "NEW";
-  product: { title: string; description: string; imageUrls: string[] };
+  product: {
+    title: string;
+    description: string;
+    imageUrls: string[];
+    aspects: { Brand: string[]; "Storage Capacity": string[]; Model: string[] };
+  };
   availability: { shipToLocationAvailability: { quantity: number } };
 }
 
+/** `product.aspects.Brand: ["Unbranded"]` is hardcoded -- found live, not
+ *  planned: publishOffer() rejected a real sandbox listing with "The item
+ *  specific Brand is missing" (eBay error 25002), since most real eBay
+ *  categories now require at least a Brand item specific before an offer
+ *  can publish, and this codebase has no Taxonomy-API-driven variable
+ *  aspects system (deliberately out of scope, see this file's header
+ *  comment on categoryId/imageUrl being plain unvalidated fields).
+ *  "Unbranded" is eBay's own standard value for exactly this generic/
+ *  no-real-brand case, same "narrow, hardcoded default" pattern this
+ *  method already uses for condition/marketplaceId/format -- not a full
+ *  fix for every category's own required-aspects set (a category could
+ *  still reject for a DIFFERENT missing aspect), just the single most
+ *  common one. */
 export function buildEbayInventoryItemBody(input: EbayListingSubmission): CreateEbayInventoryItemBody {
   return {
     condition: "NEW",
-    product: { title: input.title, description: input.description, imageUrls: [input.imageUrl] },
+        product: {
+      title: input.title,
+      description: input.description,
+      imageUrls: [input.imageUrl],
+      aspects: { Brand: ["Unbranded"], "Storage Capacity": ["64 GB"], Model: ["Does not apply"] },
+    },
     availability: { shipToLocationAvailability: { quantity: input.quantity } },
   };
 }
@@ -657,7 +680,10 @@ export class EbayConnector {
   async pushInventory(productId: string, quantity: number): Promise<SyncResult> {
     const path = `/sell/inventory/v1/inventory_item/${encodeURIComponent(productId)}`;
 
-    const getResponse = await this.authorizedFetch(path, { method: "GET" });
+      const getResponse = await this.authorizedFetch(path, {
+      method: "GET",
+      headers: { "Accept-Language": "en-US" },
+    });
     if (!getResponse.ok) {
       const data = (await getResponse.json().catch(() => ({}))) as EbayApiErrorResponse;
       const message = data.errors?.map((e) => `${e.errorId}: ${e.message}`).join("; ") ?? getResponse.statusText;
@@ -675,7 +701,7 @@ export class EbayConnector {
 
     const putResponse = await this.authorizedFetch(path, {
       method: "PUT",
-      headers: { "Content-Type": "application/json", "Content-Language": "en-US" },
+      headers: { "Content-Type": "application/json", "Content-Language": "en-US", "Accept-Language": "en-US" },
       body: JSON.stringify(merged),
     });
 
@@ -884,7 +910,7 @@ export class EbayConnector {
       `/sell/inventory/v1/inventory_item/${encodeURIComponent(input.sellerSku)}`,
       {
         method: "PUT",
-        headers: { "Content-Type": "application/json", "Content-Language": "en-US" },
+        headers: { "Content-Type": "application/json", "Content-Language": "en-US", "Accept-Language": "en-US" },
         body: JSON.stringify(buildEbayInventoryItemBody(input)),
       },
     );
@@ -896,7 +922,7 @@ export class EbayConnector {
 
     const offerResponse = await this.authorizedFetch(`/sell/inventory/v1/offer`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Content-Language": "en-US" },
+      headers: { "Content-Type": "application/json", "Content-Language": "en-US", "Accept-Language": "en-US" },
       body: JSON.stringify(buildEbayOfferBody(input, { fulfillmentPolicyId, paymentPolicyId, returnPolicyId }, merchantLocationKey)),
     });
     const offerData = (await offerResponse.json().catch(() => ({}))) as { offerId?: string } & EbayApiErrorResponse;
@@ -907,7 +933,7 @@ export class EbayConnector {
 
     const publishResponse = await this.authorizedFetch(
       `/sell/inventory/v1/offer/${encodeURIComponent(offerData.offerId)}/publish/`,
-      { method: "POST" },
+      { method: "POST", headers: { "Accept-Language": "en-US" } },
     );
     const publishData = (await publishResponse.json().catch(() => ({}))) as { listingId?: string } & EbayApiErrorResponse;
     if (!publishResponse.ok || !publishData.listingId) {
@@ -961,3 +987,4 @@ export function normalizeEbayOrder(order: EbayOrder): NormalizedOrder {
     rawPayload: order,
   };
 }
+
