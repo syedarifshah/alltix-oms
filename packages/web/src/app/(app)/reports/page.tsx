@@ -2,6 +2,7 @@ import type { ReactElement } from "react";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { withTenant } from "@alltix/db";
+import { assessStockForecast } from "@alltix/inventory-service";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
@@ -41,6 +42,14 @@ interface TroubleSpotRow {
   on_hand: number;
   reserved: number;
   available: number;
+}
+
+interface ReorderCandidateRow {
+  internal_sku: string;
+  product_name: string;
+  location_name: string;
+  available: number;
+  units_sold: string;
 }
 
 interface ReportsPageProps {
@@ -87,6 +96,12 @@ function parsePeriodDays(raw: string | undefined): number {
  * not a rounding one. The inventory section below reports units, not
  * dollars, for exactly that reason.
  *
+ * "Reorder soon" (CLAUDE.md §8 Phase 5's "stock forecasting" line, v1
+ * scope): reuses this page's own selected `periodDays` as the sales-velocity
+ * window, via @alltix/inventory-service's `assessStockForecast` -- the same
+ * pure function `/inventory` uses with its own fixed 30-day window. See that
+ * function's own doc comment for what it does and doesn't claim to predict.
+ *
  * "Revenue" here means gross order-line revenue for non-cancelled orders in
  * the selected period (`orders.placed_at`, not `created_at` -- a channel
  * order's placement date, matching how a merchant actually thinks about
@@ -120,7 +135,7 @@ export default async function ReportsPage({ searchParams }: ReportsPageProps): P
 
   const since = new Date(Date.now() - periodDays * 24 * 60 * 60 * 1000);
 
-  const { salesByChannel, topSkus, returnsSummary, inventorySnapshot, troubleSpots } = await withTenant(
+  const { salesByChannel, topSkus, returnsSummary, inventorySnapshot, troubleSpots, reorderCandidates } = await withTenant(
     pool,
     tenantId,
     async (client) => {
@@ -197,6 +212,33 @@ export default async function ReportsPage({ searchParams }: ReportsPageProps): P
           LIMIT 10`,
       );
 
+      // Reorder candidates (CLAUDE.md §8 Phase 5's "stock forecasting" line,
+      // v1 scope): still-in-stock (available > 0 -- already-out items are
+      // the troubleSpots query above, not repeated here) products/locations
+      // with recent sale velocity in THIS report's own selected period
+      // (`since`/`periodDays`, the same window every other figure on this
+      // page already uses -- no separate period concept introduced). The
+      // actual days-remaining/reorder-soon computation happens below via
+      // @alltix/inventory-service's assessStockForecast, same pure function
+      // /inventory uses with its own fixed 30-day window -- this query only
+      // fetches the raw ingredients (available + units sold in period), it
+      // doesn't decide what counts as "soon" itself.
+      const reorderCandidatesResult = await client.query<ReorderCandidateRow>(
+        `SELECT p.internal_sku, p.name AS product_name, loc.name AS location_name,
+                il.available, coalesce(sale.units_sold, 0)::text AS units_sold
+           FROM inventory_levels il
+           JOIN products p ON p.id = il.product_id
+           JOIN locations loc ON loc.id = il.location_id
+           JOIN LATERAL (
+                  SELECT sum(-ie.quantity_delta) AS units_sold
+                    FROM inventory_events ie
+                   WHERE ie.product_id = il.product_id AND ie.location_id = il.location_id
+                     AND ie.event_type = 'sale' AND ie.created_at >= $1
+                ) sale ON true
+          WHERE il.available > 0 AND sale.units_sold > 0`,
+        [since.toISOString()],
+      );
+
       return {
         salesByChannel: salesByChannelResult.rows,
         topSkus: topSkusResult.rows,
@@ -208,12 +250,26 @@ export default async function ReportsPage({ searchParams }: ReportsPageProps): P
           distinct_skus: "0",
         },
         troubleSpots: troubleSpotsResult.rows,
+        reorderCandidates: reorderCandidatesResult.rows,
       };
     },
   );
 
   const totalRevenue = salesByChannel.reduce((sum, row) => sum + Number(row.revenue), 0);
   const totalOrders = salesByChannel.reduce((sum, row) => sum + Number(row.order_count), 0);
+
+  // Reorder soon: compute each candidate's forecast over THIS page's own
+  // periodDays window, keep only ones the pure function itself flags
+  // reorderSoon, then show the most urgent (fewest days remaining) first --
+  // capped at 10, same list-size convention troubleSpots/topSkus above use.
+  const reorderSoon = reorderCandidates
+    .map((row) => ({
+      ...row,
+      forecast: assessStockForecast(row.available, Number(row.units_sold), periodDays),
+    }))
+    .filter((row) => row.forecast.reorderSoon)
+    .sort((a, b) => (a.forecast.daysRemaining ?? 0) - (b.forecast.daysRemaining ?? 0))
+    .slice(0, 10);
 
   return (
     <main className="page">
@@ -357,6 +413,49 @@ export default async function ReportsPage({ searchParams }: ReportsPageProps): P
             </table>
           </div>
         </>
+      )}
+
+      <h2>Reorder soon</h2>
+      <p className="subtitle">
+        Still in stock, but recent sales velocity over the last {periodDays} days puts them on track to run out soon — a
+        separate, velocity-based signal from the out-of-stock list above. See <a href="/inventory">/inventory</a> for the
+        per-row figure (fixed 30-day window) and every product/location, not just the top 10 most urgent shown here. A
+        product with low stock but no recent sales in this window won't appear here — see the inventory page's own note on
+        why that's a deliberate "unknown," not "safe."
+      </p>
+      {reorderSoon.length === 0 ? (
+        <p className="empty">Nothing trending toward stockout in this period.</p>
+      ) : (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>SKU</th>
+                <th>Product</th>
+                <th>Location</th>
+                <th>Available</th>
+                <th>Sold ({periodDays}d)</th>
+                <th>Est. days left</th>
+              </tr>
+            </thead>
+            <tbody>
+              {reorderSoon.map((row) => (
+                <tr key={`${row.internal_sku}:${row.location_name}`}>
+                  <td className="mono">{row.internal_sku}</td>
+                  <td>{row.product_name}</td>
+                  <td>{row.location_name}</td>
+                  <td>{row.available}</td>
+                  <td>{row.units_sold}</td>
+                  <td>
+                    <span className="badge badge-warning">
+                      ~{Math.round(row.forecast.daysRemaining ?? 0)}d
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </main>
   );

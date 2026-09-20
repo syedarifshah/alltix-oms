@@ -2,6 +2,7 @@ import type { ReactElement } from "react";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { withTenant } from "@alltix/db";
+import { assessStockForecast, DEFAULT_REORDER_THRESHOLD_DAYS, type StockForecast } from "@alltix/inventory-service";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
@@ -25,6 +26,19 @@ interface LocationRow {
   id: string;
   name: string;
 }
+
+interface SalesVelocityRow {
+  product_id: string;
+  location_id: string;
+  units_sold: string;
+}
+
+/** Fixed lookback for the velocity figure below -- same 30-day default
+ *  /reports uses (see that page's own PERIOD_CHOICES/DEFAULT_PERIOD_DAYS),
+ *  not exposed as a selector here since this page has no other period
+ *  concept to fit it into; /reports' own "Reorder soon" section lets a
+ *  tenant see the same signal over a different window if they want one. */
+const VELOCITY_WINDOW_DAYS = 30;
 
 interface InventoryPageProps {
   searchParams: Promise<{ error?: string; transferred?: string }>;
@@ -54,6 +68,21 @@ function riskBadge(risk: Risk): ReactElement {
   return <span className="badge badge-success">OK</span>;
 }
 
+/** Renders a StockForecast's daysRemaining -- see that type's own doc
+ *  comment (in @alltix/inventory-service) for why `null` is a distinct,
+ *  deliberate "no recent sales" state, never rendered as 0 or blank. */
+function forecastCell(forecast: StockForecast | undefined): ReactElement {
+  if (!forecast || forecast.daysRemaining === null) {
+    return <span className="muted">no recent sales</span>;
+  }
+  const days = Math.round(forecast.daysRemaining);
+  const label = `~${days}d`;
+  if (forecast.reorderSoon) {
+    return <span className="badge badge-warning">{label}</span>;
+  }
+  return <span>{label}</span>;
+}
+
 /**
  * The ATS (available-to-sell) view (CLAUDE.md §2.2): on_hand/reserved/
  * available per product/location, with per-channel buffer visible and
@@ -62,6 +91,12 @@ function riskBadge(risk: Risk): ReactElement {
  * already keeps current, per CLAUDE.md's "never let a channel adapter write
  * directly to inventory_levels" rule. Same auth/tenant pattern as every
  * other page in this app -- see src/app/orders/page.tsx's doc comment.
+ *
+ * "Est. days left" (CLAUDE.md §8 Phase 5's "stock forecasting" line, v1
+ * scope, @alltix/inventory-service's `assessStockForecast`) is a SEPARATE,
+ * velocity-based signal from the "Risk" column's buffer-based one above --
+ * see StockForecast's own doc comment for exactly how they differ and why
+ * both are shown rather than one replacing the other.
  */
 export default async function InventoryPage({ searchParams }: InventoryPageProps): Promise<ReactElement> {
   const authContext = await getAuthContext(await headers());
@@ -81,7 +116,9 @@ export default async function InventoryPage({ searchParams }: InventoryPageProps
     );
   }
 
-  const { rows, locations } = await withTenant(pool, tenantId, async (client) => {
+  const velocityWindowSince = new Date(Date.now() - VELOCITY_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+
+  const { rows, locations, velocityByKey } = await withTenant(pool, tenantId, async (client) => {
     const result = await client.query<InventoryRow>(
       `SELECT il.product_id, il.location_id, il.on_hand, il.reserved, il.available, il.channel_buffer, il.updated_at,
               p.internal_sku, p.name AS product_name, loc.name AS location_name
@@ -96,7 +133,23 @@ export default async function InventoryPage({ searchParams }: InventoryPageProps
     // (InventoryService.transferStock() creates one on the fly), which the
     // inner-joined query above would never surface.
     const locationsResult = await client.query<LocationRow>(`SELECT id, name FROM locations ORDER BY name`);
-    return { rows: result.rows, locations: locationsResult.rows };
+    // Recent sales velocity per (product, location) -- 'sale' events are
+    // recorded with a NEGATIVE quantity_delta (see
+    // WarehouseService.recordShipmentSaleEvents/InventoryService's own
+    // eventType table), so units actually sold is -sum(quantity_delta),
+    // straight off the same ledger table every other figure in this app
+    // reads from (CLAUDE.md §2.2's "never a raw mutable quantity" rule
+    // applies here too -- this is a read, not a new derived-and-stored
+    // number).
+    const velocityResult = await client.query<SalesVelocityRow>(
+      `SELECT product_id, location_id, sum(-quantity_delta)::text AS units_sold
+         FROM inventory_events
+        WHERE event_type = 'sale' AND created_at >= $1
+        GROUP BY product_id, location_id`,
+      [velocityWindowSince.toISOString()],
+    );
+    const velocityMap = new Map(velocityResult.rows.map((r) => [`${r.product_id}:${r.location_id}`, Number(r.units_sold)]));
+    return { rows: result.rows, locations: locationsResult.rows, velocityByKey: velocityMap };
   });
 
   // Every transferable product already has at least one inventory_levels
@@ -109,16 +162,29 @@ export default async function InventoryPage({ searchParams }: InventoryPageProps
 
   const outOfStockCount = rows.filter((r) => assessRisk(r.available, r.channel_buffer) === "zero").length;
   const lowStockCount = rows.filter((r) => assessRisk(r.available, r.channel_buffer) === "low").length;
+  const forecastByKey = new Map<string, StockForecast>(
+    rows.map((r) => {
+      const key = `${r.product_id}:${r.location_id}`;
+      const unitsSold = velocityByKey.get(key) ?? 0;
+      return [key, assessStockForecast(r.available, unitsSold, VELOCITY_WINDOW_DAYS)];
+    }),
+  );
+  const reorderSoonCount = [...forecastByKey.values()].filter((f) => f.reorderSoon).length;
 
   return (
     <main className="page">
       <h1>Inventory</h1>
       <p className="subtitle">Available-to-sell per product/location — the ledger-derived rollup, never edited directly.</p>
 
-      {rows.length > 0 && (outOfStockCount > 0 || lowStockCount > 0) && (
+      {rows.length > 0 && (outOfStockCount > 0 || lowStockCount > 0 || reorderSoonCount > 0) && (
         <div className="row" style={{ marginBottom: 16 }}>
           {outOfStockCount > 0 && <span className="badge badge-danger">{outOfStockCount} out of stock</span>}
           {lowStockCount > 0 && <span className="badge badge-warning">{lowStockCount} running low</span>}
+          {reorderSoonCount > 0 && (
+            <span className="badge badge-warning">
+              {reorderSoonCount} reorder soon (≤{DEFAULT_REORDER_THRESHOLD_DAYS}d left)
+            </span>
+          )}
         </div>
       )}
 
@@ -147,12 +213,14 @@ export default async function InventoryPage({ searchParams }: InventoryPageProps
                 <th>Available</th>
                 <th>Channel buffer</th>
                 <th>Risk</th>
+                <th>Est. days left</th>
               </tr>
             </thead>
             <tbody>
               {rows.map((row) => {
                 const risk = assessRisk(row.available, row.channel_buffer);
                 const bufferEntries = Object.entries(row.channel_buffer ?? {});
+                const forecast = forecastByKey.get(`${row.product_id}:${row.location_id}`);
                 return (
                   <tr key={`${row.product_id}:${row.location_id}`}>
                     <td className="mono">{row.internal_sku}</td>
@@ -175,6 +243,7 @@ export default async function InventoryPage({ searchParams }: InventoryPageProps
                       )}
                     </td>
                     <td>{riskBadge(risk)}</td>
+                    <td>{forecastCell(forecast)}</td>
                   </tr>
                 );
               })}

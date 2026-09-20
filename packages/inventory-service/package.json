@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc --noEmit -p .",
-    "test": "node --import tsx --test test/record-inventory-event.test.ts test/transfer-stock.test.ts test/transfer-stock-concurrency.test.ts"
+    "test": "node --import tsx --test test/record-inventory-event.test.ts test/transfer-stock.test.ts test/transfer-stock-concurrency.test.ts test/forecast.test.ts"
   },
   "dependencies": {
     "@alltix/db": "0.1.0",

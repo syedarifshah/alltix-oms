@@ -1674,12 +1674,53 @@ eBay/Temu v1" scope decision.
     Phase 4 — not a change to the phase order itself, just worth deciding deliberately
     rather than by default. The `/reports` first pass above doesn't resolve this
     either way — it's cheap enough at today's volume that the decision can still wait.
+- **Stock forecasting — built, v1 scope, moved up from Phase 5** (`@alltix/inventory-service`'s
+  `computeDailyVelocity`/`computeDaysOfStockRemaining`/`assessStockForecast`,
+  `/inventory`'s new "Est. days left" column, `/reports`' new "Reorder soon" section):
+  deliberately simple, not a demand-forecasting model — recent sales velocity (units
+  sold over a lookback window, from the same `inventory_events` ledger everything else
+  reads, `-sum(quantity_delta) WHERE event_type = 'sale'`) divided into current
+  `available` stock, nothing else. No seasonality, no trend detection, no external
+  signals, no purchase-order automation — the same "start simple, earn the complexity
+  later" call already made for the event bus, job queue, and `/reports`' own
+  plain-queries-not-CDC approach right above this bullet.
+  - Two call sites, two different windows, same pure functions: `/inventory` uses a
+    fixed 30-day lookback (no period selector on that page); `/reports`' new "Reorder
+    soon" section reuses that page's own existing `periodDays` selector (7/30/90/365)
+    instead of introducing a second, separate period concept.
+  - `computeDaysOfStockRemaining` returns two deliberately distinct non-identical
+    "low" states: `0` when `available <= 0` (already out — a real, known answer), vs.
+    `null` when there's simply no recent sales velocity to estimate from (available >
+    0, zero sales in the window) — rendered as "no recent sales," never as 0 or
+    Infinity. This means a low-stock product with zero recent sales will NOT be
+    flagged by this feature, even though it may genuinely need attention — that case
+    is already covered by `/inventory`'s separate, older, buffer-based `assessRisk`
+    badge (channel_buffer vs. a flat fallback threshold), which this is a complement
+    to, not a replacement for. The two signals can and do disagree (a product can be
+    "LOW" by buffer but not "reorder soon" by velocity, or vice versa) — both are
+    shown, deliberately, rather than one silently overriding the other.
+  - Reorder threshold: `DEFAULT_REORDER_THRESHOLD_DAYS = 14`, an admittedly arbitrary
+    but documented default (same status `/inventory`'s own
+    `LOW_STOCK_FALLBACK_THRESHOLD` already carries) — not yet a real per-tenant
+    setting anywhere; `assessStockForecast`'s own `reorderThresholdDays` parameter
+    exists for that to be added later without changing this function's shape.
+  - Unit-tested (`packages/inventory-service/test/forecast.test.ts`, 14 tests, pure
+    functions, no DB needed — same "pure-function-first" precedent
+    `extractUsShippingZip`/`rankByDistanceToShippingZip` already set in
+    `packages/order-service/test/nearest-location-routing.test.ts`). The two pages'
+    own SQL (`sum(-quantity_delta) ... WHERE event_type = 'sale'`) is NOT
+    independently integration-tested against live Postgres this pass — consistent
+    with every other read-only query already on `/inventory`/`/reports` (neither page
+    has a test file at all; both inherit correctness from the ledger-writing services,
+    which ARE tested, e.g. `recordShipmentSaleEvents`'s own sign convention this
+    query relies on). Worth a quick visual sanity check against real data once this
+    is live, same as every other report figure's own "first pass" status.
 - **Phase 5 — Scale features (Months 9-12+)**: eBay, Temu, and TikTok Shop — all three
   built and wired into the app ahead of the rest of this phase, see §4.6/§4.7/§4.8 (all
   three remain UNVERIFIED against real infrastructure — no live credentials/sandbox for
   any of them yet, see each section's own note) — /additional channels. Stock
-  forecasting. B2B portal (if pursuing Cin7-style ERP breadth). SOC 2 prep if targeting
-  mid-market.
+  forecasting — **built, moved up ahead of this phase**, see the bullet above.
+  B2B portal (if pursuing Cin7-style ERP breadth). SOC 2 prep if targeting mid-market.
 
 ## 9. Deployment & DevOps
 

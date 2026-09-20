@@ -332,3 +332,93 @@ function columnDeltasFor(
       return { onHandDelta: 0, reservedDelta: -quantityDelta };
   }
 }
+
+// --- Stock forecasting (CLAUDE.md §8 Phase 5's "stock forecasting" line,
+// v1 scope) -----------------------------------------------------------
+//
+// Deliberately simple: recent-sales-velocity divided into current available
+// stock, nothing more. NOT a demand-forecasting model -- no seasonality, no
+// trend detection, no external signals, no purchase-order automation. The
+// same "start simple, earn the complexity later" call this codebase already
+// made for the event bus, job queue, and /reports' own plain-queries-not-CDC
+// approach (see that page's own doc comment). Pure functions, no DB access
+// -- callers (currently /inventory and /reports) are responsible for
+// aggregating `unitsSoldInWindow` themselves (a `sum(-quantity_delta) WHERE
+// event_type = 'sale' AND created_at >= since` query against
+// `inventory_events`, grouped by product_id/location_id -- the same ledger
+// table every other figure in this app is computed from, never a separate
+// count) and for choosing their own window, matching this file's other
+// pure-function precedent (`extractUsShippingZip`/`rankByDistanceToShippingZip`
+// in `packages/order-service/src/index.ts`): easy to unit test without a
+// live Postgres, easy to reuse across pages with different windows.
+
+/** No spec pins this down -- an admittedly arbitrary but documented default
+ *  (two weeks), the same "simple heuristic, not a precise one" status
+ *  `/inventory`'s own `LOW_STOCK_FALLBACK_THRESHOLD` already carries.
+ *  Callers may override it (see `assessStockForecast`'s own `reorderThresholdDays`
+ *  parameter) -- not yet exposed as a real per-tenant setting anywhere, that
+ *  would be a genuine scope increase, not attempted here. */
+export const DEFAULT_REORDER_THRESHOLD_DAYS = 14;
+
+/** Units sold per day over the caller's own lookback window. Guards against
+ *  a non-positive `windowDays` (returns 0 rather than dividing by zero or a
+ *  negative number) -- defensive against a caller bug, not an expected input,
+ *  since every real caller derives `windowDays` from a fixed constant or a
+ *  validated period selector, never raw user input. */
+export function computeDailyVelocity(unitsSoldInWindow: number, windowDays: number): number {
+  if (windowDays <= 0) return 0;
+  return unitsSoldInWindow / windowDays;
+}
+
+/**
+ * Estimated days until `available` reaches zero at the given daily
+ * velocity. Two deliberately distinct non-numeric-feeling cases, both real
+ * and both worth telling apart in a UI rather than collapsing into one:
+ *
+ *   - `available <= 0`: already out (or oversold) right now -- returns 0,
+ *     not null. This is a real, known answer, not missing information.
+ *   - `dailyVelocity <= 0` (available > 0, but no sales in the window):
+ *     returns `null`, meaning "can't estimate" -- deliberately NOT
+ *     `Infinity`. A product with plenty of stock and zero recent sales
+ *     could mean healthy surplus or could mean it stopped selling
+ *     entirely; this function has no way to tell those apart, so it says
+ *     "unknown" rather than implying "forever safe."
+ */
+export function computeDaysOfStockRemaining(available: number, dailyVelocity: number): number | null {
+  if (available <= 0) return 0;
+  if (dailyVelocity <= 0) return null;
+  return available / dailyVelocity;
+}
+
+export interface StockForecast {
+  dailyVelocity: number;
+  /** null means "no recent sales activity to estimate from" -- see
+   *  {@link computeDaysOfStockRemaining}'s own doc comment. Render this as
+   *  "no recent sales" or similar, never as an empty/zero value, which
+   *  would misleadingly read as "already out." */
+  daysRemaining: number | null;
+  /** True only when `daysRemaining` is a real, known number at or below the
+   *  threshold -- `null` (unknown) never flags true. This is a real,
+   *  documented limitation: a low-stock product with zero recent sales
+   *  activity (e.g. a brand-new SKU) will NOT be flagged here, even though
+   *  it may genuinely need attention -- that case is already covered by
+   *  `/inventory`'s separate, velocity-independent risk badge
+   *  (`assessRisk`, buffer/threshold-based), which this is a complement to,
+   *  not a replacement for. */
+  reorderSoon: boolean;
+}
+
+/** Combines the two functions above into the one call site callers actually
+ *  want -- see this section's own header comment for what "window" means
+ *  and where `unitsSoldInWindow` comes from. */
+export function assessStockForecast(
+  available: number,
+  unitsSoldInWindow: number,
+  windowDays: number,
+  reorderThresholdDays: number = DEFAULT_REORDER_THRESHOLD_DAYS,
+): StockForecast {
+  const dailyVelocity = computeDailyVelocity(unitsSoldInWindow, windowDays);
+  const daysRemaining = computeDaysOfStockRemaining(available, dailyVelocity);
+  const reorderSoon = daysRemaining !== null && daysRemaining <= reorderThresholdDays;
+  return { dailyVelocity, daysRemaining, reorderSoon };
+}
