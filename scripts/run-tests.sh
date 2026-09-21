@@ -31,6 +31,7 @@ SAFE_TESTS=(
   "packages/inventory-service/test/record-inventory-event.test.ts"
   "packages/inventory-service/test/transfer-stock.test.ts"
   "packages/inventory-service/test/transfer-stock-concurrency.test.ts"
+  "packages/inventory-service/test/forecast.test.ts"
   "packages/channel-connectors/test/amazon-connector.test.ts"
   "packages/channel-connectors/test/shopify-connector.test.ts"
   "packages/channel-connectors/test/walmart-connector.test.ts"
