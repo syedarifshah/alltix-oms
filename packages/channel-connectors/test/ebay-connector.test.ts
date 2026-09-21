@@ -228,13 +228,14 @@ function makeListingSubmission(overrides: Partial<EbayListingSubmission> = {}): 
   };
 }
 
-test("buildEbayInventoryItemBody fixes condition to NEW and wraps imageUrl in a single-element array", () => {
+test("buildEbayInventoryItemBody fixes condition to NEW, wraps imageUrl in a single-element array, and hardcodes generic Brand/Storage Capacity/Model aspects", () => {
   const body = buildEbayInventoryItemBody(makeListingSubmission());
   assert.equal(body.condition, "NEW");
   assert.deepEqual(body.product, {
     title: "Test Product",
     description: "A test product description.",
     imageUrls: ["https://example.com/image.jpg"],
+    aspects: { Brand: ["Unbranded"], "Storage Capacity": ["64 GB"], Model: ["Does not apply"] },
   });
   assert.equal(body.availability.shipToLocationAvailability.quantity, 10);
 });

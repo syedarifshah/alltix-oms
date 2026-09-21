@@ -766,18 +766,24 @@ export class AmazonConnector {
    * response, exactly like pushInventory()'s PATCH call above), unlike
    * Walmart's real async feed submission that interface pair exists for.
    *
-   * Attribute shapes below (merchant_suggested_asin, condition_type,
+         * Attribute shapes below (merchant_suggested_asin, condition_type,
    * purchasable_offer, fulfillment_availability) are confirmed from real,
    * literal example payloads found in Amazon SP-API community discussions
    * (github.com/amzn/selling-partner-api-models) during this pass --
    * fulfillment_availability's shape is additionally already live-confirmed
-   * in THIS codebase by pushInventory() above. UNVERIFIED AS A WHOLE
-   * REQUEST, same status as everything else in this class: no live call has
-   * been made against this exact PUT + requirements=LISTING_OFFER_ONLY
-   * combination -- this environment's outbound network policy blocks
-   * api.amazon.com entirely (confirmed while researching this feature), on
-   * top of this class's pre-existing "not run against a real account"
-   * status for anything beyond the original sandbox pass.
+   * in THIS codebase by pushInventory() above.
+   *
+   * CONFIRMED against real SP-API sandbox infrastructure (`npm run
+   * amazon:create-listing-smoke-test`, NA sandbox host -- see
+   * SP_API_NA_SANDBOX_BASE_URL's own comment for why NA specifically): a
+   * real PUT requirements=LISTING_OFFER_ONLY request against a fake
+   * sandbox ASIN/SKU succeeded on the first attempt, no bugs found. Same
+   * caveat pushInventory()'s own sandbox pass already carries: the
+   * sandbox round-trips the request shape and an HTTP success without
+   * persisting a real, queryable listing, so a live production
+   * ASIN/account is still the only way to prove an actual listing goes
+   * publicly live -- not attempted, since that would create a real,
+   * purchasable offer under the connected seller's real account.
    */
   async createListing(input: AmazonListingSubmission): Promise<AmazonListingResult> {
     const { accessToken } = await this.authenticate();
