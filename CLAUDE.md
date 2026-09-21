@@ -1669,11 +1669,24 @@ eBay/Temu v1" scope decision.
   "wire it now, verify later" status Amazon's/Walmart's/eBay's own credentials
   carried before their first live pass). The `[ALERT]`-tagged log lines §4.4
   describes now also fire a Sentry event alongside the log line, not instead of it.
-  - Open question for Arif: given the widened volume ceiling (§0: up to 50,000
-    orders/month), whether the CDC-fed reporting store is worth moving earlier than
-    Phase 4 — not a change to the phase order itself, just worth deciding deliberately
-    rather than by default. The `/reports` first pass above doesn't resolve this
-    either way — it's cheap enough at today's volume that the decision can still wait.
+  - **Decided (Arif, this pass): keep deferring the CDC-fed store, not a change to the
+    phase order** — the open question above is resolved, not just left open longer.
+    Reasoning: unlike RLS (§11 item 6, a correctness/security problem — wrong from day
+    one leaks tenant data), the CDC-fed store is a performance/scaling concern that
+    degrades gracefully and is visible well before it's a real problem, so there's no
+    "expensive to retrofit" clock running the same way. At today's real volume
+    (effectively one live tenant — Arif's own Amazon seller account, still in testing,
+    no other sellers onboarded yet), building Debezium + ClickHouse/BigQuery now would
+    be standing up infra to solve a problem that doesn't exist yet — the same
+    "don't build infra a single self-testing tenant hasn't earned" call already made
+    for Redis/BullMQ and Kafka (§4.4, §1).
+  - **Concrete revisit trigger, so this doesn't stay a vague "later"**: whichever
+    happens first — (a) a real tenant's `/reports` page becomes visibly/measurably
+    slow, or (b) any tenant's monthly order volume crosses roughly 10,000-20,000
+    orders/month (the point `inventory_events`' own growth, §2.2's "Retrofit risk"
+    note, starts making a plain-query report meaningfully more expensive than it is
+    today). Until one of those two fires, `/reports`' plain-query approach stays as-is
+    — no infra work now.
 - **Stock forecasting — built, v1 scope, moved up from Phase 5** (`@alltix/inventory-service`'s
   `computeDailyVelocity`/`computeDaysOfStockRemaining`/`assessStockForecast`,
   `/inventory`'s new "Est. days left" column, `/reports`' new "Reorder soon" section):
