@@ -12,9 +12,19 @@ access to Amazon (blocked in that sandbox; see the note in §5).
 
 This adds the pieces that didn't exist before: a CI pipeline (`.github/workflows/ci.yml`),
 a production build path for both Vercel and a container host (`vercel.json`, `Dockerfile`),
-and this checklist. It does **not** resolve the two decisions only Arif can make:
-Amazon production access (§5) and when Stripe moves out of test mode (§4). Both are
-called out below rather than papered over.
+and this checklist. As originally written, it did **not** resolve the two decisions only
+Arif could make at the time: Amazon production access (§5) and when Stripe moves out of
+test mode (§4). Of those, Amazon production access has since been resolved (§5 was
+updated to reflect that) — Stripe staying in test mode is still the deliberate,
+still-current call (§4).
+
+**This whole file predates the app actually going live and predates five of its six
+channel connectors** — it was originally written when only Amazon existed and before
+the first real deploy. It's been corrected where it was flatly wrong (§5, §6, §9), not
+fully rewritten around the current six-channel state — treat CLAUDE.md as the
+source of truth for what's actually built/verified per channel, and this file as the
+deploy mechanics (Vercel setup, env vars, migrations, Docker) which mostly haven't
+changed.
 
 ## 2. Hosting: Vercel (recommended path)
 
@@ -97,45 +107,78 @@ separate decisions. Use `sk_test_...`/`whsec_...`/a test-mode `price_...` (via
 live-mode keys only once there's an actual paying customer to onboard, which is a
 deliberate switch-the-three-env-vars moment, not a deploy-time decision.
 
-## 5. Amazon: production access is still the open item (deliberately skipped here)
+## 5. Amazon: production access is resolved; one method still unverified
 
-Per this conversation's own explicit instruction, this pass does not attempt to resolve
-the Amazon production OAuth/self-authorization question — that's still exactly where
-earlier discussion in this project left it. Concretely, before this app can do anything
-with a real seller's Amazon data: `AMAZON_PRODUCTION_CLIENT_ID/_SECRET/_REFRESH_TOKEN/_SELLER_ID/_MARKETPLACE_ID`
-need real values (obtained however that question gets resolved), and until then,
-`/settings/channels`'s "Connect Amazon" flow and every `AMAZON_PRODUCTION_*` env var
-stay unset in the production environment. The app deploys and runs correctly without
-them — Amazon just won't be connectable for a real seller until this is sorted.
+**Update — this section is stale as originally written and has been corrected.** The
+Amazon production OAuth question this section used to describe as "still the open
+item" is resolved: a real seller (`A2P6SIBC86NP1T`) is connected in production via the
+real redirect/consent flow, not just sandbox-seeded — see CLAUDE.md §4.1's own
+"Update — the OAuth flow above has now actually been run against a real seller in
+production" note for the full trace, including a real 403 production incident (wrong
+sandbox-vs-production host resolution) that connection surfaced and that was fixed.
+`/settings/channels`'s "Connect Amazon" flow works end-to-end against real seller
+accounts today, not just sandbox ones.
 
-## 6. Scheduled Amazon order sync: Vercel Cron Jobs
+**What's still genuinely unverified**: `AmazonConnector.confirmShipment()` specifically
+— there's no safe sandbox-only way to prove it (fabricating a shipment confirmation on
+an order that didn't really ship is a real customer-facing action, not a disposable
+test), so it stays unverified until it runs organically against a real Amazon order
+that actually ships through this app in production. See CLAUDE.md §4.1's own "Still
+unverified until run against a real order in production" note.
 
-`GET /api/cron/amazon-order-sync` (`packages/web/src/app/api/cron/amazon-order-sync/route.ts`)
-is the recurring trigger for `runAmazonOrderSyncJob` — closing the gap
-`packages/scheduler/src/index.ts` and `scripts/amazon-order-sync-job.ts` flagged in their own
-header comments: the job logic was built and proven against sandbox + real Postgres, but
-nothing on this app's actual hosting (Vercel, serverless) was ever invoking it. `npm run
-amazon:order-sync-scheduler` (the `node-cron`-based long-running process) only ever ran
-locally; it is not part of this deploy and does not need to be.
+## 6. Scheduled order sync: Vercel Cron Jobs (all six channels now, not just Amazon)
 
-Two things must be set for this to actually run in production:
+**Update — this section originally only documented Amazon; five more channels have
+since shipped the identical pattern.** `GET /api/cron/amazon-order-sync`
+(`packages/web/src/app/api/cron/amazon-order-sync/route.ts`) was the first recurring
+trigger built — closing the gap `packages/scheduler/src/index.ts` and
+`scripts/amazon-order-sync-job.ts` flagged in their own header comments: the job logic
+was built and proven against sandbox + real Postgres, but nothing on this app's actual
+hosting (Vercel, serverless) was ever invoking it. `npm run amazon:order-sync-scheduler`
+(the `node-cron`-based long-running process) only ever ran locally; it is not part of
+this deploy and does not need to be — same is true of every other channel's own
+`*-order-sync-scheduler.ts` script below.
+
+Shopify, Walmart, eBay, Temu, and TikTok Shop each got their own identical cron route +
+`vercel.json` entry as they shipped, staggered 30 minutes apart so no two channels'
+sync jobs (and Shopify's separate catalog sync) overlap on Hobby's coarse once-daily
+schedule:
+
+| Route | Schedule (UTC) |
+|---|---|
+| `/api/cron/amazon-order-sync` | `0 4 * * *` |
+| `/api/cron/shopify-catalog-sync` | `30 4 * * *` |
+| `/api/cron/shopify-order-sync` | `0 5 * * *` |
+| `/api/cron/walmart-order-sync` | `30 5 * * *` |
+| `/api/cron/ebay-order-sync` | `0 6 * * *` |
+| `/api/cron/temu-order-sync` | `30 6 * * *` |
+| `/api/cron/tiktok-order-sync` | `0 7 * * *` |
+
+Two things must be set for any of these to actually run in production:
 
 1. **`CRON_SECRET`** in the Vercel project's environment variables (see `.env.example`) — a
-   random 16+ character string. Vercel automatically sends it back as
-   `Authorization: Bearer <value>` on every cron invocation, and the route 401s anything that
-   doesn't match, so this must be set for the cron job to do anything at all (missing secret
-   fails closed, not open).
-2. **The schedule in `vercel.json`'s `crons` entry**, which depends on the Vercel plan:
-   - **Hobby**: capped at once per day, with up to ±59 minutes of timing slop. `vercel.json`
-     ships with `"schedule": "0 4 * * *"` (once daily) for this reason — a more frequent
-     expression fails at deploy time on Hobby, not silently.
-   - **Pro or higher**: can run as often as once per minute. Once confirmed on Pro, change the
-     schedule to something like `"*/5 * * * *"` (every 5 minutes) to match the cadence the sync
-     job itself was originally designed and tested around, and redeploy.
+   random 16+ character string, shared across all seven routes above. Vercel automatically
+   sends it back as `Authorization: Bearer <value>` on every cron invocation, and each route
+   401s anything that doesn't match, so this must be set for any of them to do anything at
+   all (missing secret fails closed, not open). **Confirmed set and working in production**
+   — the Amazon cron route reaches real SP-API infrastructure today (see §5); this is no
+   longer an open item the way it's described lower in this section.
+2. **The schedule in each `vercel.json` `crons` entry**, which depends on the Vercel plan:
+   - **Hobby** (current plan): capped at once per day per job, with up to ±59 minutes of
+     timing slop — the table above reflects that ceiling.
+   - **Pro or higher**: can run as often as once per minute. If upgraded, consider tightening
+     the schedules (and re-staggering them) to match each sync job's originally-designed
+     cadence, and redeploy.
 
-Confirm it's actually running via Vercel's dashboard (Project → Cron Jobs → View Logs), or by
-checking `channel_connections.last_order_sync_at` for a tenant with an active Amazon
-connection — it should be advancing roughly on the configured schedule.
+Confirm a given channel is actually running via Vercel's dashboard (Project → Cron Jobs →
+View Logs), or by checking `channel_connections.last_order_sync_at` for a tenant with an
+active connection on that channel — it should be advancing roughly on the configured
+schedule. Amazon's own cron route is confirmed working end-to-end in production (reaches
+real SP-API, decrypts real credentials); the other five channels' routes are wired and
+typecheck identically but, per CLAUDE.md §4.2/§4.6-§4.8, most of those connectors
+themselves are still unverified against real infrastructure — a cron route running
+successfully just means it invoked the sync job, not that the underlying channel is
+proven, until that channel's own connector status (see CLAUDE.md) says otherwise.
 
 ## 7. Clerk: production instance
 
@@ -176,10 +219,12 @@ startup does automatically.
 
 Runs on every push/PR to `main`: typecheck, build every workspace package, production
 `next build`, apply migrations against a fresh Postgres service container, then run the
-full non-Amazon-sandbox test suite (`npm test` — see `scripts/run-tests.sh` for exactly
-which 12 test files that is and why the other 4 are excluded). This whole sequence was
-run by hand against a from-scratch database before being committed, so it isn't a
-config that merely looks plausible.
+full non-Amazon-sandbox test suite (`npm test` — see `scripts/run-tests.sh` for the
+current list and why the 4 Amazon-sandbox tests are excluded; that list has grown
+substantially since this section was first written — **34 test files** as of this
+update, not the original 12, as every channel/feature shipped its own coverage). This
+whole sequence was run by hand against a from-scratch database before being committed,
+so it isn't a config that merely looks plausible.
 
 **Deliberately does not auto-deploy.** CI catches breakage; shipping to production
 stays a deliberate action you (or Vercel's own GitHub integration, if you connect it)
@@ -207,14 +252,19 @@ After the first deploy, before calling it done:
    each should render empty-but-functional (no data yet, no errors).
 4. Visit `/settings/billing` — confirms `getOrCreateStripeCustomer` succeeds against
    the test-mode Stripe keys (§4).
-5. Visit `/settings/channels` — confirms it renders "Connect Amazon" without erroring,
-   even though clicking it won't succeed yet (§5).
-6. Confirm the cron job is registered: Vercel dashboard → Project → Cron Jobs should list
-   `/api/cron/amazon-order-sync` (§6). It won't have anything to sync until a real
-   `channel_connections` row exists, but it should appear as scheduled, not missing.
+5. Visit `/settings/channels` — confirms it renders all six "Connect X" forms/links
+   (Amazon, Shopify, Walmart, eBay, Temu, TikTok Shop) without erroring.
+6. Confirm all seven cron jobs are registered: Vercel dashboard → Project → Cron Jobs
+   should list every route in §6's table. They won't have anything to sync until a real
+   `channel_connections` row exists for that channel, but each should appear as
+   scheduled, not missing.
 
-Items 1-5 were confirmed against the live alltixoms.com deployment in earlier sessions.
-Item 6 (§6) is new: it was written and typechecked here, but not yet run against
-production — that needs `CRON_SECRET` set in Vercel's dashboard first (§2/§6), which is
-a manual step outside this session's reach. Confirm it once that's set, using the check
-above.
+**Update — this list was originally Amazon-only and pre-deploy; the app has since gone
+live at alltixoms.com with all six channels, and this checklist is now post-hoc rather
+than pre-deploy.** Items 1-6 above have been confirmed against the live deployment
+(§5/§6 have the specifics on what's actually verified vs. still-open per channel — a
+green cron log or a rendered connect form means the plumbing works, not that every
+connector is proven against real infrastructure). Worth adding to this list if/when
+useful: `/locations`, `/hr`, `/hr/payroll`, and `/reports` all render correctly signed
+in as a fresh tenant too, same "empty-but-functional" bar as item 3 — not separately
+confirmed here, but built and tested the same way everything else in CLAUDE.md is.
