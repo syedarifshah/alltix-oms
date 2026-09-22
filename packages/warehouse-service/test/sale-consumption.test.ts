@@ -24,6 +24,7 @@ import { Client, type Pool } from "pg";
 import { createAppPool, withTenant, withTenantAndUser } from "@alltix/db";
 import { InventoryService } from "@alltix/inventory-service";
 import { OrderService } from "@alltix/order-service";
+import { DomainEvent, InProcessEventBus, type InventoryChangedPayload } from "@alltix/shared";
 import { WarehouseService, recordShipmentSaleEvents } from "../src/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -164,6 +165,33 @@ test("recordShipmentSaleEvents consumes on_hand and releases reserved together, 
   assert.equal(saleEvent.rows.length, 1);
   assert.equal(saleEvent.rows[0]?.quantity_delta, -3);
   assert.equal(saleEvent.rows[0]?.reference_type, "order");
+});
+
+test("recordShipmentSaleEvents' sale consumption publishes inventory.changed on WarehouseService's own shared eventBus -- proving the real (not test-only) production wiring", async () => {
+  const eventBus = new InProcessEventBus();
+  const published: InventoryChangedPayload[] = [];
+  eventBus.subscribe<InventoryChangedPayload>(DomainEvent.InventoryChanged, (event) => {
+    published.push(event.payload);
+  });
+  // A second InventoryService/WarehouseService pair sharing `eventBus`,
+  // exactly the shape a real caller (scheduler, a web route) would use to
+  // let a future subscriber (a low-stock notifier, analytics) see these --
+  // see WarehouseService's own constructor doc comment for why its
+  // InventoryService shares this bus rather than getting a private one.
+  const sharedInventoryService = new InventoryService(pool, eventBus);
+  const sharedWarehouseService = new WarehouseService(pool, orderService, eventBus);
+
+  const { productId, orderId } = await seedAllocatedOrder(10, 2);
+  const [picklist] = await sharedWarehouseService.generatePicklist(tenantId, [orderId]);
+  await sharedWarehouseService.assignPicklist(tenantId, picklist!.id, await seedPicker());
+  await sharedWarehouseService.recordPick(tenantId, picklist!.lines[0]!.id, 2);
+  await sharedWarehouseService.packOrder(tenantId, orderId);
+
+  await recordShipmentSaleEvents(pool, sharedInventoryService, tenantId, orderId);
+
+  const saleEvents = published.filter((p) => p.eventType === "sale" && p.productId === productId);
+  assert.equal(saleEvents.length, 1);
+  assert.deepEqual(saleEvents[0], { productId, locationId, eventType: "sale", onHand: 8, reserved: 0, available: 8 });
 });
 
 test("recordShipmentSaleEvents sells the reduced (short-picked) quantity, not the original request", async () => {

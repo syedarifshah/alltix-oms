@@ -22,5 +22,12 @@ export function getWarehouseService(): WarehouseService {
 }
 
 export function getInventoryService(): InventoryService {
+  // Same default-to-a-private-in-process-bus shape as the other two
+  // factories above -- fine for the same reason: nothing here has a
+  // subscriber today. Its `inventory.changed` publish (see
+  // InventoryService's own class doc comment) still fires on this private
+  // bus for every real call this factory backs (the manual /inventory
+  // transfer route) -- it just has no listener yet, same as
+  // OrderService's/WarehouseService's own unshared-bus publishes.
   return new InventoryService(getAppPool());
 }

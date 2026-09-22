@@ -283,12 +283,13 @@ export async function recordShipmentSaleEvents(
  */
 export class WarehouseService {
   // Not injected via the constructor the way OrderService/eventBus are --
-  // InventoryService holds no state beyond the pool reference (same as this
-  // class's own relationship to `pool`), so there's nothing a caller would
-  // ever need to substitute for it the way a test substitutes a shared
-  // eventBus; see recordShipmentSaleEvents()'s own doc comment for why the
-  // function it's threaded into is exported standalone instead, for testing
-  // without a live confirmShipment() call.
+  // InventoryService holds no state beyond the pool reference and its own
+  // eventBus (same as this class's own relationship to `pool`/`eventBus`),
+  // so there's nothing a caller would ever need to substitute for it the
+  // way a test substitutes a shared eventBus; see
+  // recordShipmentSaleEvents()'s own doc comment for why the function it's
+  // threaded into is exported standalone instead, for testing without a
+  // live confirmShipment() call.
   private readonly inventoryService: InventoryService;
 
   constructor(
@@ -304,7 +305,13 @@ export class WarehouseService {
     // to see these can inject a shared bus later without any other change.
     private readonly eventBus: EventBus = new InProcessEventBus(),
   ) {
-    this.inventoryService = new InventoryService(pool);
+    // Shares this same bus, not a second private one -- InventoryService's
+    // own `inventory.changed` publish (from recordInventoryEvent(), which
+    // recordShipmentSaleEvents() calls during packOrder()'s sale
+    // consumption -- CLAUDE.md §2.2) lands on whatever bus this
+    // WarehouseService was given, exactly like a real caller sharing one
+    // bus across OrderService/RulesEngine already does elsewhere.
+    this.inventoryService = new InventoryService(pool, eventBus);
   }
 
   private async publish<T>(tenantId: string, name: DomainEventName, payload: T): Promise<void> {

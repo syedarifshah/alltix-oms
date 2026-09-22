@@ -1,7 +1,14 @@
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 import { withTenant } from "@alltix/db";
-import type { InventoryEventType, InventoryReferenceType } from "@alltix/shared";
+import {
+  DomainEvent,
+  InProcessEventBus,
+  type EventBus,
+  type InventoryChangedPayload,
+  type InventoryEventType,
+  type InventoryReferenceType,
+} from "@alltix/shared";
 
 export interface RecordInventoryEventInput {
   tenantId: string;
@@ -111,9 +118,43 @@ export interface TransferStockResult {
  * doesn't show a separate "create inventory_levels row" step, and a fresh
  * product's first stock receipt is the natural place for that row to start
  * existing.
+ *
+ * Publishes `inventory.changed` (DomainEvent.InventoryChanged,
+ * {@link InventoryChangedPayload}) after a mutation actually applies --
+ * closing CLAUDE.md §1's own stated architecture ("Inventory Service ...
+ * publishes `inventory.changed` events"), which until now was true only of
+ * the constant's existence, not its behavior: nothing in this codebase ever
+ * called `eventBus.publish()` for it. Same "default to a private
+ * in-process bus, share a real one when a caller actually has subscribers"
+ * shape as OrderService/WarehouseService's own constructors -- and same
+ * "publish only after the transaction that made the change has committed"
+ * discipline OrderService.persistPulledOrders() already established, so a
+ * subscriber's own DB work (a future low-stock notifier, say) is a
+ * genuinely separate transaction, never nested inside this one. Not
+ * retroactive: the two inline call sites this doc comment already flags
+ * above (OrderService.allocateOrder, WarehouseService.packOrder's
+ * pack-shortfall path) don't call through this class, so reservation/
+ * backorder events and pack-shortfall adjustments do NOT publish
+ * `inventory.changed` yet -- only `recordInventoryEvent` and
+ * `transferStock`'s real callers do (warehouse-service's own sale
+ * consumption during packing, and the manual `/inventory` transfer route).
+ * Extending this to the other two flows is the same already-flagged,
+ * deliberately-deferred refactor, not a new gap introduced here.
  */
 export class InventoryService {
-  constructor(private readonly pool: Pool) {}
+  constructor(
+    private readonly pool: Pool,
+    private readonly eventBus: EventBus = new InProcessEventBus(),
+  ) {}
+
+  private async publishInventoryChanged(tenantId: string, payload: InventoryChangedPayload): Promise<void> {
+    await this.eventBus.publish({
+      name: DomainEvent.InventoryChanged,
+      tenantId,
+      occurredAt: new Date().toISOString(),
+      payload,
+    });
+  }
 
   async recordInventoryEvent(input: RecordInventoryEventInput): Promise<RecordInventoryEventResult> {
     const { tenantId, productId, locationId, eventType, quantityDelta, idempotencyKey } = input;
@@ -130,7 +171,7 @@ export class InventoryService {
 
     const { onHandDelta, reservedDelta } = columnDeltasFor(eventType, quantityDelta);
 
-    return withTenant(this.pool, tenantId, async (client) => {
+    const outcome = await withTenant(this.pool, tenantId, async (client) => {
       const inserted = await client.query<{ id: string }>(
         `INSERT INTO inventory_events
            (tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
@@ -145,21 +186,40 @@ export class InventoryService {
         // Already applied by an earlier call with this same idempotency
         // key -- inventory_levels was already updated then, so touching it
         // again here would double-apply the delta.
-        return { applied: false, eventId: null };
+        return { applied: false as const, eventId: null, levels: null };
       }
 
-      await client.query(
+      const levels = await client.query<{ on_hand: number; reserved: number; available: number }>(
         `INSERT INTO inventory_levels (tenant_id, product_id, location_id, on_hand, reserved)
            VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (product_id, location_id) DO UPDATE SET
            on_hand = inventory_levels.on_hand + EXCLUDED.on_hand,
            reserved = inventory_levels.reserved + EXCLUDED.reserved,
-           updated_at = now()`,
+           updated_at = now()
+         RETURNING on_hand, reserved, available`,
         [tenantId, productId, locationId, onHandDelta, reservedDelta],
       );
 
-      return { applied: true, eventId: eventRow.id };
+      return { applied: true as const, eventId: eventRow.id, levels: levels.rows[0]! };
     });
+
+    // Published after the transaction above has committed -- see this
+    // class's own doc comment for why (a subscriber's own DB work must
+    // never nest inside this one). No-op (nothing to publish) on the
+    // idempotent-replay branch: inventory_levels didn't change, so there is
+    // no new state for a subscriber to react to.
+    if (outcome.applied) {
+      await this.publishInventoryChanged(tenantId, {
+        productId,
+        locationId,
+        eventType,
+        onHand: outcome.levels.on_hand,
+        reserved: outcome.levels.reserved,
+        available: outcome.levels.available,
+      });
+    }
+
+    return { applied: outcome.applied, eventId: outcome.eventId };
   }
 
   /** Postgres computes `available` as a STORED generated column
@@ -244,7 +304,7 @@ export class InventoryService {
     const outboundKey = `${idempotencyKey}:out`;
     const inboundKey = `${idempotencyKey}:in`;
 
-    return withTenant(this.pool, tenantId, async (client) => {
+    const outcome = await withTenant(this.pool, tenantId, async (client) => {
       // Lock the source row and re-check available stock under that lock --
       // see this method's doc comment for why this mirrors
       // OrderService.allocateOrder's own check-then-act discipline.
@@ -270,7 +330,7 @@ export class InventoryService {
         [outboundKey],
       );
       if (existingOutbound.rows[0]) {
-        return { applied: false, transferId: null };
+        return { applied: false as const, transferId: null, sourceLevels: null, destLevels: null };
       }
 
       const transferId = randomUUID();
@@ -286,9 +346,10 @@ export class InventoryService {
       // proved an inventory_levels row exists at the source (a nonexistent
       // row reads available as 0, which fails that check for any positive
       // quantity), so there's nothing to upsert here.
-      await client.query(
+      const sourceLevels = await client.query<{ on_hand: number; reserved: number; available: number }>(
         `UPDATE inventory_levels SET on_hand = on_hand - $1, updated_at = now()
-           WHERE product_id = $2 AND location_id = $3`,
+           WHERE product_id = $2 AND location_id = $3
+         RETURNING on_hand, reserved, available`,
         [quantity, productId, fromLocationId],
       );
 
@@ -302,17 +363,45 @@ export class InventoryService {
       // its first-ever stock for this product, exactly the "first event
       // creates the row on the fly" case this class's own doc comment
       // above describes for recordInventoryEvent.
-      await client.query(
+      const destLevels = await client.query<{ on_hand: number; reserved: number; available: number }>(
         `INSERT INTO inventory_levels (tenant_id, product_id, location_id, on_hand, reserved)
            VALUES ($1, $2, $3, $4, 0)
          ON CONFLICT (product_id, location_id) DO UPDATE SET
            on_hand = inventory_levels.on_hand + EXCLUDED.on_hand,
-           updated_at = now()`,
+           updated_at = now()
+         RETURNING on_hand, reserved, available`,
         [tenantId, productId, toLocationId, quantity],
       );
 
-      return { applied: true, transferId };
+      return { applied: true as const, transferId, sourceLevels: sourceLevels.rows[0]!, destLevels: destLevels.rows[0]! };
     });
+
+    // Two events, not one -- see this class's own doc comment and
+    // InventoryChangedPayload's own doc comment for why a transfer that
+    // touches two (product, location) pairs publishes once per pair rather
+    // than one dual-location event. Published after the transaction above
+    // has committed, same reasoning as recordInventoryEvent. No-op on the
+    // idempotent-replay branch, same reasoning too.
+    if (outcome.applied) {
+      await this.publishInventoryChanged(tenantId, {
+        productId,
+        locationId: fromLocationId,
+        eventType: "transfer",
+        onHand: outcome.sourceLevels.on_hand,
+        reserved: outcome.sourceLevels.reserved,
+        available: outcome.sourceLevels.available,
+      });
+      await this.publishInventoryChanged(tenantId, {
+        productId,
+        locationId: toLocationId,
+        eventType: "transfer",
+        onHand: outcome.destLevels.on_hand,
+        reserved: outcome.destLevels.reserved,
+        available: outcome.destLevels.available,
+      });
+    }
+
+    return { applied: outcome.applied, transferId: outcome.transferId };
   }
 }
 

@@ -150,6 +150,43 @@ first, not silently moved out from under it. Reachable today from `/inventory`'s
 throws outright on `eventType: 'transfer'` (it has no two-location signature) and
 points callers at this method instead.
 
+**`inventory.changed` event publishing — built, closing a real gap between this doc and
+the code**: §1's own architecture line for the Inventory Service ("computes
+available-to-sell (ATS), publishes `inventory.changed` events") was true of the
+constant's existence (`DomainEvent.InventoryChanged`, `packages/shared/src/events.ts`)
+but not its behavior — nothing in this codebase ever called `eventBus.publish()` for
+it, until now. `InventoryService` (`packages/inventory-service/src/index.ts`) gained
+an `eventBus` constructor param, same default-to-a-private-in-process-bus shape as
+`OrderService`/`WarehouseService`'s own constructors, and now publishes
+`InventoryChangedPayload` (`productId`, `locationId`, `eventType`, and the *resulting*
+`onHand`/`reserved`/`available` — not the delta, since a future low-stock subscriber
+needs the new state) after a mutation actually applies, and only after its own
+transaction has committed — same "a subscriber's own DB work must be a genuinely
+separate transaction" discipline `OrderService.persistPulledOrders()` already
+established. `transferStock()` publishes two events, one per (product, location) leg
+touched, never one dual-location event. **Not retroactive**: this only covers
+`recordInventoryEvent`/`transferStock`'s own real callers — `WarehouseService`'s sale
+consumption during packing (now sharing its own `eventBus` with the `InventoryService`
+it constructs, rather than a second private one) and the manual `/inventory` transfer
+route. The two call sites this section already flagged as writing
+`inventory_events`/`inventory_levels` inline instead of going through `InventoryService`
+(`OrderService.allocateOrder`'s reservation/backorder, `WarehouseService.packOrder`'s
+pack-shortfall adjustment) still do — migrating them is the same already-flagged,
+deliberately-deferred refactor (risk of altering already-tested allocation/pack
+behavior), not a new gap this pass introduced. No subscriber exists yet — this is
+infrastructure for one (a low-stock notifier, analytics, forecasting triggers), not a
+feature on its own; wiring a rules-engine trigger off it was considered and
+deliberately not done in this pass, since `rule_executions.order_id` is `NOT NULL` and
+an inventory change has no order to attach to — making that trigger real would mean a
+schema change (a nullable `order_id` plus a new reference column) and `/rules`' own UI
+update, a bigger, separate piece of work. Tested: two new cases each in
+`record-inventory-event.test.ts`/`transfer-stock.test.ts` (an applied mutation
+publishes with the resulting levels; a no-op idempotent replay does not publish again),
+plus one in `warehouse-service/test/sale-consumption.test.ts` proving the real (not
+test-only) production wiring — sale consumption during packing publishes on
+`WarehouseService`'s own shared bus, not just when a test constructs `InventoryService`
+directly.
+
 **Shipment sale-consumption — built, closing a real gap** (`packages/warehouse-service/src/index.ts`'s
 exported `recordShipmentSaleEvents`, called from `WarehouseService.confirmShipment` once
 the channel confirms and before the local `packed` → `shipped` flip): until this existed,

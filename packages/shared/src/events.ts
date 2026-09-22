@@ -1,3 +1,5 @@
+import type { InventoryEventType } from "./types.js";
+
 // Domain event names published on the event bus (CLAUDE.md §1, §3). The
 // order/inventory services publish these without knowing who subscribes;
 // rules-engine and reporting consume them independently.
@@ -103,4 +105,29 @@ export interface OrderSplitForBackorderPayload {
   backorderOrderId: string;
   originalOrderCancelled: boolean;
   lines: Array<{ productId: string; quantity: number }>;
+}
+
+/** Payload for `inventory.changed` -- CLAUDE.md §1's own architecture
+ *  section names this as one of the Inventory Service's core
+ *  responsibilities ("computes available-to-sell (ATS), publishes
+ *  `inventory.changed` events"), but until now the constant existed
+ *  (DomainEvent.InventoryChanged) with nothing ever actually publishing it
+ *  -- see InventoryService's own class doc comment for where this is (and
+ *  deliberately isn't yet) wired in. One event per (product, location)
+ *  mutation -- `InventoryService.transferStock()` publishes two (one per
+ *  leg), never one event carrying both locations, so a subscriber never has
+ *  to unpack a dual-location shape to answer "did *this* product at *this*
+ *  location just change." Carries the resulting levels, not just the delta
+ *  -- `onHand`/`reserved`/`available` as they stand immediately after this
+ *  mutation applied -- since "is this product now low on stock at this
+ *  location" (the motivating future consumer) needs the new state, not how
+ *  much it moved by; a subscriber that specifically wants the delta still
+ *  has `eventType` to know what kind of change this was. */
+export interface InventoryChangedPayload {
+  productId: string;
+  locationId: string;
+  eventType: InventoryEventType;
+  onHand: number;
+  reserved: number;
+  available: number;
 }

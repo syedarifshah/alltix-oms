@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { config as loadEnv } from "dotenv";
 import { Client, type Pool } from "pg";
 import { createAppPool, withTenant } from "@alltix/db";
+import { DomainEvent, InProcessEventBus, type InventoryChangedPayload } from "@alltix/shared";
 import { InventoryService } from "../src/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -136,6 +137,79 @@ test("transferStock moves on_hand from source to destination, leaving reserved u
   assert.equal(events[0]!.reference_type, "transfer");
   assert.equal(events[0]!.reference_id, result.transferId, "both legs must share the transfer's reference_id");
   assert.equal(events[1]!.reference_id, result.transferId);
+});
+
+test("transferStock publishes one inventory.changed event per leg, with each leg's own resulting levels", async () => {
+  const productId = await seedProduct(`XFER-PUBLISH-${randomUUID().slice(0, 8)}`);
+  const eventBus = new InProcessEventBus();
+  const published: InventoryChangedPayload[] = [];
+  eventBus.subscribe<InventoryChangedPayload>(DomainEvent.InventoryChanged, (event) => {
+    published.push(event.payload);
+  });
+  const inventoryService = new InventoryService(pool, eventBus);
+
+  await inventoryService.recordInventoryEvent({
+    tenantId,
+    productId,
+    locationId: locationAId,
+    eventType: "receipt",
+    quantityDelta: 10,
+    idempotencyKey: `receipt:${productId}`,
+  });
+  published.length = 0; // only care about transferStock's own publishes from here
+
+  await inventoryService.transferStock({
+    tenantId,
+    productId,
+    fromLocationId: locationAId,
+    toLocationId: locationBId,
+    quantity: 4,
+    idempotencyKey: `xfer:${productId}`,
+  });
+
+  assert.equal(published.length, 2, "one event per (product, location) leg, not one dual-location event");
+  assert.deepEqual(published[0], {
+    productId,
+    locationId: locationAId,
+    eventType: "transfer",
+    onHand: 6,
+    reserved: 0,
+    available: 6,
+  });
+  assert.deepEqual(published[1], {
+    productId,
+    locationId: locationBId,
+    eventType: "transfer",
+    onHand: 4,
+    reserved: 0,
+    available: 4,
+  });
+});
+
+test("a no-op idempotent transferStock replay does not publish inventory.changed a second time", async () => {
+  const productId = await seedProduct(`XFER-PUBLISH-IDEMPOTENT-${randomUUID().slice(0, 8)}`);
+  const eventBus = new InProcessEventBus();
+  let publishCount = 0;
+  eventBus.subscribe(DomainEvent.InventoryChanged, () => {
+    publishCount++;
+  });
+  const inventoryService = new InventoryService(pool, eventBus);
+  const idempotencyKey = `xfer:${productId}`;
+
+  await inventoryService.recordInventoryEvent({
+    tenantId,
+    productId,
+    locationId: locationAId,
+    eventType: "receipt",
+    quantityDelta: 10,
+    idempotencyKey: `receipt:${productId}`,
+  });
+  publishCount = 0; // only care about transferStock's own publishes from here
+
+  await inventoryService.transferStock({ tenantId, productId, fromLocationId: locationAId, toLocationId: locationBId, quantity: 3, idempotencyKey });
+  await inventoryService.transferStock({ tenantId, productId, fromLocationId: locationAId, toLocationId: locationBId, quantity: 3, idempotencyKey });
+
+  assert.equal(publishCount, 2, "exactly the first call's two leg-events -- the second, no-op call must not publish again");
 });
 
 test("transferStock creates the destination's inventory_levels row on the fly for a product never stocked there before", async () => {

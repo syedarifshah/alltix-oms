@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { config as loadEnv } from "dotenv";
 import { Client, type Pool } from "pg";
 import { createAppPool, withTenant } from "@alltix/db";
+import { DomainEvent, InProcessEventBus, type InventoryChangedPayload } from "@alltix/shared";
 import { InventoryService } from "../src/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -199,6 +200,71 @@ test("getAvailableToSell returns 0 for a product/location with no inventory_leve
   const inventoryService = new InventoryService(pool);
 
   assert.equal(await inventoryService.getAvailableToSell(tenantId, productId, locationId), 0);
+});
+
+test("an applied event publishes inventory.changed on the injected eventBus, with the resulting (not delta) levels", async () => {
+  const productId = await seedProduct(`PUBLISH-${randomUUID().slice(0, 8)}`);
+  const eventBus = new InProcessEventBus();
+  const published: InventoryChangedPayload[] = [];
+  eventBus.subscribe<InventoryChangedPayload>(DomainEvent.InventoryChanged, (event) => {
+    published.push(event.payload);
+  });
+  const inventoryService = new InventoryService(pool, eventBus);
+
+  await inventoryService.recordInventoryEvent({
+    tenantId,
+    productId,
+    locationId,
+    eventType: "receipt",
+    quantityDelta: 10,
+    idempotencyKey: `receipt:${productId}`,
+  });
+  await inventoryService.recordInventoryEvent({
+    tenantId,
+    productId,
+    locationId,
+    eventType: "reservation",
+    quantityDelta: -4,
+    referenceType: "order",
+    idempotencyKey: `reservation:${productId}`,
+  });
+
+  assert.equal(published.length, 2, "one inventory.changed per applied call");
+  assert.deepEqual(published[0], { productId, locationId, eventType: "receipt", onHand: 10, reserved: 0, available: 10 });
+  assert.deepEqual(published[1], { productId, locationId, eventType: "reservation", onHand: 10, reserved: 4, available: 6 });
+});
+
+test("a no-op idempotent replay does not publish inventory.changed a second time", async () => {
+  const productId = await seedProduct(`PUBLISH-IDEMPOTENT-${randomUUID().slice(0, 8)}`);
+  const eventBus = new InProcessEventBus();
+  let publishCount = 0;
+  eventBus.subscribe(DomainEvent.InventoryChanged, () => {
+    publishCount++;
+  });
+  const inventoryService = new InventoryService(pool, eventBus);
+  const idempotencyKey = `receipt:${productId}`;
+
+  await inventoryService.recordInventoryEvent({ tenantId, productId, locationId, eventType: "receipt", quantityDelta: 7, idempotencyKey });
+  await inventoryService.recordInventoryEvent({ tenantId, productId, locationId, eventType: "receipt", quantityDelta: 7, idempotencyKey });
+
+  assert.equal(publishCount, 1, "the second, no-op call must not publish -- nothing about inventory_levels actually changed");
+});
+
+test("with no eventBus passed, recordInventoryEvent still behaves exactly as before (defaults to a private, harmless bus)", async () => {
+  const productId = await seedProduct(`NO-BUS-${randomUUID().slice(0, 8)}`);
+  const inventoryService = new InventoryService(pool);
+
+  const result = await inventoryService.recordInventoryEvent({
+    tenantId,
+    productId,
+    locationId,
+    eventType: "receipt",
+    quantityDelta: 3,
+    idempotencyKey: `receipt:${productId}`,
+  });
+
+  assert.equal(result.applied, true);
+  assert.deepEqual(await levelsFor(productId), { on_hand: 3, reserved: 0, available: 3 });
 });
 
 test("'transfer' is rejected outright rather than silently mishandled", async () => {
