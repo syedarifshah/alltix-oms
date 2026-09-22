@@ -581,11 +581,11 @@ export default async function ChannelsSettingsPage({
                 : "never synced yet"}
             </div>
             <div className="alert alert-info" style={{ marginTop: 8, marginBottom: 0 }}>
-              UNVERIFIED against real TikTok Shop infrastructure, same status as Temu&apos;s own connection above --
-              TikTok&apos;s own documentation could not be read by any method tried during this connector&apos;s
-              research pass (see TikTokConnector&apos;s own class doc comment), and no TikTok credentials of any
-              kind exist anywhere in this codebase yet. Order sync failures are no longer silent, though — see
-              below if this connection has started failing.
+              UNVERIFIED against real TikTok Shop infrastructure, whichever way this was connected -- TikTok&apos;s
+              own documentation could not be read by any method tried during this connector&apos;s or the OAuth
+              flow&apos;s own research pass (see TikTokConnector&apos;s and tiktok-oauth.ts&apos;s own doc comments),
+              and no TikTok credentials of any kind exist anywhere in this codebase yet. Order sync failures are no
+              longer silent, though — see below if this connection has started failing.
             </div>
             <SyncFailureBanner
               status={tiktokConnection.status}
@@ -593,13 +593,18 @@ export default async function ChannelsSettingsPage({
               last_failure_at={tiktokConnection.last_failure_at}
               last_failure_message={tiktokConnection.last_failure_message}
             />
-            {/* No OAuth reconnect redirect (same reasoning as Temu's own
-                form here) -- reconnecting means re-submitting this form with
-                a fresh/corrected credential set. */}
-            <TikTokConnectForm buttonLabel="Reconnect TikTok Shop" />
+            <a href="/api/channels/tiktok/connect">Reconnect via TikTok OAuth</a>
+            <TikTokConnectForm buttonLabel="Reconnect TikTok Shop (manual)" />
           </div>
         ) : (
-          <TikTokConnectForm buttonLabel="Connect TikTok Shop" />
+          <div className="stack">
+            <a href="/api/channels/tiktok/connect">Connect via TikTok OAuth</a>
+            <div className="muted">
+              Only takes the first shop back if an authorization covers more than one (see the callback route&apos;s
+              own doc comment) -- or paste credentials manually instead:
+            </div>
+            <TikTokConnectForm buttonLabel="Connect TikTok Shop (manual)" />
+          </div>
         )}
       </div>
     </main>
@@ -805,14 +810,16 @@ function TemuConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElement
 }
 
 /**
- * TikTok Shop has no OAuth consent screen wired here either (same "typed
- * directly into a plain form" shape as TemuConnectForm above) -- but five
- * fields instead of three, because TikTok Shop's own credential model
- * genuinely has five independent parts (see TikTokCredentials' own doc
- * comment in tiktok-connector.ts): App Key, App Secret, Access Token,
- * Refresh Token, and Shop Cipher (a real, independent per-shop identifier --
- * one App Key/Access Token pair can cover multiple TikTok shops, each with
- * its own cipher).
+ * The manual-paste alternative to the "Connect via TikTok OAuth" link
+ * rendered alongside this form below -- same "typed directly into a plain
+ * form" shape as TemuConnectForm above, kept as a fallback now that an
+ * OAuth path also exists (see /api/channels/tiktok/connect's own GET
+ * handler doc comment for why both stay). Five fields instead of three,
+ * because TikTok Shop's own credential model genuinely has five independent
+ * parts (see TikTokCredentials' own doc comment in tiktok-connector.ts):
+ * App Key, App Secret, Access Token, Refresh Token, and Shop Cipher (a real,
+ * independent per-shop identifier -- one App Key/Access Token pair can
+ * cover multiple TikTok shops, each with its own cipher).
  *
  * All five fields are required every submission, including on reconnect --
  * same "no leave-blank-to-keep-the-existing-secret affordance" as

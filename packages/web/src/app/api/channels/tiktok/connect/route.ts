@@ -1,16 +1,44 @@
-import type { NextRequest } from "next/server";
+import { NextResponse, type NextRequest } from "next/server";
 import { withTenant, encryptChannelSecret } from "@alltix/db";
-import { TikTokConnector, TIKTOK_API_BASE_URL } from "@alltix/channel-connectors";
+import { TikTokConnector, TIKTOK_API_BASE_URL, buildTikTokAuthorizeUrl } from "@alltix/channel-connectors";
 import { getAppPool } from "@/lib/db";
-import { requireCurrentUser } from "@/lib/with-tenant-auth";
+import { requireCurrentUser, withTenantAuth, type TenantRequestContext } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { createOAuthState } from "@/lib/tiktok-oauth-state";
+import { readTikTokOAuthAppConfig } from "@/lib/tiktok-oauth-config";
 
 export const dynamic = "force-dynamic";
 
 /**
+ * GET /api/channels/tiktok/connect -- redirects to TikTok Shop's OAuth
+ * consent screen (the "Connect via TikTok OAuth" link on /settings/channels),
+ * added alongside the POST manual-paste form below rather than replacing
+ * it. Mirrors /api/channels/ebay/connect exactly (see that route's own doc
+ * comment for the withTenantAuth-for-its-auth-step-only reasoning) --
+ * genuine differences are pushed down into buildTikTokAuthorizeUrl() itself
+ * (no redirectUri param; see tiktok-oauth.ts's own header comment), not
+ * this route.
+ *
+ * The manual-paste POST form stays: it remains the only path for a tenant
+ * whose TikTok Shop application issues long-lived tokens directly (no
+ * consent-screen flow to redirect through), and is a useful fallback if the
+ * OAuth path below turns out to be wrong once a real TikTok application
+ * exists to test it against (see tiktok-oauth.ts's own "UNVERIFIED IN
+ * PRACTICE" note).
+ */
+async function connectTikTokViaOAuth(_req: NextRequest, { tenantId }: TenantRequestContext): Promise<Response> {
+  const { appKey } = readTikTokOAuthAppConfig();
+  const state = createOAuthState(tenantId);
+  const authorizeUrl = buildTikTokAuthorizeUrl(appKey, state);
+  return NextResponse.redirect(authorizeUrl);
+}
+
+export const GET = withTenantAuth(connectTikTokViaOAuth);
+
+/**
  * POST /api/channels/tiktok/connect -- persists a tenant's TikTok Shop Open
- * Platform credentials from the /settings/channels "Connect TikTok Shop"
- * form.
+ * Platform credentials from the /settings/channels "Connect TikTok Shop
+ * (manual)" form.
  *
  * Five fields instead of the usual two/three -- more than any other channel
  * in this codebase -- because TikTok Shop's own credential model genuinely
@@ -18,14 +46,6 @@ export const dynamic = "force-dynamic";
  * tiktok-connector.ts): appKey, appSecret, accessToken, refreshToken, and
  * shopCipher (a real, independent per-shop identifier, unlike every other
  * channel's own reuse of external_account_id).
- *
- * Not an OAuth redirect/callback pair like Amazon's/eBay's own connect
- * flow -- same reasoning as Temu's connect route: all five values are typed
- * directly into one plain HTML form (Arif's own tenant already holds them,
- * issued directly by TikTok's own seller/developer console) and POSTed here
- * in one step. A real OAuth authorize-redirect flow could replace this
- * later; this pass mirrors the shape every other single-step-credential
- * channel already uses.
  *
  * Not wrapped in withTenantAuth for the same reason the Walmart/Shopify/
  * Temu routes give: the first real step here is a network round trip
@@ -40,7 +60,10 @@ export const dynamic = "force-dynamic";
  * appKey, encrypted_client_secret = appSecret, encrypted_access_token =
  * accessToken, encrypted_refresh_token = refreshToken,
  * external_account_id = shopCipher -- the one channel in this codebase
- * where that last column holds what its name actually says).
+ * where that last column holds what its name actually says). The GET
+ * OAuth-redirect handler above and its callback (../callback/route.ts)
+ * write to the exact same columns, so either path can reconnect/overwrite
+ * what the other one stored.
  *
  * UNVERIFIED IN PRACTICE, more so than any other channel's connect route --
  * see TikTokConnector's own class doc comment: no TikTok credentials of any

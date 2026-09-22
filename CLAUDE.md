@@ -1622,6 +1622,67 @@ eBay/Temu v1" scope decision.
   credentials. Being "wired into the app" here means the plumbing (UI/scheduler/cron)
   exists and compiles, not that a real TikTok Shop sync has ever succeeded.
 
+### 4.8.1 TikTok Shop "Connect via OAuth" flow — built, alongside the manual-paste form
+
+- **Why**: the manual five-field paste form above (§4.8's "wired into the app") was the
+  only way to connect TikTok Shop until now. Arif's explicit decision (AskUserQuestion,
+  after being shown the research gap below): **"Build it, documented as unverified."**
+  Added as a second path, not a replacement — the form still exists as a fallback.
+- **Research trail, separate from and in addition to §4.8's own**: TikTok's official docs
+  had the identical "unreadable JS SPA" problem yet again (`partner.tiktokshop.com/docv2/`
+  pages titled "Authorization guide (202309)" and "How to refresh access token" both
+  returned only navigation chrome). Cross-confirmed instead across four independent,
+  non-copying sources: a live, Google-indexed real TikTok Shop Seller Center URL
+  (`services.tiktokshop.com/open/authorize?app_key=...`), Chilkat's commercial
+  code-example library, API2Cart's own integration docs, and a real published third-party
+  Ruby gem (`rymndcs/tiktok_shop_rb_api`). Full trail in `tiktok-oauth.ts`'s own header
+  comment.
+- **Two genuine structural differences from eBay's/Amazon's own OAuth flow** (not
+  oversights — see `tiktok-oauth.ts` for the sourcing): (1) **no `redirect_uri`** —
+  TikTok Shop's callback URL is fixed once, out-of-band, in the Partner Center app's own
+  settings, confirmed directly by the Ruby gem's README ("passing one raises
+  ArgumentError"); (2) `grant_type=authorized_code`, not the RFC 6749-standard
+  `authorization_code` — confirmed literally in API2Cart's shown query string.
+- **Three endpoints**: `GET services.tiktokshop.com/open/authorize?app_key&state` (the
+  consent-screen redirect, `buildTikTokAuthorizeUrl`); `GET
+  auth.tiktok-shops.com/api/v2/token/get?app_key&app_secret&auth_code&grant_type=authorized_code`
+  (the code-for-tokens exchange, unsigned plain query string — same non-standard
+  convention `authenticate()`'s own refresh call already uses against this host,
+  `exchangeTikTokAuthorizationCode`); `GET
+  open-api.tiktokglobalshop.com/authorization/202309/shops` (a SIGNED business-API call,
+  `shop_cipher` deliberately omitted from what it signs since discovering that value is
+  the whole point of calling it, `getTikTokAuthorizedShops`) — `shop_cipher` is NOT part
+  of the token-exchange response itself, confirmed by the Ruby gem treating shop lookup
+  as a separate step.
+- **Multi-shop gap, documented not hidden**: one `app_key`/`access_token` pair can cover
+  several TikTok shops (§4.8's own `shop_cipher` note). The callback route
+  (`/api/channels/tiktok/callback`) takes only the FIRST shop `getTikTokAuthorizedShops`
+  returns — a tenant authorizing more than one shop under the same app only gets the
+  first one connected. A real shop-picker UI is deliberately deferred follow-up work, not
+  built this pass.
+- **Wired into the app**: `/settings/channels`' TikTok Shop card now has a "Connect via
+  TikTok OAuth" link (`GET /api/channels/tiktok/connect`, `withTenantAuth`-wrapped, same
+  shape as eBay's own "Connect eBay" link) alongside the existing manual-paste form. The
+  callback (`/api/channels/tiktok/callback`) verifies a signed, tenant-bound `state`
+  token (`tiktok-oauth-state.ts`, a literal fork of `ebay-oauth-state.ts`, its own
+  `TIKTOK_OAUTH_STATE_SECRET`), exchanges the code, looks up the shop, and writes to the
+  exact same `channel_connections` columns the manual POST handler already uses — either
+  path can reconnect/overwrite what the other stored. `readTikTokOAuthAppConfig()`
+  reuses `TIKTOK_APP_KEY`/`TIKTOK_APP_SECRET` directly (no separate
+  `TIKTOK_OAUTH_CLIENT_ID`-style pair the way eBay has one — TikTok Shop has only one
+  app-level credential set, not two distinct keysets).
+- **UNVERIFIED IN PRACTICE**, same status §4.8's own connector carries, for the same
+  underlying reason (no TikTok application registered anywhere in this codebase) — with
+  one open question §4.8 doesn't have: unlike eBay's callback (whose own doc comment
+  records this project's cloud sandbox as CONFIRMED to block `api.ebay.com`/
+  `api.sandbox.ebay.com` at the proxy level), whether this environment can even reach
+  TikTok's OAuth hosts has never been tested either way. `buildTikTokAuthorizeUrl`/
+  `parseTikTokOAuthCallback` (pure) and `exchangeTikTokAuthorizationCode`/
+  `getTikTokAuthorizedShops` (fetch-intercepted, no live network) are unit-tested; the
+  state sign/verify round-trip is unit-tested (`tiktok-oauth-state.test.ts`, a literal
+  mirror of `amazon-oauth-state.test.ts`). Nothing past those boundaries has been
+  exercised against live TikTok infrastructure.
+
 ## 5. Technology Stack
 
 | Layer | Choice | Why |
@@ -2066,6 +2127,11 @@ from there.
   `taskkill /IM node.exe` or `pkill node` — it can kill unrelated Node processes on the
   same machine (other dev servers, editor extensions, etc.), not just the one the test
   started.
+- **TikTok Shop OAuth: no multi-shop picker** — §4.8.1's `/api/channels/tiktok/callback`
+  connects only the FIRST shop `getTikTokAuthorizedShops` returns. A tenant whose TikTok
+  Shop authorization covers more than one shop under the same app needs a real
+  shop-picker step (list every returned shop, let them choose, maybe loop to connect
+  more than one) — not built yet, deliberately deferred.
 
 ## 13. Observability (Sentry — §5/§8 Phase 4's "Observability dashboards")
 

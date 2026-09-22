@@ -23,6 +23,7 @@ cd "$(dirname "$0")/.."
 
 SAFE_TESTS=(
   "packages/web/test/amazon-oauth-state.test.ts"
+  "packages/web/test/tiktok-oauth-state.test.ts"
   "packages/web/test/tenant-isolation.e2e.test.ts"
   "packages/warehouse-service/test/generate-and-pick.test.ts"
   "packages/warehouse-service/test/assign-picklist-concurrency.test.ts"
@@ -38,6 +39,7 @@ SAFE_TESTS=(
   "packages/channel-connectors/test/ebay-connector.test.ts"
   "packages/channel-connectors/test/temu-connector.test.ts"
   "packages/channel-connectors/test/tiktok-connector.test.ts"
+  "packages/channel-connectors/test/tiktok-oauth.test.ts"
   "packages/channel-connectors/test/retry.test.ts"
   "packages/db/test/channel-connections-rls.test.ts"
   "packages/db/test/hr-rls.test.ts"

@@ -65,6 +65,13 @@ import { fetchWithBackoff } from "./retry.js";
 // well-researched first draft, not a proven implementation. No TikTok
 // credentials of any kind exist anywhere in this codebase yet (see
 // .env.example's TIKTOK_* entries).
+//
+// The redirect-based OAuth flow that PRODUCES those credentials (the
+// "Connect TikTok Shop via OAuth" alternative to the manual-paste form
+// /api/channels/tiktok/connect's POST handler used exclusively until now)
+// lives in the separate tiktok-oauth.ts, not here -- same file split
+// ebay-oauth.ts/ebay-connector.ts already establishes. Its own header
+// comment carries its own, separate research trail.
 
 /** Confirmed from the openlinker spike (cross-confirmed by the Go package's
  *  own literal `APIBaseURL` constant). One global host -- region is carried
