@@ -1,6 +1,6 @@
 import { schedule, type ScheduledTask } from "node-cron";
 import type { Pool } from "pg";
-import { captureError } from "@alltix/shared";
+import { captureError, sendEmail } from "@alltix/shared";
 import {
   runAmazonOrderSyncJob,
   runShopifyOrderSyncJob,
@@ -76,6 +76,30 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * The other half of closing CLAUDE.md §4.4/§13's "no email/Slack infra"
+ * gap -- packages/scheduler/src/index.ts's notifyTenantUsers() covers a
+ * single tenant's own connection needing attention; this covers the
+ * genuinely different case a whole job run exhausting every retry
+ * represents (this file's own header comment: "DB down, every credential
+ * rejected, an unhandled bug"). There is no single tenant responsible for
+ * or notifiable about that -- it's a platform-operator incident, not a
+ * tenant one -- so this emails a fixed PLATFORM_ALERT_EMAIL address (see
+ * .env.example) instead of looking up any tenant's users. Same
+ * "wire it now, verify later, inert until configured" shape as
+ * sendEmail() itself: unset PLATFORM_ALERT_EMAIL means this is a silent
+ * no-op (sendEmail() has nothing to send to), which is fine -- Sentry
+ * (captureError(), called alongside this at every call site) is still the
+ * primary signal either way; email is additive, not load-bearing.
+ */
+async function notifyPlatformOperator(subject: string, message: string): Promise<void> {
+  const operatorEmail = process.env.PLATFORM_ALERT_EMAIL;
+  if (!operatorEmail) {
+    return;
+  }
+  await sendEmail({ to: [operatorEmail], subject, text: message });
+}
+
 function summarizeResults(results: TenantSyncResult[]) {
   return {
     tenantsProcessed: results.length,
@@ -137,6 +161,10 @@ export async function runOnceWithRetry(
       );
       if (!willRetry) {
         captureError(err, { event: "amazon_order_sync_run", runId, attempt });
+        await notifyPlatformOperator(
+          `alltix-oms: amazon order sync failed after ${attempt} attempt(s)`,
+          `The Amazon order-sync job (runId ${runId}) exhausted all ${attempt} attempt(s) and will not retry until the next scheduled tick.\n\nError: ${message}`,
+        );
         return;
       }
       await sleep(retryDelayMs * attempt);
@@ -250,6 +278,10 @@ export async function runShopifyOnceWithRetry(
       );
       if (!willRetry) {
         captureError(err, { event: "shopify_order_sync_run", runId, attempt });
+        await notifyPlatformOperator(
+          `alltix-oms: shopify order sync failed after ${attempt} attempt(s)`,
+          `The Shopify order-sync job (runId ${runId}) exhausted all ${attempt} attempt(s) and will not retry until the next scheduled tick.\n\nError: ${message}`,
+        );
         return;
       }
       await sleep(retryDelayMs * attempt);
@@ -356,6 +388,10 @@ export async function runWalmartOnceWithRetry(
       );
       if (!willRetry) {
         captureError(err, { event: "walmart_order_sync_run", runId, attempt });
+        await notifyPlatformOperator(
+          `alltix-oms: walmart order sync failed after ${attempt} attempt(s)`,
+          `The Walmart order-sync job (runId ${runId}) exhausted all ${attempt} attempt(s) and will not retry until the next scheduled tick.\n\nError: ${message}`,
+        );
         return;
       }
       await sleep(retryDelayMs * attempt);
@@ -462,6 +498,10 @@ export async function runEbayOnceWithRetry(
       );
       if (!willRetry) {
         captureError(err, { event: "ebay_order_sync_run", runId, attempt });
+        await notifyPlatformOperator(
+          `alltix-oms: ebay order sync failed after ${attempt} attempt(s)`,
+          `The eBay order-sync job (runId ${runId}) exhausted all ${attempt} attempt(s) and will not retry until the next scheduled tick.\n\nError: ${message}`,
+        );
         return;
       }
       await sleep(retryDelayMs * attempt);
@@ -565,6 +605,10 @@ export async function runTemuOnceWithRetry(
       );
       if (!willRetry) {
         captureError(err, { event: "temu_order_sync_run", runId, attempt });
+        await notifyPlatformOperator(
+          `alltix-oms: temu order sync failed after ${attempt} attempt(s)`,
+          `The Temu order-sync job (runId ${runId}) exhausted all ${attempt} attempt(s) and will not retry until the next scheduled tick.\n\nError: ${message}`,
+        );
         return;
       }
       await sleep(retryDelayMs * attempt);
@@ -669,6 +713,10 @@ export async function runTikTokOnceWithRetry(
       );
       if (!willRetry) {
         captureError(err, { event: "tiktok_order_sync_run", runId, attempt });
+        await notifyPlatformOperator(
+          `alltix-oms: tiktok order sync failed after ${attempt} attempt(s)`,
+          `The TikTok Shop order-sync job (runId ${runId}) exhausted all ${attempt} attempt(s) and will not retry until the next scheduled tick.\n\nError: ${message}`,
+        );
         return;
       }
       await sleep(retryDelayMs * attempt);

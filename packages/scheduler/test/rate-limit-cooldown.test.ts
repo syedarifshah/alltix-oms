@@ -175,6 +175,35 @@ test("a connection with rate_limited_until = NULL is discovered normally", async
   }
 });
 
+test("recordRateLimitTrip never emails the tenant, even with RESEND_API_KEY set -- deliberately Sentry/log-only (see its own doc comment on alert fatigue)", async () => {
+  const tenantId = await seedShopifyConnection();
+  const originalApiKey = process.env.RESEND_API_KEY;
+  process.env.RESEND_API_KEY = "re_test_key";
+  const originalFetch = globalThis.fetch;
+  let callCount = 0;
+  globalThis.fetch = (async () => {
+    callCount++;
+    return new Response("{}", { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    await recordRateLimitTrip(appPool, tenantId, "shopify", null);
+    assert.equal(
+      callCount,
+      0,
+      "a rate-limit trip is self-healing and non-actionable -- it must never call sendEmail, unlike recordSyncFailure's threshold-crossing branch",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalApiKey === undefined) {
+      delete process.env.RESEND_API_KEY;
+    } else {
+      process.env.RESEND_API_KEY = originalApiKey;
+    }
+    await cleanup(tenantId);
+  }
+});
+
 test("recordSyncSuccess clears an in-progress rate_limited_until", async () => {
   const tenantId = await seedShopifyConnection();
   try {

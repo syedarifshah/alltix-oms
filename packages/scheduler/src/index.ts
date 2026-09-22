@@ -1,6 +1,6 @@
 import type { Pool } from "pg";
 import { withTenant } from "@alltix/db";
-import { InProcessEventBus, type EventBus, captureAlert } from "@alltix/shared";
+import { InProcessEventBus, type EventBus, captureAlert, sendEmail } from "@alltix/shared";
 import {
   createAmazonConnectorFromChannelConnection,
   SP_API_SANDBOX_TEST_CASE_CREATED_AFTER,
@@ -131,14 +131,45 @@ export const RATE_LIMIT_COOLDOWN_MS = 15 * 60 * 1000;
  * syncTenant()/syncShopifyTenant()/syncWalmartTenant(), not call this
  * directly.
  */
+
+/**
+ * Closes the "no email/Slack/other notification infra exists anywhere in
+ * this codebase" gap CLAUDE.md §4.4/§13 both flagged -- emails every user
+ * of the AFFECTED TENANT (not a platform operator; see cron-runner.ts's
+ * own whole-job alerting for that) when their own channel connection needs
+ * their attention. Deliberately no new recipient-list schema: `users` is
+ * already tenant-scoped and RLS-isolated, so "everyone who can see this
+ * tenant's /settings/channels page" is exactly the right audience with no
+ * new column, table, or per-tenant notification-preference UI needed for
+ * v1 -- the same "start simple, earn the complexity later" call this
+ * codebase makes everywhere else (CLAUDE.md §1, §4.4, §8).
+ *
+ * A tenant with zero users (shouldn't happen in practice -- a tenant only
+ * exists because a Clerk user created it, see 0010_tenants_and_users.sql)
+ * is a silent no-op via sendEmail()'s own empty-recipients guard, not an
+ * error -- there being no one to notify is not itself alert-worthy, and
+ * this function's callers already fire captureAlert()/console.error
+ * regardless of whether an email goes out.
+ */
+async function notifyTenantUsers(appPool: Pool, tenantId: string, subject: string, message: string): Promise<void> {
+  const recipients = await withTenant(appPool, tenantId, (client) =>
+    client.query<{ email: string }>(`SELECT DISTINCT email FROM users WHERE tenant_id = $1`, [tenantId]),
+  );
+  await sendEmail({
+    to: recipients.rows.map((r) => r.email),
+    subject,
+    text: message,
+  });
+}
+
 export async function recordSyncFailure(
   appPool: Pool,
   tenantId: string,
   channel: "amazon" | "shopify" | "walmart" | "ebay" | "temu" | "tiktok",
   message: string,
 ): Promise<void> {
-  await withTenant(appPool, tenantId, async (client) => {
-    const updated = await client.query<{ consecutive_failures: number; status: string }>(
+  const updated = await withTenant(appPool, tenantId, (client) =>
+    client.query<{ consecutive_failures: number; status: string }>(
       `UPDATE channel_connections
           SET consecutive_failures = consecutive_failures + 1,
               last_failure_at = now(),
@@ -151,18 +182,30 @@ export async function recordSyncFailure(
       // but an unbounded connector error string (a raw provider response
       // body, say) has no business growing this row without limit.
       [message.slice(0, 2000), CONSECUTIVE_FAILURE_ERROR_THRESHOLD, tenantId, channel],
-    );
+    ),
+  );
 
-    const row = updated.rows[0];
-    if (row?.status === "error" && row.consecutive_failures === CONSECUTIVE_FAILURE_ERROR_THRESHOLD) {
-      const alertMessage =
-        `[ALERT] ${channel} channel_connections for tenant ${tenantId} has failed ${row.consecutive_failures} ` +
-        `consecutive sync runs and is now status='error' -- it will NOT be retried automatically until ` +
-        `reconnected via /settings/channels. Last error: ${message}`;
-      console.error(alertMessage);
-      captureAlert(alertMessage, { tenantId, channel, consecutiveFailures: row.consecutive_failures });
-    }
-  });
+  const row = updated.rows[0];
+  if (row?.status === "error" && row.consecutive_failures === CONSECUTIVE_FAILURE_ERROR_THRESHOLD) {
+    const alertMessage =
+      `[ALERT] ${channel} channel_connections for tenant ${tenantId} has failed ${row.consecutive_failures} ` +
+      `consecutive sync runs and is now status='error' -- it will NOT be retried automatically until ` +
+      `reconnected via /settings/channels. Last error: ${message}`;
+    console.error(alertMessage);
+    captureAlert(alertMessage, { tenantId, channel, consecutiveFailures: row.consecutive_failures });
+    // Outside the UPDATE's own withTenant() block, deliberately -- this is
+    // an unrelated read (users, not channel_connections) that has no
+    // reason to share the UPDATE's transaction, and running it only after
+    // that transaction has committed means a tenant's notified users can
+    // always find the 'error' status this email describes if they click
+    // through to /settings/channels right away.
+    await notifyTenantUsers(
+      appPool,
+      tenantId,
+      `Action needed: your ${channel} connection has stopped syncing`,
+      `${alertMessage}\n\nReconnect from /settings/channels to resume order sync for this channel.`,
+    );
+  }
 }
 
 /**
@@ -238,6 +281,18 @@ export async function recordSyncSuccess(
  * still calls recordSyncFailure() too (this run IS a failed sync, and the
  * per-run console.error/skip-remaining-tenants behavior is unchanged) --
  * this function only adds the cooldown on top, it doesn't replace that call.
+ *
+ * Deliberately does NOT call notifyTenantUsers() the way recordSyncFailure()'s
+ * threshold-crossing branch does, even though both are "[ALERT]"-tagged for
+ * Sentry/log purposes. A rate-limit trip is self-healing (the cooldown
+ * above expires on its own, and recordSyncSuccess() clears it early on the
+ * next demonstrated success) and there is nothing actionable for a tenant
+ * to *do* about it -- emailing them "you're being rate-limited" on what
+ * could be a routine, recurring, healthy-account event would just be
+ * inbox noise, exactly the kind of alert fatigue observability.ts's own
+ * header comment already rejected a blanket console.error->Sentry hook
+ * over. Sentry (for Arif, watching for a pattern across tenants) is the
+ * right audience for this one, not the tenant themselves.
  */
 export async function recordRateLimitTrip(
   appPool: Pool,

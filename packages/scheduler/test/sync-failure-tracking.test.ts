@@ -22,7 +22,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config as loadEnv } from "dotenv";
 import type { Pool } from "pg";
-import { createAppPool, withTenant } from "@alltix/db";
+import { createAppPool, withTenant, withTenantAndUser } from "@alltix/db";
 import { InProcessEventBus } from "@alltix/shared";
 import {
   syncShopifyOrders,
@@ -96,6 +96,71 @@ async function cleanup(tenantId: string): Promise<void> {
   await withTenant(appPool, tenantId, (client) =>
     client.query("DELETE FROM channel_connections WHERE tenant_id = $1", [tenantId]),
   );
+}
+
+/** Same broken-connection shape as seedBrokenShopifyConnection(), but for a
+ *  tenantId the caller already minted -- needed by the notifyTenantUsers()
+ *  test below, which has to seed a real `tenants` row (and `users` rows
+ *  under it) FIRST, via seedTenantWithUsers(), rather than letting this
+ *  function mint its own random tenant id the way seedBrokenShopifyConnection()
+ *  does. */
+async function seedBrokenShopifyConnectionForTenant(tenantId: string): Promise<void> {
+  await withTenant(appPool, tenantId, (client) =>
+    client.query(
+      `INSERT INTO channel_connections (tenant_id, channel, marketplace, external_account_id)
+       VALUES ($1, 'shopify', '', $2)`,
+      [tenantId, `broken-test-${tenantId.slice(0, 8)}.myshopify.com`],
+    ),
+  );
+}
+
+/**
+ * Seeds a REAL `tenants` row plus one `users` row per given email --
+ * needed to test recordSyncFailure()'s new notifyTenantUsers() call, which
+ * reads real `users.email` values. `users.tenant_id` is the one table in
+ * this schema with a real FK to `tenants(id)` (migration 0010's own
+ * comment), unlike every tenant-scoped table `seedBrokenShopifyConnection()`
+ * above gets away with seeding against a bare synthetic UUID -- so a real
+ * `tenants` row has to exist first.
+ *
+ * `app_user` has no INSERT grant on `tenants` (only SELECT/UPDATE --
+ * confirmed via migration 0010_tenants_and_users.sql's own GRANT
+ * statements), so the `tenants` insert goes through `adminPool`
+ * (DATABASE_URL, the schema-owning connection already used elsewhere in
+ * this codebase for legitimately cross-tenant/system-level operations --
+ * see SyncAmazonOrdersParams.adminPool's own doc comment in
+ * packages/scheduler/src/index.ts). `users` DOES have an app_user INSERT
+ * grant, but its RLS policy (self_lookup_users) is scoped by
+ * `app.clerk_user_id`, not `app.tenant_id` -- withTenant() alone never sets
+ * that, so the insert needs withTenantAndUser() (packages/db/src/pool.ts),
+ * which sets both in the same transaction, exactly the way
+ * provisionTenantForNewUser() itself does for a real signup.
+ */
+async function seedTenantWithUsers(emails: string[]): Promise<string> {
+  const tenantId = randomUUID();
+  await adminPool.query(`INSERT INTO tenants (id, name) VALUES ($1, $2)`, [
+    tenantId,
+    `notify-test-tenant-${tenantId.slice(0, 8)}`,
+  ]);
+  for (const email of emails) {
+    const clerkUserId = `test-clerk-${randomUUID()}`;
+    await withTenantAndUser(appPool, { tenantId, clerkUserId }, (client) =>
+      client.query(`INSERT INTO users (tenant_id, clerk_user_id, email) VALUES ($1, $2, $3)`, [
+        tenantId,
+        clerkUserId,
+        email,
+      ]),
+    );
+  }
+  return tenantId;
+}
+
+/** Counterpart to seedTenantWithUsers() -- app_user has no DELETE grant on
+ *  either `users` or `tenants` (same migration 0010 GRANT statements), so
+ *  cleanup goes through adminPool, users first to respect the FK. */
+async function cleanupTenantWithUsers(tenantId: string): Promise<void> {
+  await adminPool.query(`DELETE FROM users WHERE tenant_id = $1`, [tenantId]);
+  await adminPool.query(`DELETE FROM tenants WHERE id = $1`, [tenantId]);
 }
 
 test("a Shopify connection with no access token fails deterministically, with no network call", async () => {
@@ -199,5 +264,57 @@ test("recordSyncFailure does not keep incrementing an already-'error' row (self-
     );
   } finally {
     await cleanup(tenantId);
+  }
+});
+
+test("recordSyncFailure emails the tenant's own users exactly once, on the run that crosses the failure threshold", async () => {
+  const tenantId = await seedTenantWithUsers(["owner@example.test", "teammate@example.test"]);
+  await seedBrokenShopifyConnectionForTenant(tenantId);
+
+  const originalApiKey = process.env.RESEND_API_KEY;
+  process.env.RESEND_API_KEY = "re_test_key";
+  const originalFetch = globalThis.fetch;
+  let callCount = 0;
+  let capturedInit: RequestInit | undefined;
+  globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+    callCount++;
+    capturedInit = init;
+    return new Response("{}", { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    for (let i = 1; i < CONSECUTIVE_FAILURE_ERROR_THRESHOLD; i++) {
+      await recordSyncFailure(appPool, tenantId, "shopify", `failure ${i}`);
+    }
+    assert.equal(callCount, 0, "must not notify before the connection actually crosses the threshold");
+
+    await recordSyncFailure(appPool, tenantId, "shopify", "final straw failure");
+    assert.equal(callCount, 1, "must notify exactly once, on the run that flips status to 'error'");
+
+    const body = JSON.parse(capturedInit?.body as string) as { to: string[]; subject: string; text: string };
+    assert.deepEqual(
+      [...body.to].sort(),
+      ["owner@example.test", "teammate@example.test"].sort(),
+      "recipients must be exactly this tenant's own users' emails, nothing more/less",
+    );
+    assert.match(body.subject, /shopify connection has stopped syncing/);
+    assert.match(body.text, /final straw failure/);
+    assert.match(body.text, /\/settings\/channels/, "the email must point the tenant at how to fix it");
+
+    // A further failure past the threshold must not re-notify --
+    // recordSyncFailure()'s own WHERE status = 'active' guard means the
+    // UPDATE returns zero rows once already 'error', so the notify branch
+    // (gated on RETURNING a row at all) never re-fires.
+    await recordSyncFailure(appPool, tenantId, "shopify", "post-error failure");
+    assert.equal(callCount, 1, "must not re-notify once the connection is already status='error'");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalApiKey === undefined) {
+      delete process.env.RESEND_API_KEY;
+    } else {
+      process.env.RESEND_API_KEY = originalApiKey;
+    }
+    await cleanup(tenantId);
+    await cleanupTenantWithUsers(tenantId);
   }
 });

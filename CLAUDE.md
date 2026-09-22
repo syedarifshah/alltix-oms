@@ -668,7 +668,12 @@ eBay/Temu v1" scope decision.
     `recordSyncSuccess()` clears `rate_limited_until` on a demonstrated success
     rather than making the tenant wait out a cooldown that's already been proven
     unnecessary. Same `[ALERT]`-tagged log-based alerting as the failure-tracking
-    below, plus a Sentry event (§13; no email/Slack infra exists beyond that).
+    below, plus a Sentry event (§13). Deliberately does **not** email the tenant the
+    way `recordSyncFailure()`'s threshold-crossing branch does (see the alerting
+    paragraph below) — a rate-limit trip is self-healing and non-actionable, and
+    `recordRateLimitTrip()`'s own doc comment explains why emailing it would just be
+    inbox noise; `packages/scheduler/test/rate-limit-cooldown.test.ts` has a test
+    proving this (fetch is asserted never called, even with `RESEND_API_KEY` set).
     Tested against a real local Postgres in
     `packages/channel-connectors/test/retry.test.ts` (in-process backoff, injectable
     `sleep`, no real timers) and `packages/scheduler/test/rate-limit-cooldown.test.ts`
@@ -688,8 +693,9 @@ eBay/Temu v1" scope decision.
   discovery query — a dead connection stops being retried on every cron tick
   instead of failing forever with only a log line each time. A single
   `[ALERT]`-tagged `console.error` fires exactly once, on the run that crosses the
-  threshold — log-based, and (as of §13) also a Sentry event via `captureAlert()`;
-  no email/Slack/notification infra exists beyond that. Recovery is manual today: the tenant
+  threshold — log-based, and (as of §13) also a Sentry event via `captureAlert()`,
+  and (as of the alerting paragraph below) a real email to the tenant's own users.
+  Recovery is manual today: the tenant
   reconnects via `/settings/channels`, which re-verifies live before writing
   `status = 'active'` again; nothing auto-retries an `error` row. Deliberately NOT
   wired into `syncShopifyCatalogForTenant` — catalog sync and order sync are
@@ -697,6 +703,70 @@ eBay/Temu v1" scope decision.
   failure (e.g. a GraphQL schema quirk) shouldn't be able to flip a tenant to
   `error` and cut off order sync, which may be working fine; that gap stays open,
   flagged in that function's own comment.
+- **Alerting/notifications — built, closing the "no email/Slack/other notification
+  infra exists" gap this section and §13 both used to flag** (`packages/shared/src/
+  email.ts`'s `sendEmail()`, `packages/scheduler/src/index.ts`'s
+  `notifyTenantUsers()`, `packages/scheduler/src/cron-runner.ts`'s
+  `notifyPlatformOperator()`): real transactional email via
+  [Resend](https://resend.com) (`RESEND_API_KEY`), extracted from the pre-existing
+  demo-request-notification code (`packages/web/src/app/api/leads/demo-request/
+  route.ts`, which now calls the same shared `sendEmail()` instead of its own
+  duplicate fetch logic) rather than introducing a second, competing email
+  integration. `sendEmail()` never throws and is a silent no-op with zero
+  recipients or an unset `RESEND_API_KEY` — same "wire it now, verify against a
+  real account later, inert until configured" pattern as Sentry's own DSN (§13).
+  - **Two deliberately separate audiences, not one generic "send an alert"
+    concept**: `notifyTenantUsers()` (called from `recordSyncFailure()`'s
+    threshold-crossing branch, above) emails that tenant's own `users` rows — a
+    per-tenant, actionable incident (their own channel connection died) with a
+    real fix path (`/settings/channels`). `notifyPlatformOperator()` (called from
+    every one of `cron-runner.ts`'s six `runXOnceWithRetry` functions'
+    `!willRetry` branch, alongside their existing `captureError()` call) emails a
+    fixed `PLATFORM_ALERT_EMAIL` address instead — a whole-job-failure incident
+    (DB down, every credential rejected, an unhandled bug) has no single tenant
+    responsible for it, so there's no tenant inbox to route it to. Deliberately
+    reuses the `users` table as the tenant recipient list rather than adding a new
+    notification-preferences schema — see `notifyTenantUsers()`'s own doc comment
+    for why that's the right amount of schema for v1.
+  - **`recordRateLimitTrip()` deliberately does NOT email the tenant** — see the
+    rate-limit paragraph above; a rate-limit trip is self-healing and
+    non-actionable, and emailing it would be alert fatigue, the same reasoning
+    `observability.ts`'s own header comment already gives for rejecting a blanket
+    `console.error`→Sentry hook.
+  - **A real, production-affecting bug found writing this feature's own regression
+    tests, not by manual review**: `notifyTenantUsers()`'s
+    `SELECT DISTINCT email FROM users WHERE tenant_id = $1`, run inside
+    `withTenant()` (sets only `app.tenant_id`), silently returned **zero rows
+    against real RLS, every time, in every environment** — not a test artifact.
+    `users`' only RLS policy before this (`self_lookup_users`, migration `0010`) is
+    scoped by `app.clerk_user_id`, which `withTenant()` never sets by design; that
+    migration's own comment had already flagged this exact gap ahead of time
+    ("a future 'list my org's teammates' feature needs an additional policy branch
+    scoped by app.tenant_id"). `sendEmail()`'s own empty-recipients guard made the
+    zero-row result look like a harmless "no users to notify" no-op instead of the
+    real bug it was — not one tenant alert email could ever have actually been
+    delivered. **Fixed** by migration `0030_users_tenant_scoped_select_policy.sql`,
+    adding exactly the additive, SELECT-only, tenant-scoped policy `0010`'s own
+    comment described (Postgres RLS policies for the same command are OR'd
+    together, so this doesn't touch or narrow the existing self-lookup policy).
+    Regression-tested in `packages/scheduler/test/sync-failure-tracking.test.ts`'s
+    new `notifyTenantUsers()` test — which is what caught this in the first place,
+    against a real seeded `tenants`+`users` pair, not a mock.
+  - Tested: `packages/shared/test/email.test.ts` (`sendEmail()` itself — no-op when
+    unconfigured/no recipients, request shape, non-2xx/thrown-error swallowing, all
+    via a stubbed `global.fetch`, no real Resend account); the new
+    `notifyTenantUsers()` test in `sync-failure-tracking.test.ts` (recipients match
+    the tenant's own seeded users, fires exactly once, not per-run or post-error);
+    the no-tenant-email test in `rate-limit-cooldown.test.ts`; and
+    `packages/scheduler/test/cron-runner-platform-alerts.test.ts`
+    (`notifyPlatformOperator()`'s own no-op/success/retry-recovery/notify paths,
+    driven through the exported `runXOnceWithRetry` functions via a
+    deterministically-rejecting fake `adminPool` — no real Postgres needed for this
+    one file, see its own header comment).
+  - **UNVERIFIED against a real Resend account**, same status every other external
+    integration in this codebase carried before its first live pass (§13) —
+    `RESEND_API_KEY`/`ALERT_FROM_EMAIL`/`PLATFORM_ALERT_EMAIL` are all left unset in
+    `.env.example`, so this is wired-and-ready, not proven against real delivery.
 
 ### 4.5 Shopify Admin API (build third — channel #3, GraphQL, verified live)
 

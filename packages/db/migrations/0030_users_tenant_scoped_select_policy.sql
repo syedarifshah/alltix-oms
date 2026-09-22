@@ -1,0 +1,38 @@
+-- Closes a real bug found writing regression tests for the new tenant-email
+-- alerting feature (packages/scheduler/src/index.ts's notifyTenantUsers(),
+-- called from recordSyncFailure() once a channel connection crosses
+-- CONSECUTIVE_FAILURE_ERROR_THRESHOLD): its query --
+-- `SELECT DISTINCT email FROM users WHERE tenant_id = $1`, run inside
+-- withTenant() (sets only app.tenant_id) -- silently returned ZERO rows
+-- against real RLS, every time, in every environment, not just in the test
+-- that caught it. sendEmail()'s own empty-recipients guard
+-- (packages/shared/src/email.ts) then made that look like a harmless no-op
+-- ("no users to notify") instead of the real bug it was: not one tenant
+-- alert email could ever have gone out.
+--
+-- Root cause: migration 0010_tenants_and_users.sql's own comment already
+-- flagged this exact gap ahead of time -- "Only a self-lookup policy exists
+-- today (a user reading/inserting their own row by clerk_user_id) ... a
+-- future 'list my org's teammates' feature needs an additional policy
+-- branch scoped by app.tenant_id -- don't widen this one to double as that;
+-- add a second policy". `self_lookup_users` is scoped by
+-- `current_setting('app.clerk_user_id', true)`, which withTenant() never
+-- sets (by design -- see withTenant()'s own doc comment in
+-- packages/db/src/pool.ts) -- so a plain withTenant()-scoped SELECT against
+-- `users` always evaluated that policy's USING clause against an unset
+-- session variable and matched nothing. notifyTenantUsers() is exactly the
+-- "list my org's teammates" case 0010's own comment predicted, so this adds
+-- the second, additive policy it already described rather than touching
+-- the original self-lookup one.
+--
+-- Postgres RLS policies for the same command are OR'd together (permissive
+-- by default), so this is purely additive: any query that already matched
+-- self_lookup_users keeps matching it, and a tenant-scoped query (which
+-- previously matched nothing) now also has a path to match. SELECT-only --
+-- no corresponding INSERT/UPDATE/DELETE widening, since nothing tenant-
+-- scoped needs to write another user's row, only read the tenant's own
+-- users' emails to notify them. No GRANT change needed -- app_user already
+-- has GRANT SELECT ON users from migration 0010.
+CREATE POLICY tenant_scoped_select_users ON users
+  FOR SELECT
+  USING (tenant_id = current_setting('app.tenant_id', true)::uuid);

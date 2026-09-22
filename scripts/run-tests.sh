@@ -56,6 +56,8 @@ SAFE_TESTS=(
   "packages/order-service/test/lifecycle-transitions.test.ts"
   "packages/scheduler/test/sync-failure-tracking.test.ts"
   "packages/scheduler/test/rate-limit-cooldown.test.ts"
+  "packages/scheduler/test/cron-runner-platform-alerts.test.ts"
+  "packages/shared/test/email.test.ts"
 )
 
 # Each needs AMAZON_SANDBOX_CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN/SELLER_ID
