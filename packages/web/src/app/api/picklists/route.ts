@@ -3,6 +3,7 @@ import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { getWarehouseService } from "@/lib/services";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -11,9 +12,14 @@ export const dynamic = "force-dynamic";
  *  checkbox form on /picklists. Plain HTML form POST, not JSON: this page
  *  works with no client JS. */
 export async function POST(req: NextRequest): Promise<Response> {
-  const user = await requireCurrentUser(req, getAppPool());
+  const pool = getAppPool();
+  const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/picklists", "not signed in");
+  }
+
+  if (await checkRateLimit(pool, user.tenantId, "picklists.create")) {
+    return redirectWithError(req, "/picklists", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   const formData = await req.formData();

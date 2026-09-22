@@ -3,17 +3,28 @@ import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { getWarehouseService } from "@/lib/services";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
 /** POST /api/picklists/[id]/lines/[lineId]/record -- records what a picker
  *  actually pulled for one picklist line (WarehouseService.recordPick). The
  *  picklist id in the URL is only used to redirect back to the right page;
- *  recordPick itself resolves the line's own picklist internally. */
+ *  recordPick itself resolves the line's own picklist internally.
+ *
+ *  Rate limit here is looser than most other routes (300/min, see the call
+ *  below) -- a busy floor with several pickers scanning barcodes in
+ *  parallel is a real, legitimate high-frequency pattern for this specific
+ *  route, unlike a one-off order-lifecycle action. */
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string; lineId: string }> }): Promise<Response> {
-  const user = await requireCurrentUser(req, getAppPool());
+  const pool = getAppPool();
+  const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/picklists", "not signed in");
+  }
+
+  if (await checkRateLimit(pool, user.tenantId, "picklists.record_line", 300)) {
+    return redirectWithError(req, "/picklists", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   const { lineId } = await ctx.params;

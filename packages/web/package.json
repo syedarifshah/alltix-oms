@@ -13,7 +13,8 @@
     "test:tiktok-oauth-state": "node --import tsx --test test/tiktok-oauth-state.test.ts",
     "test:tiktok-oauth-pending": "node --import tsx --test test/tiktok-oauth-pending.test.ts",
     "test:reorder-threshold": "node --import tsx --test test/reorder-threshold.test.ts",
-    "test:channel-flags": "node --import tsx --test test/channel-flags.test.ts"
+    "test:channel-flags": "node --import tsx --test test/channel-flags.test.ts",
+    "test:rate-limit": "node --import tsx --test test/rate-limit.test.ts"
   },
   "dependencies": {
     "@alltix/billing-service": "0.1.0",

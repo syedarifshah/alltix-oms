@@ -4,6 +4,7 @@ import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { getOrderService } from "@/lib/services";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
 import { isOrderStatus } from "@/lib/order-status";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -22,12 +23,18 @@ export const dynamic = "force-dynamic";
  * here first wouldn't make this any safer, only slower.
  */
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }): Promise<Response> {
-  const user = await requireCurrentUser(req, getAppPool());
+  const pool = getAppPool();
+  const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/orders", "not signed in");
   }
 
   const { id } = await ctx.params;
+
+  if (await checkRateLimit(pool, user.tenantId, "orders.cancel")) {
+    return redirectWithError(req, `/orders/${id}`, RATE_LIMIT_ERROR_MESSAGE);
+  }
+
   const formData = await req.formData();
   const from = formData.get("from");
 

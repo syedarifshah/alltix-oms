@@ -4,6 +4,7 @@ import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { getInventoryService } from "@/lib/services";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -27,9 +28,19 @@ export const dynamic = "force-dynamic";
  * app's plain-form mutations, so this doesn't invent one just for transfers.
  */
 export async function POST(req: NextRequest): Promise<Response> {
-  const user = await requireCurrentUser(req, getAppPool());
+  const pool = getAppPool();
+  const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/inventory", "not signed in");
+  }
+
+  // Lower default limit (60/min, vs. this module's usual 120) -- deliberate:
+  // a stock transfer is a rarer, heavier, concurrency-sensitive action
+  // (InventoryService.transferStock's own allocation-style guarded
+  // updates), not something a legitimate workflow does dozens of times a
+  // minute the way picklist scanning does.
+  if (await checkRateLimit(pool, user.tenantId, "inventory.transfer", 60)) {
+    return redirectWithError(req, "/inventory", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   const formData = await req.formData();

@@ -1762,7 +1762,9 @@ eBay/Temu v1" scope decision.
 - **Webhook verification**: validate signatures on every inbound webhook (Amazon SNS
   message signing, Shopify HMAC, etc.) — don't trust unsigned payloads.
 - **Rate-limit/DDoS protection** on the public API — a buggy customer integration
-  script can otherwise take the platform down.
+  script can otherwise take the platform down. **A first version of this is built for
+  today's session-authenticated mutation routes** — see §16 for the honest scope note
+  on why that's not quite the same thing as the "public API" this bullet pictures.
 
 ## 7. Testing Strategy
 
@@ -2540,6 +2542,87 @@ CHECK constraint already makes that impossible in practice). No DB-layer test su
 the migration itself, same precedent migration 0031 set — verified instead via `tsc -b`,
 `next build`, and a manual rolled-back-transaction smoke test of the default value and
 the CHECK constraint against a real local Postgres.
+
+## 16. API Rate Limiting (§6's own Security & Compliance item)
+
+**Status: built, for today's actual surface.** §6 flags "Rate-limit/DDoS protection on
+the public API — a buggy customer integration script can otherwise take the platform
+down" as a real, previously-unaddressed gap. This closes it for the mutation routes
+that actually exist today — there is **no** separate, API-key-authenticated public REST
+API anywhere in this codebase yet (the architecture diagram in §1 pictures one; it has
+never been built — every route under `packages/web/src/app/api` is called only by this
+app's own session-cookie-authenticated browser forms). The real threat this protects
+against, honestly: not a third party's "customer integration script" (there's no way
+for one to authenticate yet), but a tenant's own stuck browser tab auto-retrying a
+failing submit, a runaway automation reusing a saved session, or a genuine bug — any of
+which could otherwise hammer the database through a real, authenticated session. A
+future API-key-authenticated public API would need its own, similarly-designed limiter
+(almost certainly per-API-key rather than per-tenant) — not covered here, and not the
+same feature.
+
+**Design — fixed one-minute window, not a token bucket or Redis-backed sliding window**:
+migration `0033_api_rate_limit_windows.sql`'s `api_rate_limit_windows` table (tenant_id,
+route_key, window_start, request_count) plus `packages/web/src/lib/rate-limit.ts`'s
+`recordRequestAndCheckRateLimit` — a single atomic `INSERT ... ON CONFLICT DO UPDATE`
+increment-and-check per request, same "handle concurrency at the database, not the
+application SELECT" discipline the allocation/transfer code (§2.2, §3) and the HR
+clock-in fix (§14) already apply elsewhere: two genuinely concurrent requests from the
+same tenant/route can't both read a stale count and both slip through. Same "don't
+stand up infra a single self-testing tenant hasn't earned yet" call this codebase
+already makes for BullMQ/Redis (§4.4), Kafka (§1), and §15's own channel feature flags.
+
+**Coverage — nine routes, deliberately not all ~30 mutation routes**: the order
+lifecycle (`orders/[id]/{cancel,pack,ship,transition,return}`), picklists
+(`picklists` create, `picklists/[id]/assign`, `picklists/[id]/lines/[lineId]/record`),
+and `inventory/transfer` — the highest-frequency, highest-consequence operational hot
+path (the one a stuck retry loop or a warehouse floor bug is most likely to actually
+hit hard, and where DB contention has real downstream cost). Connector-credential
+routes, rules, locations, HR, and products are **not yet covered** — same
+`checkRateLimit(pool, tenantId, routeKey)` one-line addition extends to any of them
+whenever it's actually needed; not applied everywhere up front because most of this
+app's ~30 `requireCurrentUser`-based routes don't share a single chokepoint `with-
+tenant-auth.ts` could enforce this from centrally (see the next paragraph) — retrofitting
+the rest is real, bounded, low-risk future work, not an oversight.
+
+**Why not enforced centrally in `withTenantAuth`/`requireCurrentUser` itself**: only 4
+of this codebase's ~34 authenticated routes actually go through `withTenantAuth` (see
+that function's own doc comment) — the other ~30, including every route this section
+covers, use `requireCurrentUser` instead specifically because their first real step is
+a network call or a service-layer transaction of their own, and `requireCurrentUser`'s
+return type (`CurrentUser | null`) is relied on by every one of those call sites to mean
+exactly one thing: "not signed in." Silently overloading it to also mean "rate limited"
+would make every existing "not signed in" redirect lie to a legitimate signed-in tenant
+who's simply been rate limited, and changing its return shape to disambiguate would mean
+touching all ~30 files anyway — no smaller than applying the check directly at each site.
+So each protected route makes its own explicit `checkRateLimit(pool, user.tenantId,
+"<route_key>")` call, right after resolving `user` and before doing any real work,
+redirecting with `RATE_LIMIT_ERROR_MESSAGE` on a hit — one extra line of intent per
+route, not a hidden side effect of the shared auth helper.
+
+**Limits are tuned per route, not one global number**: `DEFAULT_RATE_LIMIT_PER_MINUTE`
+(120/tenant/route/minute) covers the order-lifecycle and picklist-assign/create routes;
+`picklists.record_line` gets a higher explicit 300/min (a busy floor with several
+pickers scanning barcodes in parallel is a real, legitimate high-frequency pattern for
+that one route); `inventory.transfer` gets a lower explicit 60/min (a rarer, heavier,
+concurrency-sensitive action, not something a legitimate workflow does dozens of times a
+minute). All comfortably above any plausible human-driven usage, tight enough to stop a
+runaway loop well before it can meaningfully load the database.
+
+**No periodic cleanup job** — `api_rate_limit_windows` grows by one row per
+tenant/route/minute with no expiry in this pass, same "add the infra once actual scale
+demands it" call §15 already makes for not building an operator UI. Negligible at this
+platform's current single-self-testing-tenant stage; a scheduled `DELETE WHERE
+window_start < now() - interval '1 day'` is real, cheap, explicitly deferred future
+work — see the migration's own comment.
+
+**Tests**: `packages/web/test/rate-limit.test.ts` covers the two pure functions
+(`computeWindowStart`, `computeRetryAfterSeconds`) — same "extract the pure decision,
+test it directly" precedent every other feature this session set. No DB-layer test for
+the atomic increment itself (same "verified via `tsc -b`/`next build`/manual smoke test,
+not a new DB-layer test suite" call migrations 0031/0032 already made) — the underlying
+`INSERT ... ON CONFLICT DO UPDATE` pattern itself is the same one CLAUDE.md's own §7
+"property-based/fuzz testing for concurrent allocation" line already trusts Postgres to
+serialize correctly.
 
 ---
 
