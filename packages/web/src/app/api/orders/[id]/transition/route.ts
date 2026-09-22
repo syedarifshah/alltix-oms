@@ -52,7 +52,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   }
 
   try {
-    await getOrderService().transition(user.tenantId, id, from, to);
+    await getOrderService().transition(user.tenantId, id, from, to, { actorUserId: user.id });
   } catch (err) {
     return redirectWithError(req, `/orders/${id}`, errorMessage(err));
   }

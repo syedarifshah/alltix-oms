@@ -37,7 +37,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   }
 
   try {
-    await getWarehouseService().recordPick(user.tenantId, lineId, quantityPicked, damaged);
+    await getWarehouseService().recordPick(user.tenantId, lineId, quantityPicked, damaged, user.id);
   } catch (err) {
     return redirectWithError(req, "/picklists", errorMessage(err));
   }

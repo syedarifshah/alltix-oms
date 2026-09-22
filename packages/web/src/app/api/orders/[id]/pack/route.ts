@@ -24,7 +24,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const { id } = await ctx.params;
 
   try {
-    await getWarehouseService().packOrder(user.tenantId, id);
+    await getWarehouseService().packOrder(user.tenantId, id, user.id);
   } catch (err) {
     return redirectWithError(req, "/picklists", errorMessage(err));
   }

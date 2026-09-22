@@ -29,7 +29,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   try {
-    await getWarehouseService().generatePicklist(user.tenantId, orderIds);
+    await getWarehouseService().generatePicklist(user.tenantId, orderIds, user.id);
   } catch (err) {
     return redirectWithError(req, "/picklists", errorMessage(err));
   }

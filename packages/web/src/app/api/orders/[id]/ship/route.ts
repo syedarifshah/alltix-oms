@@ -41,11 +41,16 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   }
 
   try {
-    await getWarehouseService().confirmShipment(user.tenantId, id, {
-      carrier,
-      trackingNumber,
-      shippedAt: new Date().toISOString(),
-    });
+    await getWarehouseService().confirmShipment(
+      user.tenantId,
+      id,
+      {
+        carrier,
+        trackingNumber,
+        shippedAt: new Date().toISOString(),
+      },
+      user.id,
+    );
   } catch (err) {
     return redirectWithError(req, "/picklists", errorMessage(err));
   }

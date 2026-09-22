@@ -62,6 +62,7 @@ export async function POST(req: NextRequest): Promise<Response> {
       toLocationId,
       quantity,
       idempotencyKey: `manual-transfer:${user.tenantId}:${randomUUID()}`,
+      actorUserId: user.id,
     });
   } catch (err) {
     const message = errorMessage(err);

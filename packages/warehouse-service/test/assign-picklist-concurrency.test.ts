@@ -80,6 +80,7 @@ before(async () => {
 after(async () => {
   const admin = new Client({ connectionString: process.env.DATABASE_URL });
   await admin.connect();
+  await admin.query("DELETE FROM audit_log WHERE tenant_id = $1", [tenantId]);
   await admin.query("DELETE FROM picklists WHERE tenant_id = $1", [tenantId]);
   await admin.query("DELETE FROM users WHERE tenant_id = $1", [tenantId]);
   await admin.query("DELETE FROM tenants WHERE id = $1", [tenantId]);

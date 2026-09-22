@@ -57,6 +57,7 @@ before(async () => {
 });
 
 after(async () => {
+  await adminPool.query("DELETE FROM audit_log WHERE tenant_id = $1", [tenantId]);
   await adminPool.query("DELETE FROM rule_executions WHERE tenant_id = $1", [tenantId]);
   await adminPool.query("DELETE FROM automation_rules WHERE tenant_id = $1", [tenantId]);
   await adminPool.query("DELETE FROM inventory_events WHERE tenant_id = $1", [tenantId]);

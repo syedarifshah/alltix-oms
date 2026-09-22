@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import {
   DomainEvent,
   InProcessEventBus,
@@ -42,6 +42,11 @@ export interface TransferStockInput {
    *  per leg), and why checking just the outbound leg is enough to detect
    *  "already applied." */
   idempotencyKey: string;
+  /** Who initiated this transfer, for the `inventory.transferred` audit
+   *  event recorded alongside it -- null (the default) for an internal/
+   *  automatic caller, same null-means-no-human-actor semantics
+   *  OrderService.transition()'s own `actorUserId` option carries. */
+  actorUserId?: string | null;
 }
 
 export interface TransferStockResult {
@@ -290,9 +295,15 @@ export class InventoryService {
    * (nonsensical -- there's nothing to move), a non-positive or
    * non-integer `quantity`, or insufficient `available` stock at the
    * source under the lock above.
+   *
+   * Records one `inventory.transferred` audit event (`input.actorUserId`,
+   * defaulting to null) in the same transaction as both legs above -- see
+   * recordAuditEvent's own doc comment for why that atomicity matters. Not
+   * recorded on the idempotent-replay branch (nothing new happened).
    */
   async transferStock(input: TransferStockInput): Promise<TransferStockResult> {
     const { tenantId, productId, fromLocationId, toLocationId, quantity, idempotencyKey } = input;
+    const actorUserId = input.actorUserId ?? null;
 
     if (fromLocationId === toLocationId) {
       throw new Error("InventoryService.transferStock: fromLocationId and toLocationId must be different locations");
@@ -372,6 +383,19 @@ export class InventoryService {
          RETURNING on_hand, reserved, available`,
         [tenantId, productId, toLocationId, quantity],
       );
+
+      // Same transaction as both inventory_events/inventory_levels writes
+      // above -- see recordAuditEvent's own doc comment for why that
+      // matters (a rolled-back transfer never leaves a committed audit row
+      // behind).
+      await recordAuditEvent(client, {
+        tenantId,
+        userId: actorUserId,
+        action: "inventory.transferred",
+        entityType: "product",
+        entityId: productId,
+        details: { fromLocationId, toLocationId, quantity, transferId },
+      });
 
       return { applied: true as const, transferId, sourceLevels: sourceLevels.rows[0]!, destLevels: destLevels.rows[0]! };
     });

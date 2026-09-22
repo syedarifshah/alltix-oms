@@ -1,5 +1,5 @@
 import type { Pool, PoolClient } from "pg";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import {
   DomainEvent,
   InProcessEventBus,
@@ -347,8 +347,18 @@ export class WarehouseService {
    * An order with zero order_lines is transitioned to 'picking' directly
    * (vacuously nothing to pick), mirroring allocateOrder()'s "zero lines is
    * vacuously fine" precedent.
+   *
+   * `actorUserId` (optional, defaults to null for an internal/automatic
+   * caller -- same null-means-no-human-actor semantics
+   * OrderService.transition()'s own option carries) records one
+   * `picklist.created` audit event per picklist inserted, in the same
+   * transaction that inserts it -- and is passed straight through to each
+   * covered order's own `allocated -> picking` transition() call below, so
+   * that transition's own `order.transitioned` audit event (recorded inside
+   * OrderService.simpleTransition()) attributes to the same actor rather
+   * than defaulting to null.
    */
-  async generatePicklist(tenantId: string, orderIds: string[]): Promise<Picklist[]> {
+  async generatePicklist(tenantId: string, orderIds: string[], actorUserId: string | null = null): Promise<Picklist[]> {
     interface LineWithLocation {
       orderId: string;
       orderLineId: string;
@@ -427,6 +437,17 @@ export class WarehouseService {
         );
         const picklistId = picklistResult.rows[0]!.id;
 
+        // Same transaction as the INSERT above -- see recordAuditEvent's own
+        // doc comment for why that matters.
+        await recordAuditEvent(client, {
+          tenantId,
+          userId: actorUserId,
+          action: "picklist.created",
+          entityType: "picklist",
+          entityId: picklistId,
+          details: { locationId, orderIds: [...new Set(lines.map((l) => l.orderId))], lineCount: lines.length },
+        });
+
         const picklistLines: PicklistLine[] = [];
         for (const line of lines) {
           const lineResult = await client.query<{ id: string }>(
@@ -461,7 +482,7 @@ export class WarehouseService {
 
     const distinctOrderIds = [...new Set(orderIds)];
     for (const orderId of distinctOrderIds) {
-      await this.orderService.transition(tenantId, orderId, "allocated", "picking");
+      await this.orderService.transition(tenantId, orderId, "allocated", "picking", { actorUserId });
     }
 
     return picklists;
@@ -476,8 +497,17 @@ export class WarehouseService {
    * request's UPDATE commits first flips the row to 'assigned', so the
    * second request's UPDATE matches zero rows and fails loudly instead of
    * silently overwriting the first picker's assignment).
+   *
+   * `actorUserId` (optional, defaults to null) records a `picklist.assigned`
+   * audit event in the same transaction as the UPDATE -- see
+   * recordAuditEvent's own doc comment for why that ordering matters.
    */
-  async assignPicklist(tenantId: string, picklistId: string, pickerId: string): Promise<void> {
+  async assignPicklist(
+    tenantId: string,
+    picklistId: string,
+    pickerId: string,
+    actorUserId: string | null = null,
+  ): Promise<void> {
     await withTenant(this.pool, tenantId, async (client) => {
       const result = await client.query(
         `UPDATE picklists SET status = 'assigned', assigned_to = $1, updated_at = now()
@@ -487,6 +517,14 @@ export class WarehouseService {
       if (result.rowCount === 0) {
         throw new Error(`Picklist ${picklistId} is not 'open' -- refusing assignment (already assigned?)`);
       }
+      await recordAuditEvent(client, {
+        tenantId,
+        userId: actorUserId,
+        action: "picklist.assigned",
+        entityType: "picklist",
+        entityId: picklistId,
+        details: { pickerId },
+      });
     });
   }
 
@@ -498,12 +536,18 @@ export class WarehouseService {
    * `damage` vs `adjustment` inventory_events entry accordingly (CLAUDE.md
    * §2.2). Requires the picklist to be 'assigned' (someone must have
    * claimed it before recording picks against it).
+   *
+   * `actorUserId` (optional, defaults to null) records a
+   * `picklist.line_recorded` audit event in the same transaction as the
+   * UPDATE below -- see recordAuditEvent's own doc comment for why that
+   * ordering matters.
    */
   async recordPick(
     tenantId: string,
     picklistLineId: string,
     quantityPicked: number,
     damaged: boolean = false,
+    actorUserId: string | null = null,
   ): Promise<void> {
     await withTenant(this.pool, tenantId, async (client) => {
       const lineResult = await client.query<{ picklist_id: string; quantity_requested: number }>(
@@ -534,6 +578,15 @@ export class WarehouseService {
           WHERE id = $3 AND tenant_id = $4`,
         [quantityPicked, status, picklistLineId, tenantId],
       );
+
+      await recordAuditEvent(client, {
+        tenantId,
+        userId: actorUserId,
+        action: "picklist.line_recorded",
+        entityType: "picklist_line",
+        entityId: picklistLineId,
+        details: { quantityPicked, quantityRequested: line.quantity_requested, damaged, status },
+      });
     });
   }
 
@@ -624,8 +677,18 @@ export class WarehouseService {
    * If every line on the owning picklist(s) is now resolved, marks the
    * picklist 'completed' regardless of which of the two outcomes above the
    * order landed on.
+   *
+   * `actorUserId` (optional, defaults to null): passed straight through to
+   * the `picking -> packed` transition() call at the end of this method (so
+   * that transition's own `order.transitioned` audit event, recorded inside
+   * OrderService.simpleTransition(), attributes to the real actor). The
+   * ALL-SHORT raw cancellation flip above is NOT a transition() call (see
+   * this doc comment's own reasoning on why it can't double-release via
+   * OrderService.cancelOrder()), so it gets its own `order.transitioned`
+   * audit event, recorded directly alongside that UPDATE -- otherwise this
+   * one cancellation path would be invisible to the audit log entirely.
    */
-  async packOrder(tenantId: string, orderId: string): Promise<void> {
+  async packOrder(tenantId: string, orderId: string, actorUserId: string | null = null): Promise<void> {
     const result = await withTenant(this.pool, tenantId, async (client) => {
       const lines = await client.query<{
         id: string;
@@ -751,6 +814,20 @@ export class WarehouseService {
             throw new Error(`Order ${orderId} is not in status 'picking' -- refusing to cancel (concurrent update?)`);
           }
           originalCancelled = true;
+
+          // Same transaction as the UPDATE above -- see recordAuditEvent's
+          // own doc comment for why that matters. Not routed through
+          // transition()/OrderService.cancelOrder() (see this method's own
+          // doc comment), so this is the only place this specific
+          // 'picking' -> 'cancelled' flip gets recorded.
+          await recordAuditEvent(client, {
+            tenantId,
+            userId: actorUserId,
+            action: "order.transitioned",
+            entityType: "order",
+            entityId: orderId,
+            details: { from: "picking", to: "cancelled", reason: "short_pick_all_lines" },
+          });
         }
       }
 
@@ -781,7 +858,7 @@ export class WarehouseService {
       return;
     }
 
-    await this.orderService.transition(tenantId, orderId, "picking", "packed");
+    await this.orderService.transition(tenantId, orderId, "picking", "packed", { actorUserId });
   }
 
   /** Marks a picklist 'completed' once every one of its lines is resolved
@@ -836,8 +913,18 @@ export class WarehouseService {
    * above) rather than becoming 'shipped' with no matching consumption
    * ever recorded for it -- the one outcome this whole fix exists to rule
    * out.
+   *
+   * `actorUserId` (optional, defaults to null): passed straight through to
+   * the `packed -> shipped` transition() call at the end of this method, so
+   * that transition's own `order.transitioned` audit event attributes to
+   * the real actor rather than defaulting to null.
    */
-  async confirmShipment(tenantId: string, orderId: string, tracking: TrackingInfo): Promise<void> {
+  async confirmShipment(
+    tenantId: string,
+    orderId: string,
+    tracking: TrackingInfo,
+    actorUserId: string | null = null,
+  ): Promise<void> {
     const order = await withTenant(this.pool, tenantId, async (client) => {
       const result = await client.query<{ channel: string; external_order_id: string; status: string }>(
         `SELECT channel, external_order_id, status FROM orders WHERE id = $1 AND tenant_id = $2`,
@@ -879,6 +966,6 @@ export class WarehouseService {
     }
 
     await recordShipmentSaleEvents(this.pool, this.inventoryService, tenantId, orderId);
-    await this.orderService.transition(tenantId, orderId, "packed", "shipped");
+    await this.orderService.transition(tenantId, orderId, "packed", "shipped", { actorUserId });
   }
 }

@@ -1,9 +1,8 @@
 import type { NextRequest } from "next/server";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
-import { recordAuditEvent } from "@/lib/audit-log";
 import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";

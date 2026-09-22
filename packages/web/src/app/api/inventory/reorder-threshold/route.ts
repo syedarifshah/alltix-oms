@@ -1,10 +1,9 @@
 import type { NextRequest } from "next/server";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError } from "@/lib/route-helpers";
 import { parseReorderThresholdDays } from "@/lib/reorder-threshold";
-import { recordAuditEvent } from "@/lib/audit-log";
 
 export const dynamic = "force-dynamic";
 

@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from "pg";
 import * as zipcodes from "zipcodes";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import {
   DomainEvent,
   InProcessEventBus,
@@ -245,24 +245,40 @@ export class OrderService {
    * whether this restocks the exact quantity the order's own 'sale' ledger
    * events say it consumed when shipped. No other `to` value is
    * implemented.
+   *
+   * `options.actorUserId` (new, optional) -- the signed-in user who
+   * initiated this, when there is one -- records an `order.transitioned`
+   * audit_log row (CLAUDE.md's "Audit Log" section) in the SAME transaction
+   * as the underlying status flip/ledger write each branch below already
+   * makes, same atomicity guarantee `recordAuditEvent`'s own doc comment
+   * describes for the original four web-route call sites. Defaults to
+   * `null` (an operator/system-initiated transition -- an internal auto-
+   * validate/auto-allocate step in persistPulledOrders(), a webhook-
+   * triggered cancellation, a test or seed script) rather than being
+   * required, since most of this method's ~50 call sites across this
+   * package, WarehouseService, and test/seed scripts have no human actor
+   * in the loop at all -- see audit-log.ts's own doc comment on why NULL is
+   * the correct representation for that, not a fabricated system-user row.
    */
   async transition(
     tenantId: string,
     orderId: string,
     from: OrderStatus,
     to: OrderStatus,
-    options?: { disposition?: ReturnDisposition },
+    options?: { disposition?: ReturnDisposition; actorUserId?: string | null },
   ): Promise<OrderStatus> {
     if (!isValidOrderTransition(from, to)) {
       throw new Error(`Invalid order transition: ${from} -> ${to}`);
     }
 
+    const actorUserId = options?.actorUserId ?? null;
+
     if (to === "allocated") {
-      return this.allocateOrder(tenantId, orderId, from);
+      return this.allocateOrder(tenantId, orderId, from, actorUserId);
     }
 
     if (to === "returned") {
-      return this.returnOrder(tenantId, orderId, from, options?.disposition);
+      return this.returnOrder(tenantId, orderId, from, options?.disposition, actorUserId);
     }
 
     if (
@@ -274,11 +290,11 @@ export class OrderService {
       to === "delivered" ||
       to === "refunded"
     ) {
-      return this.simpleTransition(tenantId, orderId, from, to);
+      return this.simpleTransition(tenantId, orderId, from, to, actorUserId);
     }
 
     if (to === "cancelled") {
-      return this.cancelOrder(tenantId, orderId, from);
+      return this.cancelOrder(tenantId, orderId, from, actorUserId);
     }
 
     throw new Error(`OrderService.transition: '${from}' -> '${to}' is not implemented yet`);
@@ -340,7 +356,12 @@ export class OrderService {
    * unpack it, not a button in this app. 'shipped' already has its own
    * CLAUDE.md §3-drawn path to returned/refunded instead of cancellation.
    */
-  private async cancelOrder(tenantId: string, orderId: string, from: OrderStatus): Promise<OrderStatus> {
+  private async cancelOrder(
+    tenantId: string,
+    orderId: string,
+    from: OrderStatus,
+    actorUserId: string | null,
+  ): Promise<OrderStatus> {
     await withTenant(this.pool, tenantId, async (client) => {
       const result = await client.query(
         `UPDATE orders SET status = 'cancelled', updated_at = now() WHERE id = $1 AND tenant_id = $2 AND status = $3`,
@@ -351,6 +372,17 @@ export class OrderService {
           `Order ${orderId} is not in status '${from}' -- refusing cancellation (concurrent update?)`,
         );
       }
+
+      // Same transaction as the UPDATE (and, below, the release events) --
+      // see transition()'s own doc comment on options.actorUserId.
+      await recordAuditEvent(client, {
+        tenantId,
+        userId: actorUserId,
+        action: "order.transitioned",
+        entityType: "order",
+        entityId: orderId,
+        details: { from, to: "cancelled" },
+      });
 
       if (!OrderService.CANCEL_RELEASES_RESERVATION.has(from)) {
         return;
@@ -455,6 +487,7 @@ export class OrderService {
     orderId: string,
     from: OrderStatus,
     disposition: ReturnDisposition | undefined,
+    actorUserId: string | null,
   ): Promise<OrderStatus> {
     if (!disposition) {
       throw new Error(
@@ -473,6 +506,17 @@ export class OrderService {
           `Order ${orderId} is not in status '${from}' -- refusing return (concurrent update?)`,
         );
       }
+
+      // Same transaction as the UPDATE (and, for 'sellable', the restock
+      // events below) -- see transition()'s own doc comment.
+      await recordAuditEvent(client, {
+        tenantId,
+        userId: actorUserId,
+        action: "order.transitioned",
+        entityType: "order",
+        entityId: orderId,
+        details: { from, to: "returned", disposition },
+      });
 
       if (disposition !== "sellable") {
         return;
@@ -527,6 +571,7 @@ export class OrderService {
     orderId: string,
     from: OrderStatus,
     to: OrderStatus,
+    actorUserId: string | null,
   ): Promise<OrderStatus> {
     await withTenant(this.pool, tenantId, async (client) => {
       const result = await client.query(
@@ -538,6 +583,17 @@ export class OrderService {
           `Order ${orderId} is not in status '${from}' -- refusing transition to '${to}' (concurrent update?)`,
         );
       }
+
+      // Same transaction as the UPDATE -- see transition()'s own doc
+      // comment.
+      await recordAuditEvent(client, {
+        tenantId,
+        userId: actorUserId,
+        action: "order.transitioned",
+        entityType: "order",
+        entityId: orderId,
+        details: { from, to },
+      });
     });
 
     const eventName = SIMPLE_TRANSITION_EVENT[to];
@@ -589,7 +645,12 @@ export class OrderService {
    * Phase 4 tracks both as separately-scoped, not-yet-built gaps). If no
    * candidate has enough stock, the order backorders exactly as before.
    */
-  private async allocateOrder(tenantId: string, orderId: string, expectedFromStatus: OrderStatus): Promise<OrderStatus> {
+  private async allocateOrder(
+    tenantId: string,
+    orderId: string,
+    expectedFromStatus: OrderStatus,
+    actorUserId: string | null,
+  ): Promise<OrderStatus> {
     const result = await withTenant(this.pool, tenantId, async (client) => {
       const orderResult = await client.query<{
         status: OrderStatus;
@@ -620,6 +681,14 @@ export class OrderService {
           `UPDATE orders SET status = 'allocated', updated_at = now() WHERE id = $1 AND tenant_id = $2`,
           [orderId, tenantId],
         );
+        await recordAuditEvent(client, {
+          tenantId,
+          userId: actorUserId,
+          action: "order.transitioned",
+          entityType: "order",
+          entityId: orderId,
+          details: { from: expectedFromStatus, to: "allocated", locationId: null, lineCount: 0 },
+        });
         return { status: "allocated" as const, locationId: null };
       }
 
@@ -688,6 +757,14 @@ export class OrderService {
           `UPDATE orders SET status = 'backordered', updated_at = now() WHERE id = $1 AND tenant_id = $2`,
           [orderId, tenantId],
         );
+        await recordAuditEvent(client, {
+          tenantId,
+          userId: actorUserId,
+          action: "order.transitioned",
+          entityType: "order",
+          entityId: orderId,
+          details: { from: expectedFromStatus, to: "backordered" },
+        });
         return { status: "backordered" as const, locationId: null };
       }
 
@@ -716,6 +793,14 @@ export class OrderService {
         `UPDATE orders SET status = 'allocated', updated_at = now() WHERE id = $1 AND tenant_id = $2`,
         [orderId, tenantId],
       );
+      await recordAuditEvent(client, {
+        tenantId,
+        userId: actorUserId,
+        action: "order.transitioned",
+        entityType: "order",
+        entityId: orderId,
+        details: { from: expectedFromStatus, to: "allocated", locationId: chosenLocationId, lineCount: lines.rows.length },
+      });
       return { status: "allocated" as const, locationId: chosenLocationId };
     });
 

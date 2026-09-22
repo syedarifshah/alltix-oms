@@ -2695,30 +2695,77 @@ cannot edit or erase a row, verified directly against a real Postgres (a smoke-t
 `UPDATE`/`DELETE` both fail with `permission denied for table audit_log`, not just "no
 code path happens to call it").
 
-**Atomicity — same transaction as the mutation it records, always**: `audit-log.ts`'s
-`recordAuditEvent(client, event)` deliberately takes an already-open, tenant-scoped
-`client` rather than offering a pool-level convenience the way `channel-flags.ts`/
-`rate-limit.ts` each do — every instrumented route already does its mutation via
-`withTenant(pool, tenantId, (client) => ...)`, so recording the audit row through that
-SAME client, inside that SAME transaction, means a rolled-back mutation never leaves a
-committed audit row behind. This is *why* coverage is narrower than rate limiting's own
-nine routes (§16): only routes that already do their own direct `client.query(...)`
-inside `withTenant` (not ones that delegate to a service class's own internal
-transaction, like `OrderService.transition`/`WarehouseService`) get this for free without
-changing business-logic code in another package.
+**Atomicity — same transaction as the mutation it records, always**: `recordAuditEvent(client,
+event)` deliberately takes an already-open, tenant-scoped `client` rather than offering a
+pool-level convenience the way `channel-flags.ts`/`rate-limit.ts` each do — every
+instrumented route or service method already does its mutation via `withTenant(pool,
+tenantId, (client) => ...)`, so recording the audit row through that SAME client, inside
+that SAME transaction, means a rolled-back mutation never leaves a committed audit row
+behind. Lives in `packages/db/src/audit-log.ts` (exported from `@alltix/db`'s own
+`index.ts`), not `packages/web/src/lib` where it originally shipped — moved there
+specifically so `OrderService`/`WarehouseService`/`InventoryService` (none of which
+depend on `@alltix/web`) could call it directly once the coverage below was built,
+without a new cross-package dependency; `@alltix/db` is the one package every service
+package and `packages/web` both already depend on. `scripts/set-channel-flags.ts` was
+updated to import it from there too, same "scripts never reach into `@alltix/web`'s own
+`src/`" boundary that script's own `ALL_CHANNELS` comment already established (that
+boundary was never about `@alltix/db`, which every script already imports from freely).
 
-**Coverage — four call sites, deliberately not order/picklist/warehouse actions**:
-`rules` (create), `rules/[id]/toggle`, `inventory/reorder-threshold`, and
-`scripts/set-channel-flags.ts` (inlined there rather than imported from
-`packages/web/src/lib/audit-log.ts` — same "scripts never reach into `@alltix/web`'s own
-`src/`" boundary `set-channel-flags.ts`'s own `ALL_CHANNELS` comment already
-established). The order lifecycle, picklists, and inventory transfer — §16's own rate-
-limited hot path — route through `OrderService`/`WarehouseService`/`InventoryService`,
-each opening its own internal transaction the Route Handler never sees; auditing those
-for real (with the same same-transaction atomicity guarantee) means threading an actor
-and an audit write into each service method itself, not the route. Real, bounded,
-explicitly deferred future work — not attempted here to avoid touching business logic in
-three other packages in the same pass as everything else this session already shipped.
+**Coverage — now includes the order lifecycle, picklists, and inventory transfer**: what
+used to be four call sites (`rules` create, `rules/[id]/toggle`, `inventory/
+reorder-threshold`, `scripts/set-channel-flags.ts`) is now the whole of §16's own
+rate-limited hot path too. The gap this section used to flag — "auditing those for real
+means threading an actor and an audit write into each service method itself, not the
+route" — is closed:
+  - `OrderService.transition()` (`packages/order-service/src/index.ts`) gained an
+    `actorUserId?: string | null` field on its existing `options` parameter (defaulting
+    to `null` — the same "no human actor" meaning `audit_log.user_id` NULL already
+    carries for an operator script). Recorded ONCE, inside `transition()`'s own private
+    branch methods (`cancelOrder`, `returnOrder`, `simpleTransition`, `allocateOrder`),
+    each already opening its own `withTenant` block — not at each of `transition()`'s
+    ~50 call sites. `action: "order.transitioned"` (`details: {from, to, ...}` —
+    `allocateOrder` additionally records `locationId`/`lineCount`, `returnOrder` records
+    `disposition`).
+  - Because `WarehouseService`'s own `generatePicklist`/`packOrder`/`confirmShipment`
+    each internally call `this.orderService.transition(...)`, threading their own new
+    `actorUserId?: string | null` parameter (default `null`) into that call gets an
+    `order.transitioned` row "for free" for the `allocated -> picking`, `picking ->
+    packed`, and `packed -> shipped` legs — no separate instrumentation needed for those.
+    `WarehouseService` additionally records its OWN mutations directly (each already
+    opens its own `withTenant` block, same pattern as `OrderService`'s branch methods):
+    `generatePicklist` → `picklist.created` (one per picklist inserted), `assignPicklist`
+    → `picklist.assigned`, `recordPick` → `picklist.line_recorded`. The one exception:
+    `packOrder`'s ALL-SHORT case cancels the original order via a raw guarded status flip
+    (see that method's own doc comment for why it can't go through
+    `OrderService.cancelOrder()` — double-release risk), which is NOT a `transition()`
+    call, so it gets its own directly-recorded `order.transitioned` row
+    (`details.reason: "short_pick_all_lines"`) right alongside that UPDATE, rather than
+    being silently invisible to the audit log.
+  - `InventoryService.transferStock()` gained an `actorUserId?: string | null` field on
+    its existing `TransferStockInput` (default `null`), recording `inventory.transferred`
+    in the same transaction as both legs' `inventory_events`/`inventory_levels` writes.
+    `recordInventoryEvent()` (the lower-level primitive `transferStock` does NOT go
+    through, and every reservation/sale/receipt/adjustment event in the system does) was
+    deliberately left uninstrumented — auditing every sale/reservation event would mean
+    a row per order line on every order, far noisier than this table's "highest-value
+    mutations" scope, and `inventory_events` already IS that ledger's own audit trail
+    (§2.2) for exactly that granularity.
+  - Every route calling into these methods now passes the signed-in `user.id` as the new
+    actor argument: `orders/[id]/{cancel,transition,return}` (via `transition()`'s
+    `options.actorUserId`), `orders/[id]/{pack,ship}`, `picklists` (create),
+    `picklists/[id]/assign` (as both `pickerId` and `actorUserId` — the picker claiming
+    it IS the actor), `picklists/[id]/lines/[lineId]/record`, `inventory/transfer`. The
+    one deliberate exception: `webhooks/shopify`'s own `orders/cancelled`-triggered
+    `transition(..., 'cancelled')` call stays on the `actorUserId` default (`null`) — a
+    webhook delivery has no signed-in user to attribute the cancellation to, the same
+    NULL-means-no-human-actor semantics an operator script already gets.
+  - **Deliberately not audited this pass**: the new backordered order `packOrder`'s
+    SHORT-PICK SPLIT inserts via `spinOffBackorder()` (a new `orders` row, not a
+    transition of an existing one) has no audit event of its own — `OrderSplitForBackorder`/
+    `OrderBackordered` domain events already surface that split to any subscriber, and
+    adding a distinct audit action for order *creation* (vs. every other action here,
+    which are all status transitions or updates to something that already existed) would
+    be a real, separate scope increase, not a small addition to this pass.
 
 **New RLS policy on `users`, invited by that table's own migration comment**: migration
 0010's own doc comment on `self_lookup_users` already named this exact need — "a future
@@ -2742,10 +2789,35 @@ table to maintain as more routes get instrumented.
 **Tests**: no dedicated test file — `recordAuditEvent` is a thin, direct SQL wrapper
 with no pure decision logic to extract the way `reorder-threshold.ts`/`rate-limit.ts`
 each had (same as `route-helpers.ts`'s own `redirectWithError`/`redirectTo`, which also
-have none). Verified instead via `tsc -b`, `next build`, and a manual smoke test against
-a real local Postgres covering: same-transaction recording with a real actor, a
-system-actor (NULL `user_id`) entry, the `/settings/activity` join query itself,
-cross-tenant isolation, and the append-only `UPDATE`/`DELETE` rejection — all passed.
+have none). Verified instead via `tsc -b`, `next build`, `bash scripts/run-tests.sh`
+(the full existing suite), and a manual smoke test against a real local Postgres
+covering: same-transaction recording with a real actor, a system-actor (NULL `user_id`)
+entry, the `/settings/activity` join query itself, cross-tenant isolation, and the
+append-only `UPDATE`/`DELETE` rejection (the original pass, still valid) — plus, for
+this pass's service-layer extension: an order cancellation recording `order.transitioned`
+with a real actor via `OrderService.transition()`'s new option, a picklist creation
+recording `picklist.created`, and an inventory transfer recording
+`inventory.transferred` — all against real seeded rows, not mocks, all passed.
+
+**A real test-cleanup gap found and fixed while verifying this pass, not a production
+bug**: every existing `OrderService`/`WarehouseService`/`InventoryService` test file
+that exercises `transition()`/`generatePicklist()`/`transferStock()` and friends now
+writes real `audit_log` rows as a side effect (none of these methods needed a code
+change to start doing so — that's the whole point of instrumenting the chokepoint once).
+None of those test files' own `after()` cleanup blocks deleted from `audit_log` —
+it didn't exist as a concern for them before this pass — so every test run was leaving
+permanent, orphaned rows behind (confirmed directly: 364 pre-existing orphaned rows,
+`tenant_id`s with no matching `tenants` row, found and deleted from the local dev
+database while verifying this change). `audit_log` has no FK constraint on `tenant_id`
+(§17's own schema paragraph), so this was never a broken-test-run risk, only a slow,
+silent leak into a table this codebase specifically designed to be permanent and
+append-only — exactly the kind of table where an unnoticed leak matters more than most.
+**Fixed** by adding `DELETE FROM audit_log WHERE tenant_id = $1` to the `after()` cleanup
+of every affected test file (17 across `order-service`, `warehouse-service`,
+`inventory-service`, `rules-engine`, `billing-service`, and one `scheduler` test —
+anything that calls `persistPulledOrders`/`transition`/`generatePicklist`/`transferStock`
+and friends) — confirmed zero orphaned rows after a full `bash scripts/run-tests.sh` run
+post-fix.
 
 ---
 

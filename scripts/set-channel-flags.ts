@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { fileURLToPath } from "node:url";
-import { createAppPool, withTenant } from "../packages/db/src/index.js";
+import { createAppPool, withTenant, recordAuditEvent } from "../packages/db/src/index.js";
 
 // Deliberately NOT imported from packages/web/src/lib/channel-flags.ts --
 // no other script in this repo reaches into @alltix/web's own src/ (every
@@ -76,19 +76,22 @@ export async function setChannelFlags(
       throw new Error(`No tenant found with id ${tenantId} (or RLS hid it -- check TENANT_ID)`);
     }
     // Same transaction as the UPDATE above, same atomicity reasoning
-    // packages/web/src/lib/audit-log.ts's own recordAuditEvent doc comment
-    // gives -- inlined here rather than imported from that module, same
+    // @alltix/db's recordAuditEvent doc comment gives. Imported directly
+    // now that it lives in @alltix/db, not packages/web/src/lib -- the
     // "scripts never reach into @alltix/web's own src/" boundary this
-    // file's own ALL_CHANNELS comment already established. user_id is NULL
-    // -- an operator running this script from a shell has no Clerk
-    // session to attribute the change to (see migration
-    // 0034_audit_log.sql's own doc comment on why that's NULL, not a
-    // required column).
-    await client.query(
-      `INSERT INTO audit_log (tenant_id, user_id, action, entity_type, entity_id, details)
-       VALUES ($1, NULL, 'settings.channel_flags_changed', 'tenant', $1, $2)`,
-      [tenantId, JSON.stringify({ enabledChannels: channels })],
-    );
+    // file's own ALL_CHANNELS comment still applies to THAT (still a
+    // web-only file), but no longer blocks this import. user_id is NULL --
+    // an operator running this script from a shell has no Clerk session to
+    // attribute the change to (see migration 0034_audit_log.sql's own doc
+    // comment on why that's NULL, not a required column).
+    await recordAuditEvent(client, {
+      tenantId,
+      userId: null,
+      action: "settings.channel_flags_changed",
+      entityType: "tenant",
+      entityId: tenantId,
+      details: { enabledChannels: channels },
+    });
   });
 }
 

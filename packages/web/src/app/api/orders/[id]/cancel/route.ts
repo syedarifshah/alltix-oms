@@ -43,7 +43,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   }
 
   try {
-    await getOrderService().transition(user.tenantId, id, from, "cancelled");
+    await getOrderService().transition(user.tenantId, id, from, "cancelled", { actorUserId: user.id });
   } catch (err) {
     return redirectWithError(req, `/orders/${id}`, errorMessage(err));
   }

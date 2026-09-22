@@ -58,6 +58,7 @@ after(async () => {
   const { Client } = await import("pg");
   const admin = new Client({ connectionString: process.env.DATABASE_URL });
   await admin.connect();
+  await admin.query("DELETE FROM audit_log WHERE tenant_id = $1", [tenantId]);
   await admin.query("DELETE FROM inventory_events WHERE tenant_id = $1", [tenantId]);
   await admin.query("DELETE FROM orders WHERE tenant_id = $1", [tenantId]); // cascades order_lines
   await admin.query("DELETE FROM inventory_levels WHERE tenant_id = $1", [tenantId]);
