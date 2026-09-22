@@ -74,6 +74,23 @@ export interface OrderReceivedPayload {
   lineSkus: string[];
 }
 
+/** Payload for `order.backordered` -- the rules engine's second trigger
+ *  event (alongside `order.received`, see RulesEngine.attach()). Minimal on
+ *  purpose, same "don't type ahead of a real consumer" discipline
+ *  OrderReceivedPayload's own doc comment describes: `allocateOrder()`
+ *  (packages/order-service/src/index.ts) has never published anything
+ *  beyond `{ orderId }` here, and a rule reacting to a backorder has no
+ *  channel/marketplace/SKU context to condition on the way an
+ *  order.received rule does -- this event fires purely because *this
+ *  specific order* just ran out of stock everywhere, which is already fully
+ *  captured by `orderId` alone. A rule that wants to condition on which
+ *  product/channel it was can still do so by only running against orders it
+ *  already knows to expect (e.g. a channel-specific tenant), or by looking
+ *  the order up -- not something this payload needs to carry pre-resolved. */
+export interface OrderBackorderedPayload {
+  orderId: string;
+}
+
 /** Payload for `order.split_for_backorder` -- see DomainEvent.OrderSplitForBackorder's
  *  own comment for why this exists as its own event/payload rather than
  *  making a subscriber reconstruct the relationship from OrderBackordered/

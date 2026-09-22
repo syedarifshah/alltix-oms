@@ -3,11 +3,13 @@ import { withTenant } from "@alltix/db";
 import {
   DomainEvent,
   isValidOrderTransition,
+  sendEmail,
   type AutomationRule,
   type AutomationRuleAction,
   type AutomationRuleCondition,
   type DomainEventEnvelope,
   type EventBus,
+  type OrderBackorderedPayload,
   type OrderReceivedPayload,
   type OrderStatus,
 } from "@alltix/shared";
@@ -29,6 +31,15 @@ export interface ResolvedAction {
   rule: AutomationRule;
   action: AutomationRuleAction;
   applied: boolean;
+}
+
+/** An email a `send_notification` action wants sent, built (pure, no I/O)
+ *  during rule execution and actually dispatched afterward -- see
+ *  {@link RulesEngine.handleOrderEvent}'s doc comment for why the send
+ *  itself is deliberately outside that method's DB transaction. */
+export interface RuleNotification {
+  subject: string;
+  text: string;
 }
 
 function getByPath(obj: unknown, path: string): unknown {
@@ -85,18 +96,29 @@ function matchesConditions(conditions: AutomationRuleCondition[], payload: unkno
  * created_at ascending (the rule made first wins -- an explicable story,
  * unlike an arbitrary id comparison). The algorithm is action-type-general,
  * not hardcoded to routing, so it didn't need reworking when a second
- * action type ('hold_order', see {@link executeAction}) was added.
+ * action type ('hold_order', see {@link executeAction}) was added, or a
+ * third ('send_notification', same section).
+ *
+ * Two trigger events, not one: `order.received` (the original) and
+ * `order.backordered` (added alongside `send_notification` -- a backorder
+ * running out of stock everywhere is exactly the kind of thing a tenant
+ * wants to hear about without watching `/orders` themselves). Both share
+ * the same {@link handleOrderEvent} handler -- see its own doc comment for
+ * why one generic handler covers any event whose payload carries an
+ * `orderId`.
  */
 export class RulesEngine {
   constructor(private readonly pool: Pool) {}
 
-  /** Registers this engine's order.received handler on `eventBus`. Called
-   *  once during service wiring (by whatever constructs both an
-   *  OrderService and a RulesEngine sharing the same bus) -- OrderService
-   *  never references RulesEngine directly; this is the other half of that
-   *  decoupling. */
+  /** Registers this engine's event handlers on `eventBus`. Called once
+   *  during service wiring (by whatever constructs both an OrderService and
+   *  a RulesEngine sharing the same bus) -- OrderService never references
+   *  RulesEngine directly; this is the other half of that decoupling. Both
+   *  `order.received` and `order.backordered` route through the same
+   *  {@link handleOrderEvent} -- see its own doc comment. */
   attach(eventBus: EventBus): void {
-    eventBus.subscribe<OrderReceivedPayload>(DomainEvent.OrderReceived, (event) => this.handleOrderReceived(event));
+    eventBus.subscribe<OrderReceivedPayload>(DomainEvent.OrderReceived, (event) => this.handleOrderEvent(event));
+    eventBus.subscribe<OrderBackorderedPayload>(DomainEvent.OrderBackordered, (event) => this.handleOrderEvent(event));
   }
 
   async loadEnabledRules(tenantId: string, triggerEvent: string): Promise<AutomationRule[]> {
@@ -186,7 +208,12 @@ export class RulesEngine {
   }
 
   /**
-   * The order.received subscriber (registered via {@link attach}). Loads
+   * The shared subscriber for both `order.received` and `order.backordered`
+   * (registered via {@link attach}) -- one generic handler rather than two
+   * near-identical copies, since both events' payloads narrow to the one
+   * thing this method actually needs, `orderId`, and every other step
+   * (loading rules for `event.name`, evaluating/resolving, writing
+   * `rule_executions`) is already fully generic across trigger events. Loads
    * enabled rules for this trigger, evaluates and resolves them, executes
    * every *applied* action, and writes one rule_executions row per matched
    * rule/action pair (applied or not -- see RuleExecution's doc comment).
@@ -197,9 +224,33 @@ export class RulesEngine {
    * staying up matters more than any one misconfigured rule, the same
    * reasoning EventBus.publish() applies one level up for a whole
    * subscriber's failure.
+   *
+   * `send_notification` actions are collected into `pendingNotifications`
+   * rather than dispatched inline from inside {@link executeAction} --
+   * deliberately, and NOT sent until after the surrounding `withTenant`
+   * transaction has committed. sendEmail() makes a real outbound HTTP
+   * request; making that request while still holding open the same
+   * transaction that's writing `rule_executions` (and, for a matched
+   * `hold_order`, the order's own status) would tie this transaction's
+   * lifetime -- and the connection it holds from the pool -- to an external
+   * service's latency, for no benefit (email delivery has no bearing on
+   * whether the rest of this transaction should commit). Same
+   * "email is additive, not load-bearing" precedent
+   * packages/scheduler/src/index.ts's recordSyncFailure() already
+   * establishes by calling its own notifyTenantUsers() only after its
+   * UPDATE's transaction returns -- this mirrors that, at the level of one
+   * whole rule-execution transaction rather than one UPDATE. A consequence
+   * worth being explicit about: a `send_notification` action's own
+   * `rule_executions` row always records `applied: true, error: null` once
+   * its message is built (building the message can't itself fail -- see
+   * {@link buildRuleNotification}), regardless of whether the email actually
+   * gets delivered afterward -- sendEmail() itself never throws and logs its
+   * own failures, matching every other place in this codebase email is
+   * fire-and-forget best-effort, not a tracked outcome.
    */
-  private async handleOrderReceived(event: DomainEventEnvelope<OrderReceivedPayload>): Promise<void> {
+  private async handleOrderEvent(event: DomainEventEnvelope<{ orderId: string }>): Promise<void> {
     const { tenantId, payload } = event;
+    const pendingNotifications: RuleNotification[] = [];
 
     await withTenant(this.pool, tenantId, async (client) => {
       const rules = await this.loadEnabledRulesWithClient(client, tenantId, event.name);
@@ -209,7 +260,8 @@ export class RulesEngine {
         let error: string | null = null;
         if (applied) {
           try {
-            await this.executeAction(client, tenantId, payload.orderId, action);
+            const notification = await this.executeAction(client, tenantId, payload.orderId, action, rule, event.name);
+            if (notification) pendingNotifications.push(notification);
           } catch (err) {
             error = err instanceof Error ? err.message : String(err);
           }
@@ -223,23 +275,36 @@ export class RulesEngine {
         );
       }
     });
+
+    for (const notification of pendingNotifications) {
+      await this.notifyTenantUsers(tenantId, notification.subject, notification.text);
+    }
   }
 
-  /** Dispatches one applied action. Two action types are implemented today:
-   *  'route_to_warehouse' (CLAUDE.md §8 Phase 3: "order routing at
-   *  minimum") and 'hold_order' (places a matching order on_hold instead of
-   *  letting it proceed toward allocation -- see {@link placeOrderOnHold}).
-   *  Other action types (notifications, tagging, etc.) are future work, not
-   *  built speculatively; an unrecognized type throws (caught by the caller
-   *  and recorded as this row's error) rather than silently no-op-ing. */
+  /** Dispatches one applied action. Three action types are implemented
+   *  today: 'route_to_warehouse' (CLAUDE.md §8 Phase 3: "order routing at
+   *  minimum"), 'hold_order' (places a matching order on_hold instead of
+   *  letting it proceed toward allocation -- see {@link placeOrderOnHold}),
+   *  and 'send_notification' (emails the tenant's own users -- see
+   *  {@link buildRuleNotification} and {@link handleOrderEvent}'s own doc
+   *  comment on why the actual send happens outside this method/transaction).
+   *  Other action types (tagging, webhooks, etc.) are future work, not built
+   *  speculatively; an unrecognized type throws (caught by the caller and
+   *  recorded as this row's error) rather than silently no-op-ing. */
   private async executeAction(
     client: PoolClient,
     tenantId: string,
     orderId: string,
     action: AutomationRuleAction,
-  ): Promise<void> {
+    rule: AutomationRule,
+    triggerEvent: string,
+  ): Promise<RuleNotification | void> {
     if (action.type === "hold_order") {
       return this.placeOrderOnHold(client, tenantId, orderId);
+    }
+
+    if (action.type === "send_notification") {
+      return RulesEngine.buildRuleNotification(rule, triggerEvent, orderId, action);
     }
 
     if (action.type !== "route_to_warehouse") {
@@ -295,6 +360,16 @@ export class RulesEngine {
    * 'on_hold' -> 'validated' resume path (and the 'validated' -> 'allocated'
    * manual action next to it on the order detail page) already let staff
    * release a hold placed this way.
+   *
+   * Only meaningful for an `order.received`-triggered rule -- a rule that
+   * puts `hold_order` on an `order.backordered` trigger will always fail
+   * this method's own guarded UPDATE (the order is already 'backordered',
+   * not 'received') and record that as this row's `error`, same as naming a
+   * nonexistent warehouse to `route_to_warehouse` does. Deliberately not
+   * specially validated/blocked at rule-creation time -- same "an
+   * unrecognized/inapplicable config fails loud in rule_executions, it
+   * doesn't get silently rejected upfront" philosophy this class already
+   * applies to every other action.
    */
   private async placeOrderOnHold(client: PoolClient, tenantId: string, orderId: string): Promise<void> {
     const steps: ReadonlyArray<readonly [OrderStatus, OrderStatus]> = [
@@ -315,5 +390,76 @@ export class RulesEngine {
         throw new Error(`hold_order: order ${orderId} is not in status '${from}' -- refusing to continue (concurrent update?)`);
       }
     }
+  }
+
+  /**
+   * Builds a `send_notification` action's email content -- pure, no I/O, so
+   * it can't itself fail (see {@link handleOrderEvent}'s doc comment on what
+   * that means for this action's own `rule_executions.error`). Static for
+   * the same "no instance state needed" reason evaluate()/resolveActions()
+   * are.
+   *
+   * `action.value` is optional: a string is used verbatim as the message
+   * body (letting a tenant write "Restock SKU WIDGET-RED before Friday" or
+   * similar instead of a generic line); omitted, `null`, or a
+   * whitespace-only string falls back to a generic default referencing the
+   * rule name/trigger/order so the email is never blank. Anything else
+   * (a number, object, array) is a config mistake, not a valid "no custom
+   * message" sentinel -- `executeAction`'s caller in {@link handleOrderEvent}
+   * catches the thrown error and records it on this row the same way
+   * route_to_warehouse's own value-shape validation does.
+   */
+  private static buildRuleNotification(
+    rule: AutomationRule,
+    triggerEvent: string,
+    orderId: string,
+    action: AutomationRuleAction,
+  ): RuleNotification {
+    if (action.value !== undefined && action.value !== null && typeof action.value !== "string") {
+      throw new Error(`send_notification's value must be a string message or omitted, got ${JSON.stringify(action.value)}`);
+    }
+    const customMessage = typeof action.value === "string" && action.value.trim().length > 0 ? action.value.trim() : null;
+
+    return {
+      subject: `Automation alert: ${rule.name}`,
+      text: [
+        customMessage ?? `Your automation rule "${rule.name}" matched a ${triggerEvent} event for order ${orderId}.`,
+        "",
+        `View this order: /orders/${orderId}`,
+      ].join("\n"),
+    };
+  }
+
+  /**
+   * Emails every one of this tenant's own `users` -- a near-literal fork of
+   * packages/scheduler/src/index.ts's own notifyTenantUsers() (same query,
+   * same "reuse the existing users table as the recipient list, no new
+   * notification-preferences schema" reasoning, same reliance on migration
+   * 0030_users_tenant_scoped_select_policy.sql's tenant-scoped SELECT policy
+   * -- without it this SELECT silently returns zero rows under RLS, see
+   * that migration's own doc comment for the real bug this already caused
+   * once). Not shared/imported from @alltix/scheduler on purpose:
+   * rules-engine has no existing dependency on scheduler (and shouldn't
+   * gain one just for this -- scheduler is the cron/job-runner layer,
+   * rules-engine is a domain-event subscriber, pulling one into the other's
+   * dependency graph for a five-line query is the wrong direction), and the
+   * query itself is small enough that duplicating it here is cheaper than
+   * the abstraction would be -- same "not enough shared shape yet" call
+   * this codebase's own channel connectors make repeatedly (CLAUDE.md
+   * §4.2/§4.5's own "kept as parallel functions" notes).
+   *
+   * A tenant with zero users is a silent no-op via sendEmail()'s own
+   * empty-recipients guard, not an error -- same reasoning as the scheduler
+   * original.
+   */
+  private async notifyTenantUsers(tenantId: string, subject: string, message: string): Promise<void> {
+    const recipients = await withTenant(this.pool, tenantId, (client) =>
+      client.query<{ email: string }>(`SELECT DISTINCT email FROM users WHERE tenant_id = $1`, [tenantId]),
+    );
+    await sendEmail({
+      to: recipients.rows.map((r) => r.email),
+      subject,
+      text: message,
+    });
   }
 }

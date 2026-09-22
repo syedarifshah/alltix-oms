@@ -39,16 +39,16 @@ interface RulesPageProps {
 
 /**
  * View/manage automation_rules (CLAUDE.md §1 Rules/Automation Engine --
- * "build it early, not as a v2 feature"). Only trigger_event
- * 'order.received' is implemented, with two action types --
- * 'route_to_warehouse' and 'hold_order' (see
- * packages/rules-engine/src/index.ts) -- the create form below doesn't
- * hard-restrict those fields (a rule for an unimplemented trigger/action is
- * harmless to store, just inert), but the defaults point at what actually
- * works, and this page says so plainly rather than implying more automation
- * exists than does. Conditions/actions are edited as raw JSON, per this
- * pass's explicit scope call -- a visual condition/action builder is future
- * work.
+ * "build it early, not as a v2 feature"). Two trigger_events are
+ * implemented -- 'order.received' and 'order.backordered' -- with three
+ * action types -- 'route_to_warehouse', 'hold_order', and
+ * 'send_notification' (see packages/rules-engine/src/index.ts) -- the
+ * create form below doesn't hard-restrict those fields (a rule for an
+ * unimplemented trigger/action is harmless to store, just inert), but the
+ * defaults point at what actually works, and this page says so plainly
+ * rather than implying more automation exists than does. Conditions/actions
+ * are edited as raw JSON, per this pass's explicit scope call -- a visual
+ * condition/action builder is future work.
  */
 export default async function RulesPage({ searchParams }: RulesPageProps): Promise<ReactElement> {
   const authContext = await getAuthContext(await headers());
@@ -91,9 +91,13 @@ export default async function RulesPage({ searchParams }: RulesPageProps): Promi
     <main className="page">
       <h1>Rules</h1>
       <p className="subtitle">
-        Order automation on order.received: route_to_warehouse (sets a preferred warehouse) and hold_order (places
-        the order on_hold instead of letting it proceed toward allocation, for manual review). Lower priority number
-        wins when two enabled rules&apos; actions of the same type conflict.
+        Order automation on two triggers — order.received and order.backordered. Actions: route_to_warehouse (sets a
+        preferred warehouse, order.received only), hold_order (places the order on_hold instead of letting it
+        proceed toward allocation, for manual review — order.received only; on order.backordered the order has
+        already left &apos;received&apos;, so this action will fail and show as an error below), and
+        send_notification (emails everyone on your team — a rule with an empty/omitted value sends a generic
+        message naming the rule and order; a non-empty string is sent verbatim instead). Lower priority number wins
+        when two enabled rules&apos; actions of the same type conflict.
       </p>
 
       {error && <div className="alert alert-danger">{decodeURIComponent(error)}</div>}
@@ -170,7 +174,7 @@ export default async function RulesPage({ searchParams }: RulesPageProps): Promi
         </div>
         <div className="row">
           <div className="form-row">
-            <label htmlFor="triggerEvent">Trigger event</label>
+            <label htmlFor="triggerEvent">Trigger event (order.received or order.backordered)</label>
             <input id="triggerEvent" type="text" name="triggerEvent" defaultValue="order.received" required />
           </div>
           <div className="form-row">
@@ -195,8 +199,9 @@ export default async function RulesPage({ searchParams }: RulesPageProps): Promi
         </div>
         <div className="form-row">
           <label htmlFor="actions">
-            Actions (JSON array — &quot;route_to_warehouse&quot; (value = a warehouse location name) or
-            &quot;hold_order&quot; (value ignored) are implemented)
+            Actions (JSON array — &quot;route_to_warehouse&quot; (value = a warehouse location name),
+            &quot;hold_order&quot; (value ignored), or &quot;send_notification&quot; (value = an optional custom
+            message string; omit or leave blank for a generic default) are implemented)
           </label>
           <textarea
             id="actions"

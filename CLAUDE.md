@@ -1730,7 +1730,62 @@ eBay/Temu v1" scope decision.
   SKU, a real but deliberately unaddressed limitation, same scope discipline
   as every other pass in this file). Per-location fulfillment routing beyond
   what the rules engine's `route_to_warehouse` action, this nearest-location
-  ranking, and per-SKU routing already do is otherwise still open. Returns
+  ranking, and per-SKU routing already do is otherwise still open.
+  **Rules engine expansion — built**: a second trigger event
+  (`order.backordered`) and a third action type (`send_notification`),
+  closing the "retention feature" out further rather than leaving it at just
+  routing/holding. `RulesEngine.attach()` (`packages/rules-engine/src/
+  index.ts`) now subscribes both `order.received` and `order.backordered` to
+  the same generic handler (`handleOrderEvent`, renamed from the
+  order.received-only `handleOrderReceived` — every step past reading
+  `event.name`/`payload.orderId` was already fully trigger-agnostic, so one
+  handler covers both instead of a copy-pasted second one).
+  `OrderBackorderedPayload` (`packages/shared/src/events.ts`) is now typed
+  (`{ orderId: string }`, deliberately minimal — a backorder has no
+  channel/SKU context worth pre-resolving the way `order.received`'s own
+  `lineSkus` does). `send_notification` emails every one of the tenant's own
+  `users` (a near-fork of `packages/scheduler/src/index.ts`'s own
+  `notifyTenantUsers()` — not shared/imported from `@alltix/scheduler`,
+  since rules-engine has no existing dependency on the job-runner layer and
+  shouldn't gain one for a five-line query) with either a tenant-supplied
+  custom message (`action.value`, a plain string) or a generic default
+  naming the rule/trigger/order when `value` is omitted, `null`, or
+  whitespace-only; a non-string, non-empty value is a config mistake and
+  throws, recorded as that row's `error` the same way an unrecognized
+  warehouse name already is for `route_to_warehouse`. The actual `sendEmail()`
+  call deliberately happens AFTER the whole rule-execution transaction
+  commits, not from inside `executeAction()` itself — an outbound HTTP call
+  has no business holding open the same DB transaction that's writing
+  `rule_executions` (and, for a matched `hold_order` in the same batch, the
+  order's own status change), same "email is additive, not load-bearing"
+  precedent `recordSyncFailure()`'s own `notifyTenantUsers()` call already
+  set by running after its UPDATE's transaction, not inside it (§4.4/the
+  alerting paragraph above). A consequence worth being explicit about: a
+  `send_notification` action's `rule_executions` row always shows
+  `applied: true, error: null` once its message is built, regardless of
+  whether the email actually gets delivered afterward — building the
+  message can't itself fail, and `sendEmail()` never throws (same
+  fire-and-forget contract as every other email in this codebase).
+  `hold_order` combined with an `order.backordered` trigger is a real,
+  reachable misconfiguration (the order is already 'backordered', not
+  'received', by the time that event fires) — deliberately not blocked at
+  rule-creation time, same "fails loud in `rule_executions`, not rejected
+  upfront" philosophy every other action's bad config already gets;
+  `/rules`' own help text calls this out directly rather than leaving a
+  tenant to discover it the hard way. Depends on migration
+  `0030_users_tenant_scoped_select_policy.sql` (the alerting paragraph
+  above) for `send_notification`'s own `SELECT ... FROM users` to see any
+  rows at all — without it this would have silently emailed nobody, the
+  same real bug that migration fixed for the scheduler's own tenant
+  alerting. Tested in `packages/rules-engine/test/
+  order-backordered-integration.test.ts` (the second trigger event firing
+  independently of `order.received`, both on the same order; the
+  `hold_order`-on-`order.backordered` failure mode) and `packages/rules-engine/
+  test/send-notification-integration.test.ts` (RESEND_API_KEY unset stays a
+  no-op; a non-string value throws; a blank string falls back to the
+  default message) — all against real seeded `tenants`/`users` rows, not
+  mocks, same rigor `sync-failure-tracking.test.ts`'s own
+  `notifyTenantUsers()` test already established. Returns
   handling — **built**, see §2.2/§3. Rate-limit
   hardening, circuit breakers — **built**, see §4.4. Observability dashboards —
   **built**, see §13: Sentry is wired end-to-end across packages/web and every

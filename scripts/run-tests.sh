@@ -46,6 +46,8 @@ SAFE_TESTS=(
   "packages/rules-engine/test/order-received-integration.test.ts"
   "packages/rules-engine/test/hold-order-integration.test.ts"
   "packages/rules-engine/test/sku-routing-integration.test.ts"
+  "packages/rules-engine/test/order-backordered-integration.test.ts"
+  "packages/rules-engine/test/send-notification-integration.test.ts"
   "packages/order-service/test/persist-and-allocate.test.ts"
   "packages/order-service/test/allocation-concurrency.test.ts"
   "packages/order-service/test/multi-warehouse-allocation.test.ts"
