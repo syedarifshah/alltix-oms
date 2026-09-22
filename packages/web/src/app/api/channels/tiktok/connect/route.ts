@@ -1,11 +1,11 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { withTenant, encryptChannelSecret } from "@alltix/db";
 import { TikTokConnector, TIKTOK_API_BASE_URL, buildTikTokAuthorizeUrl } from "@alltix/channel-connectors";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser, withTenantAuth, type TenantRequestContext } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
 import { createOAuthState } from "@/lib/tiktok-oauth-state";
 import { readTikTokOAuthAppConfig } from "@/lib/tiktok-oauth-config";
+import { persistTikTokConnection } from "@/lib/tiktok-connection";
 
 export const dynamic = "force-dynamic";
 
@@ -105,34 +105,16 @@ export async function POST(req: NextRequest): Promise<Response> {
     return redirectWithError(req, "/settings/channels", `tiktok_verify_failed:${errorMessage(err)}`);
   }
 
+  // external_account_id = shopCipher, marketplace = '' -- see
+  // loadTikTokCredentialsFromChannelConnection's own doc comment in
+  // tiktok-connector.ts. Reconnecting with the SAME shopCipher updates the
+  // existing row; a different shopCipher (a second TikTok shop under the
+  // same app) inserts a second row rather than silently overwriting the
+  // first. Shared with the OAuth callback's own single-shop fast path and
+  // the shop-picker's POST target -- see persistTikTokConnection's own doc
+  // comment.
   try {
-    await withTenant(pool, user.tenantId, async (client) => {
-      const encryptedAppSecret = await encryptChannelSecret(client, appSecret);
-      const encryptedAccessToken = await encryptChannelSecret(client, accessToken);
-      const encryptedRefreshToken = await encryptChannelSecret(client, refreshToken);
-
-      // external_account_id = shopCipher, marketplace = '' -- see
-      // loadTikTokCredentialsFromChannelConnection's own doc comment in
-      // tiktok-connector.ts. Reconnecting with the SAME shopCipher updates
-      // the existing row; a different shopCipher (a second TikTok shop
-      // under the same app) inserts a second row rather than silently
-      // overwriting the first.
-      await client.query(
-        `INSERT INTO channel_connections
-           (tenant_id, channel, marketplace, external_account_id, lwa_client_id,
-            encrypted_client_secret, encrypted_access_token, encrypted_refresh_token, status)
-         VALUES ($1, 'tiktok', '', $2, $3, $4, $5, $6, 'active')
-         ON CONFLICT (tenant_id, channel, marketplace, external_account_id)
-         DO UPDATE SET
-           lwa_client_id = EXCLUDED.lwa_client_id,
-           encrypted_client_secret = EXCLUDED.encrypted_client_secret,
-           encrypted_access_token = EXCLUDED.encrypted_access_token,
-           encrypted_refresh_token = EXCLUDED.encrypted_refresh_token,
-           status = 'active',
-           updated_at = now()`,
-        [user.tenantId, shopCipher, appKey, encryptedAppSecret, encryptedAccessToken, encryptedRefreshToken],
-      );
-    });
+    await persistTikTokConnection(pool, user.tenantId, { appKey, appSecret, accessToken, refreshToken, shopCipher });
   } catch (err) {
     return redirectWithError(req, "/settings/channels", `tiktok_save_failed:${errorMessage(err)}`);
   }

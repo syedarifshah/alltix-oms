@@ -11,6 +11,8 @@ import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
 import { verifyOAuthState } from "@/lib/tiktok-oauth-state";
 import { readTikTokOAuthAppConfig } from "@/lib/tiktok-oauth-config";
+import { persistTikTokConnection } from "@/lib/tiktok-connection";
+import { createPendingTikTokConnectionToken } from "@/lib/tiktok-oauth-pending";
 
 export const dynamic = "force-dynamic";
 
@@ -25,17 +27,30 @@ export const dynamic = "force-dynamic";
 // 2026-09-22) -- state sign/verify follows the same pattern already
 // unit-tested for Amazon's/eBay's equivalents.
 //
-// Takes only the FIRST shop returned by getTikTokAuthorizedShops() --
 // TikTok Shop Open Platform's own multi-shop-per-authorization model (see
 // TikTokCredentials' own doc comment in tiktok-connector.ts: "one
 // app_key/access_token pair can cover several shops, each with its own
-// shop_cipher") means a tenant authorizing more than one shop under the
-// same app would silently only get the first one connected here. A real
-// shop-picker step (list every returned shop, let the tenant choose, maybe
-// loop to connect more than one) is real, deliberately deferred follow-up
-// work -- flagged here rather than silently wrong, same discipline this
-// codebase applies to every other known-incomplete piece (CLAUDE.md's own
-// "inventory.changed... not retroactive" entry is the most recent example).
+// shop_cipher") means getTikTokAuthorizedShops() can return more than one
+// shop. This used to silently connect only the first one (flagged as a
+// Known Follow-up in CLAUDE.md); now, whenever there's more than one, this
+// route redirects to /settings/channels/tiktok-shops instead of guessing --
+// a real shop-picker page that lets the tenant choose, via a signed,
+// encrypted-secrets pending-connection token (tiktok-oauth-pending.ts, see
+// its own header comment for why the secrets travel encrypted rather than
+// in the clear). A single shop is still connected directly, no extra hop,
+// same as before.
+//
+// Deliberately still "pick exactly one," not "connect every shop this
+// authorization covers" -- loadTikTokCredentialsFromChannelConnection
+// (tiktok-connector.ts) reads only the most recently created ACTIVE
+// 'tiktok' row per tenant (`ORDER BY created_at DESC LIMIT 1`), so every
+// real caller (the scheduler's sync job, WarehouseService.confirmShipment())
+// only ever uses ONE connection per tenant today regardless of how many
+// rows exist. Connecting several shops at once here would look complete
+// but silently only ever use whichever was created last -- true concurrent
+// multi-shop support needs that loading layer to change first, real,
+// separate, deliberately out of scope for this pass (see CLAUDE.md's Known
+// Follow-ups).
 
 function redirectWithError(req: NextRequest, error: string): Response {
   const url = new URL("/settings/channels", req.url);
@@ -96,37 +111,42 @@ export async function GET(req: NextRequest): Promise<Response> {
     console.error("TikTok authorized-shops lookup failed:", err instanceof Error ? err.message : err);
     return redirectWithError(req, "tiktok_authorized_shops_lookup_failed");
   }
-  const shopCipher = shops[0]?.cipher;
-  if (!shopCipher) {
+  if (shops.length === 0) {
     return redirectWithError(req, "tiktok_no_authorized_shops");
   }
 
-  // Same column mapping the POST manual-paste handler in ../connect/route.ts
-  // writes to -- see loadTikTokCredentialsFromChannelConnection's own doc
-  // comment in tiktok-connector.ts for the full reasoning.
-  await withTenant(pool, tenantIdFromState, async (client) => {
-    const encryptedAppSecret = await encryptChannelSecret(client, appSecret);
-    const encryptedAccessToken = await encryptChannelSecret(client, accessToken);
-    const encryptedRefreshToken = await encryptChannelSecret(client, refreshToken);
+  // Exactly one shop: connect it directly, no extra hop -- this is still
+  // the common case (a self-testing tenant's own single shop) and stays as
+  // fast as it was before the picker existed.
+  if (shops.length === 1) {
+    await persistTikTokConnection(pool, tenantIdFromState, { appKey, appSecret, accessToken, refreshToken, shopCipher: shops[0]!.cipher });
+    const url = new URL("/settings/channels", req.url);
+    url.searchParams.set("connected", "tiktok");
+    return NextResponse.redirect(url);
+  }
 
-    await client.query(
-      `INSERT INTO channel_connections
-         (tenant_id, channel, marketplace, external_account_id, lwa_client_id,
-          encrypted_client_secret, encrypted_access_token, encrypted_refresh_token, status)
-       VALUES ($1, 'tiktok', '', $2, $3, $4, $5, $6, 'active')
-       ON CONFLICT (tenant_id, channel, marketplace, external_account_id)
-       DO UPDATE SET
-         lwa_client_id = EXCLUDED.lwa_client_id,
-         encrypted_client_secret = EXCLUDED.encrypted_client_secret,
-         encrypted_access_token = EXCLUDED.encrypted_access_token,
-         encrypted_refresh_token = EXCLUDED.encrypted_refresh_token,
-         status = 'active',
-         updated_at = now()`,
-      [tenantIdFromState, shopCipher, appKey, encryptedAppSecret, encryptedAccessToken, encryptedRefreshToken],
-    );
+  // More than one shop: nothing gets persisted yet -- hand off to the
+  // picker page via a signed, encrypted-secrets pending token instead of
+  // guessing which one the tenant wants (see this file's own header
+  // comment, and tiktok-oauth-pending.ts for why the secrets travel
+  // encrypted rather than in the clear).
+  const pendingToken = await withTenant(pool, tenantIdFromState, async (client) => {
+    const [encryptedAppSecret, encryptedAccessToken, encryptedRefreshToken] = await Promise.all([
+      encryptChannelSecret(client, appSecret),
+      encryptChannelSecret(client, accessToken),
+      encryptChannelSecret(client, refreshToken),
+    ]);
+    return createPendingTikTokConnectionToken({
+      tenantId: tenantIdFromState,
+      appKey,
+      encryptedAppSecret: encryptedAppSecret.toString("base64"),
+      encryptedAccessToken: encryptedAccessToken.toString("base64"),
+      encryptedRefreshToken: encryptedRefreshToken.toString("base64"),
+      shops: shops.map((shop) => ({ cipher: shop.cipher, name: typeof shop.name === "string" ? shop.name : undefined, region: typeof shop.region === "string" ? shop.region : undefined })),
+    });
   });
 
-  const url = new URL("/settings/channels", req.url);
-  url.searchParams.set("connected", "tiktok");
-  return NextResponse.redirect(url);
+  const pickerUrl = new URL("/settings/channels/tiktok-shops", req.url);
+  pickerUrl.searchParams.set("token", pendingToken);
+  return NextResponse.redirect(pickerUrl);
 }

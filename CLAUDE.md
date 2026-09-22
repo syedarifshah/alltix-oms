@@ -1654,23 +1654,69 @@ eBay/Temu v1" scope decision.
   the whole point of calling it, `getTikTokAuthorizedShops`) — `shop_cipher` is NOT part
   of the token-exchange response itself, confirmed by the Ruby gem treating shop lookup
   as a separate step.
-- **Multi-shop gap, documented not hidden**: one `app_key`/`access_token` pair can cover
-  several TikTok shops (§4.8's own `shop_cipher` note). The callback route
-  (`/api/channels/tiktok/callback`) takes only the FIRST shop `getTikTokAuthorizedShops`
-  returns — a tenant authorizing more than one shop under the same app only gets the
-  first one connected. A real shop-picker UI is deliberately deferred follow-up work, not
-  built this pass.
+- **Multi-shop picker — built**, closing the gap this section used to flag as deferred:
+  one `app_key`/`access_token` pair can cover several TikTok shops (§4.8's own
+  `shop_cipher` note). The callback route (`/api/channels/tiktok/callback`) used to
+  silently connect only the FIRST shop `getTikTokAuthorizedShops` returned; now, whenever
+  it returns more than one, nothing is persisted yet — the callback instead redirects to
+  a new page, `/settings/channels/tiktok-shops`
+  (`packages/web/src/app/(app)/settings/channels/tiktok-shops/page.tsx`), carrying a
+  signed **pending-connection token** (`tiktok-oauth-pending.ts`,
+  `createPendingTikTokConnectionToken`/`verifyPendingTikTokConnectionToken`, its own
+  `TIKTOK_OAUTH_PENDING_SECRET` — deliberately separate from `TIKTOK_OAUTH_STATE_SECRET`,
+  since it's a second, later hop, not the first redirect's one-time CSRF token). That
+  page renders one radio button per shop and POSTs the tenant's choice, plus the token
+  itself as a hidden field, to a new route, `/api/channels/tiktok/select-shop`, which
+  re-verifies the token, re-checks the signed-in tenant matches it (same
+  defense-in-depth every OAuth callback in this codebase already applies on top of its
+  own state/pending token), validates the chosen shop cipher against the token's OWN
+  embedded shop list (never an arbitrary client-supplied string), and persists exactly
+  like before. **Exactly one shop at a time, still** — see "no true multi-connect" below
+  for why "connect every shop this authorization covers" was deliberately not built
+  either, even though it was the second option this section used to name.
+  - **The pending token's app_secret/access_token/refresh_token travel ENCRYPTED, not in
+    the clear** — a real security decision worth being explicit about, not an
+    implementation detail. Unlike the first-hop `state` token (which only ever carries a
+    bare `tenantId`), this one carries a completed OAuth exchange's actual secrets across
+    a redirect + a hidden form field the tenant's own browser holds for up to 10 minutes
+    — a real exposure surface (browser history, referrer headers, access logs) this
+    codebase doesn't accept for any other secret. `tiktok-oauth-pending.ts`'s only real
+    caller (the callback route) encrypts all three via `@alltix/db`'s
+    `encryptChannelSecret` — the SAME `pgcrypto`/`CHANNEL_CREDENTIALS_ENCRYPTION_KEY`
+    channel every other channel's secrets are already encrypted under at rest — before
+    ever building the token, and `/api/channels/tiktok/select-shop` decrypts them back
+    (`decryptChannelSecret`) only after the token and the chosen shop both verify. No new
+    key, no new table, no new infra — this reuses the encryption channel that already
+    exists.
+  - **`persistTikTokConnection`** (`packages/web/src/lib/tiktok-connection.ts`) is a new
+    shared helper extracted from what used to be three near-identical inline upserts —
+    the manual-paste POST handler, the OAuth callback's single-shop fast path, and this
+    new select-shop route all call the same one now, so the column mapping (§4.8's own
+    `lwa_client_id`/`encrypted_client_secret`/etc. reasoning) can't drift between them.
+- **No true multi-connect, and why**: `loadTikTokCredentialsFromChannelConnection`
+  (`tiktok-connector.ts`) reads only the most recently created ACTIVE `'tiktok'` row per
+  tenant (`ORDER BY created_at DESC LIMIT 1`) — every real caller (the scheduler's sync
+  job, `WarehouseService.confirmShipment()`) only ever uses ONE connection per tenant
+  today, regardless of how many `channel_connections` rows exist. Building a picker that
+  connects several shops AT ONCE would look complete but silently only ever get used for
+  whichever was created last — so the picker above deliberately only ever connects the
+  ONE shop a tenant picks per run (rerunning the OAuth flow connects a different one,
+  overwriting nothing since each shop gets its own row by `shop_cipher`). Real concurrent
+  multi-shop support needs that loading layer itself to change first (e.g. letting a
+  tenant designate one row "primary," or teaching the scheduler to iterate every active
+  row per channel) — real, separate, deliberately out of scope for this pass.
 - **Wired into the app**: `/settings/channels`' TikTok Shop card now has a "Connect via
   TikTok OAuth" link (`GET /api/channels/tiktok/connect`, `withTenantAuth`-wrapped, same
   shape as eBay's own "Connect eBay" link) alongside the existing manual-paste form. The
   callback (`/api/channels/tiktok/callback`) verifies a signed, tenant-bound `state`
   token (`tiktok-oauth-state.ts`, a literal fork of `ebay-oauth-state.ts`, its own
-  `TIKTOK_OAUTH_STATE_SECRET`), exchanges the code, looks up the shop, and writes to the
-  exact same `channel_connections` columns the manual POST handler already uses — either
-  path can reconnect/overwrite what the other stored. `readTikTokOAuthAppConfig()`
-  reuses `TIKTOK_APP_KEY`/`TIKTOK_APP_SECRET` directly (no separate
-  `TIKTOK_OAUTH_CLIENT_ID`-style pair the way eBay has one — TikTok Shop has only one
-  app-level credential set, not two distinct keysets).
+  `TIKTOK_OAUTH_STATE_SECRET`), exchanges the code, looks up the shop(s), and either
+  persists directly (one shop) or hands off to the picker above (more than one) — either
+  path writes to the exact same `channel_connections` columns the manual POST handler
+  already uses, so any of the three can reconnect/overwrite what another stored.
+  `readTikTokOAuthAppConfig()` reuses `TIKTOK_APP_KEY`/`TIKTOK_APP_SECRET` directly (no
+  separate `TIKTOK_OAUTH_CLIENT_ID`-style pair the way eBay has one — TikTok Shop has
+  only one app-level credential set, not two distinct keysets).
 - **UNVERIFIED IN PRACTICE**, same status §4.8's own connector carries, for the same
   underlying reason (no TikTok application registered anywhere in this codebase) — with
   one open question §4.8 doesn't have: unlike eBay's callback (whose own doc comment
@@ -1679,9 +1725,12 @@ eBay/Temu v1" scope decision.
   TikTok's OAuth hosts has never been tested either way. `buildTikTokAuthorizeUrl`/
   `parseTikTokOAuthCallback` (pure) and `exchangeTikTokAuthorizationCode`/
   `getTikTokAuthorizedShops` (fetch-intercepted, no live network) are unit-tested; the
-  state sign/verify round-trip is unit-tested (`tiktok-oauth-state.test.ts`, a literal
-  mirror of `amazon-oauth-state.test.ts`). Nothing past those boundaries has been
-  exercised against live TikTok infrastructure.
+  state and pending-token sign/verify round-trips are both unit-tested
+  (`tiktok-oauth-state.test.ts`, `tiktok-oauth-pending.test.ts` — the latter's own extra
+  cases covering its richer payload and its "secrets are opaque strings, never decrypted
+  by this module" boundary). Nothing past those boundaries — the picker page itself, the
+  select-shop route, a real multi-shop TikTok authorization — has been exercised against
+  live TikTok infrastructure.
 
 ## 5. Technology Stack
 
@@ -2127,11 +2176,14 @@ from there.
   `taskkill /IM node.exe` or `pkill node` — it can kill unrelated Node processes on the
   same machine (other dev servers, editor extensions, etc.), not just the one the test
   started.
-- **TikTok Shop OAuth: no multi-shop picker** — §4.8.1's `/api/channels/tiktok/callback`
-  connects only the FIRST shop `getTikTokAuthorizedShops` returns. A tenant whose TikTok
-  Shop authorization covers more than one shop under the same app needs a real
-  shop-picker step (list every returned shop, let them choose, maybe loop to connect
-  more than one) — not built yet, deliberately deferred.
+- **TikTok Shop OAuth: no true multi-shop CONNECT** — §4.8.1's multi-shop picker (built)
+  lets a tenant choose which ONE shop to connect when an authorization covers several,
+  but `channel_connections` rows beyond the most-recently-created active one are still
+  invisible to every real caller (`loadTikTokCredentialsFromChannelConnection`'s own
+  `ORDER BY created_at DESC LIMIT 1`). Genuine concurrent multi-shop support — syncing
+  two or more TikTok shops for the same tenant at once — needs that loading layer (and
+  probably the scheduler) to change first; not built, deliberately out of scope for the
+  picker pass.
 
 ## 13. Observability (Sentry — §5/§8 Phase 4's "Observability dashboards")
 

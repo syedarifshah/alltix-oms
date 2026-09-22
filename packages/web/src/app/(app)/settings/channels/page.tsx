@@ -600,8 +600,8 @@ export default async function ChannelsSettingsPage({
           <div className="stack">
             <a href="/api/channels/tiktok/connect">Connect via TikTok OAuth</a>
             <div className="muted">
-              Only takes the first shop back if an authorization covers more than one (see the callback route&apos;s
-              own doc comment) -- or paste credentials manually instead:
+              If the authorization covers more than one shop, you&apos;ll be asked to pick which one to connect --
+              or paste credentials manually instead:
             </div>
             <TikTokConnectForm buttonLabel="Connect TikTok Shop (manual)" />
           </div>
