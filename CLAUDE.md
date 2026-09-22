@@ -2780,11 +2780,38 @@ policies for the same command with `OR`, so this is purely additive; smoke-teste
 directly against a real Postgres alongside the append-only and cross-tenant-isolation
 checks above.
 
-**`/settings/activity`**: read-only, newest-first, capped at 200 rows, no
-filter/search/pagination UI yet — same "start simple" call every other first-pass list
-page in this app makes. A generic `describeAction()` formatter (dot/underscore →
-spaced, sentence-cased) renders any action string sensibly with no per-action lookup
-table to maintain as more routes get instrumented.
+**`/settings/activity`**: read-only, newest-first, 200 rows per page. A generic
+`describeAction()` formatter (dot/underscore → spaced, sentence-cased) renders any
+action string sensibly with no per-action lookup table to maintain as more routes get
+instrumented.
+
+**Filter + pagination — built**, closing the "no filter/search/pagination UI yet" gap
+this section used to flag, worth doing in the same pass that just multiplied this
+table's real-world volume (the order lifecycle, picklists, and inventory transfer, per
+the "Coverage" paragraph above, all landed in the audit log at once — 200 rows caps out
+fast on an active tenant now, where it barely would have before). Entity-type tabs
+(`?entityType=`) are derived from `SELECT DISTINCT entity_type FROM audit_log WHERE
+tenant_id = $1`, not a hardcoded list — same reasoning `describeAction()`'s own doc
+comment already gives for `action`: `entity_type` is free text, and a hardcoded list
+would need editing every time a newly-instrumented route introduces one (this same pass
+added `order`, `picklist`, `picklist_line`, and reused `product` for
+`inventory.transferred`, all in one go). "Show older" pages backward via a `before`
+keyset cursor on `created_at` (`created_at < $before`), not `OFFSET` — this table only
+grows and never gets rows deleted (append-only, §17's own schema paragraph), so a
+position-based `OFFSET` would get slower and more prone to skipping/duplicating a row
+under concurrent writes the further back a tenant pages; a keyset cursor doesn't have
+either problem. One real nuance worth recording, found writing this pass's own smoke
+test: Postgres's `now()` is frozen at *transaction* start, not evaluated per statement —
+so multiple `audit_log` rows written inside the SAME transaction (e.g.
+`generatePicklist()` inserting more than one picklist, one per distinct location, each
+recording its own `picklist.created` row) land the exact same `created_at`, and their
+relative order within that tie is unspecified. Not a correctness bug (every row still
+appears, exactly once, on the right page either side of the tie) — just means "newest
+first" isn't a guaranteed *total* order down to sub-transaction granularity, which this
+page's UI was never promising anyway. Verified via `tsc -b`, `next build`, and a manual
+smoke test against real Postgres proving the entity-type filter, the unfiltered
+newest-first ordering, and the `before` cursor pagination all return exactly the
+expected rows.
 
 **Tests**: no dedicated test file — `recordAuditEvent` is a thin, direct SQL wrapper
 with no pure decision logic to extract the way `reorder-threshold.ts`/`rate-limit.ts`
