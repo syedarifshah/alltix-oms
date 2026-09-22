@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
@@ -57,11 +57,21 @@ export async function POST(req: NextRequest): Promise<Response> {
       if ((open.rowCount ?? 0) > 0) {
         throw new Error("already_clocked_in");
       }
-      await client.query(
+      const inserted = await client.query<{ id: string }>(
         `INSERT INTO time_entries (tenant_id, employee_id, location_id, clock_in, entry_source)
-         VALUES ($1, $2, $3, now(), 'clock')`,
+         VALUES ($1, $2, $3, now(), 'clock') RETURNING id`,
         [user.tenantId, employeeId, locationId],
       );
+      // Same transaction as the INSERT above -- see recordAuditEvent's own
+      // doc comment for why that matters.
+      await recordAuditEvent(client, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        action: "time_entry.clocked_in",
+        entityType: "time_entry",
+        entityId: inserted.rows[0]!.id,
+        details: { employeeId, locationId },
+      });
     });
   } catch (err) {
     if (errorMessage(err) === "already_clocked_in") {

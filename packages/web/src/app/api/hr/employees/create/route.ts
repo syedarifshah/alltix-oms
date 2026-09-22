@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
@@ -46,12 +46,23 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   try {
-    await withTenant(pool, user.tenantId, (client) =>
-      client.query(
-        `INSERT INTO employees (tenant_id, name, role, location_id, hourly_rate) VALUES ($1, $2, $3, $4, $5)`,
+    await withTenant(pool, user.tenantId, async (client) => {
+      const result = await client.query<{ id: string }>(
+        `INSERT INTO employees (tenant_id, name, role, location_id, hourly_rate) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
         [user.tenantId, name, role, locationId, hourlyRate],
-      ),
-    );
+      );
+      // Same transaction as the INSERT above -- see recordAuditEvent's own
+      // doc comment for why that matters (a rolled-back create never leaves
+      // a committed audit row behind).
+      await recordAuditEvent(client, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        action: "employee.created",
+        entityType: "employee",
+        entityId: result.rows[0]!.id,
+        details: { name, role, locationId, hourlyRate },
+      });
+    });
   } catch (err) {
     return redirectWithError(req, "/hr", `employee_create_failed:${errorMessage(err)}`);
   }

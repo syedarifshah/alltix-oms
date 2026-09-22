@@ -2767,6 +2767,44 @@ route" — is closed:
     which are all status transitions or updates to something that already existed) would
     be a real, separate scope increase, not a small addition to this pass.
 
+**Coverage — HR module (employees, time entries)**: the last gap this section's own
+"Coverage" paragraph left open. Payroll data — hourly rates, hours worked — is exactly
+the kind of high-stakes change an audit trail exists for, and §16's rate-limit coverage
+already treated these 5 routes as sensitive (each has its own `checkRateLimit` bucket)
+without ever wiring up an audit trail to match. Unlike `OrderService`/`WarehouseService`/
+`InventoryService`, these are plain `requireCurrentUser`-based Next.js routes with no
+service-class layer underneath (`packages/web/src/app/api/hr/**`), so there was no
+chokepoint to instrument once — each route got its own direct `recordAuditEvent` call,
+same shape as `rules/route.ts`/`inventory/reorder-threshold/route.ts`'s existing
+call sites:
+  - `hr/employees/create` → `employee.created` (`entityType: "employee"`, `details:
+    {name, role, locationId, hourlyRate}`). The INSERT gained a `RETURNING id` it didn't
+    need before, to get an `entity_id`.
+  - `hr/employees/[id]/update` → `employee.updated`, same `details` shape as `create`
+    plus `status`. Recorded only when the guarded `UPDATE ... WHERE id = $x AND tenant_id
+    = $y` actually matched a row (`result.rowCount` checked inside the same `withTenant`
+    callback, before the route's own not-found branch runs) — same "no audit row for a
+    mutation that didn't happen" discipline `rules/[id]/toggle`'s existing `enabled`/
+    `disabled` split already established, now smoke-tested directly: a bogus id
+    produces zero `audit_log` rows, not a row with a misleading `entity_id`.
+  - `hr/time-entries/clock-in` → `time_entry.clocked_in` (`entityType: "time_entry"`,
+    `details: {employeeId, locationId}`). Recorded inside the same `withTenant` callback
+    as the already-clocked-in guard and the INSERT, which itself gained `RETURNING id`.
+  - `hr/time-entries/[id]/clock-out` → `time_entry.clocked_out`, no `details` (nothing
+    beyond the entity itself to record — same "omit `details` when there's nothing to
+    say" precedent `rules/[id]/toggle` sets). Same "only when a row actually matched"
+    guard as `employees/[id]/update` — clocking out an already-closed shift (a
+    double-submitted click, the route's own doc comment already calls this out) leaves
+    no audit trace, verified directly: a second clock-out attempt on the same entry
+    stays at exactly one `time_entry.clocked_out` row, not two.
+  - `hr/time-entries/manual` → `time_entry.manual_entry_added` (`entityType:
+    "time_entry"`, `details: {employeeId, locationId, hours, notes}`). The INSERT gained
+    `RETURNING id`.
+  - `user.id` is the actor on all 5 — every one of these routes already requires a
+    signed-in user via `requireCurrentUser`, so unlike the Shopify-webhook exception in
+    the "Coverage" paragraph above, there is no unattributed-actor case here to default
+    to `null` for.
+
 **New RLS policy on `users`, invited by that table's own migration comment**: migration
 0010's own doc comment on `self_lookup_users` already named this exact need — "a future
 'list my org's teammates' feature needs an additional policy branch scoped by
@@ -2824,7 +2862,11 @@ append-only `UPDATE`/`DELETE` rejection (the original pass, still valid) — plu
 this pass's service-layer extension: an order cancellation recording `order.transitioned`
 with a real actor via `OrderService.transition()`'s new option, a picklist creation
 recording `picklist.created`, and an inventory transfer recording
-`inventory.transferred` — all against real seeded rows, not mocks, all passed.
+`inventory.transferred` — all against real seeded rows, not mocks, all passed; and for
+the HR coverage pass: all 5 routes' audit rows recorded with the right `action`/
+`entity_id`/`details`, plus the two "no row matched" cases (a bogus employee update, a
+second clock-out on an already-closed entry) each leaving zero `audit_log` rows — 14
+assertions, all passed.
 
 **A real test-cleanup gap found and fixed while verifying this pass, not a production
 bug**: every existing `OrderService`/`WarehouseService`/`InventoryService` test file

@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import type { EmployeeStatus } from "@alltix/shared";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
@@ -57,14 +57,28 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   }
 
   try {
-    const result = await withTenant(pool, user.tenantId, (client) =>
-      client.query(
+    const rowCount = await withTenant(pool, user.tenantId, async (client) => {
+      const result = await client.query(
         `UPDATE employees SET role = $1, location_id = $2, hourly_rate = $3, status = $4, updated_at = now()
           WHERE id = $5 AND tenant_id = $6`,
         [role, locationId, hourlyRate, status, id, user.tenantId],
-      ),
-    );
-    if (result.rowCount === 0) {
+      );
+      if (result.rowCount) {
+        // Same transaction as the UPDATE above -- see recordAuditEvent's own
+        // doc comment for why that matters. Only recorded when a row was
+        // actually matched, so a not-found update leaves no audit trace.
+        await recordAuditEvent(client, {
+          tenantId: user.tenantId,
+          userId: user.id,
+          action: "employee.updated",
+          entityType: "employee",
+          entityId: id,
+          details: { role, locationId, hourlyRate, status },
+        });
+      }
+      return result.rowCount;
+    });
+    if (rowCount === 0) {
       return redirectWithError(req, "/hr", "employee_not_found");
     }
   } catch (err) {

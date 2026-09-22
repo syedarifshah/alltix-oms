@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
@@ -29,14 +29,28 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const { id } = await ctx.params;
 
   try {
-    const result = await withTenant(pool, user.tenantId, (client) =>
-      client.query(
+    const rowCount = await withTenant(pool, user.tenantId, async (client) => {
+      const result = await client.query(
         `UPDATE time_entries SET clock_out = now(), updated_at = now()
           WHERE id = $1 AND tenant_id = $2 AND clock_out IS NULL`,
         [id, user.tenantId],
-      ),
-    );
-    if (result.rowCount === 0) {
+      );
+      if (result.rowCount) {
+        // Same transaction as the UPDATE above -- see recordAuditEvent's
+        // own doc comment for why that matters. Only recorded when a row
+        // was actually matched, so a not-open clock-out leaves no audit
+        // trace.
+        await recordAuditEvent(client, {
+          tenantId: user.tenantId,
+          userId: user.id,
+          action: "time_entry.clocked_out",
+          entityType: "time_entry",
+          entityId: id,
+        });
+      }
+      return result.rowCount;
+    });
+    if (rowCount === 0) {
       return redirectWithError(req, "/hr", "time_entry_not_open");
     }
   } catch (err) {

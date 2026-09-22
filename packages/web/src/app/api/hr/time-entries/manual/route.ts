@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
@@ -62,13 +62,23 @@ export async function POST(req: NextRequest): Promise<Response> {
   const clockOut = new Date(clockIn.getTime() + hours * 60 * 60 * 1000);
 
   try {
-    await withTenant(pool, user.tenantId, (client) =>
-      client.query(
+    await withTenant(pool, user.tenantId, async (client) => {
+      const inserted = await client.query<{ id: string }>(
         `INSERT INTO time_entries (tenant_id, employee_id, location_id, clock_in, clock_out, entry_source, notes)
-         VALUES ($1, $2, $3, $4, $5, 'manual', $6)`,
+         VALUES ($1, $2, $3, $4, $5, 'manual', $6) RETURNING id`,
         [user.tenantId, employeeId, locationId, clockIn.toISOString(), clockOut.toISOString(), notes],
-      ),
-    );
+      );
+      // Same transaction as the INSERT above -- see recordAuditEvent's own
+      // doc comment for why that matters.
+      await recordAuditEvent(client, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        action: "time_entry.manual_entry_added",
+        entityType: "time_entry",
+        entityId: inserted.rows[0]!.id,
+        details: { employeeId, locationId, hours, notes },
+      });
+    });
   } catch (err) {
     return redirectWithError(req, "/hr", `time_entry_manual_add_failed:${errorMessage(err)}`);
   }
