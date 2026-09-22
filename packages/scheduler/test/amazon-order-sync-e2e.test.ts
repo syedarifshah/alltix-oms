@@ -20,6 +20,7 @@
 
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config as loadEnv } from "dotenv";
@@ -55,7 +56,27 @@ before(async () => {
   appPool = createAppPool({ connectionString: appConnectionString });
   adminPool = createAppPool({ connectionString: adminConnectionString });
 
-  const seeded = await seedTestChannelConnection(appPool);
+  // A real `tenants` row, seeded first via a fresh tenantId and the admin
+  // connection (app_user has no INSERT grant on tenants -- migration 0010's
+  // own comment) -- needed now that syncAmazonOrders()'s discovery query
+  // joins `tenants` and requires 'amazon' = ANY(enabled_channels), part of
+  // closing CLAUDE.md §12's "channel feature flags don't gate ongoing sync"
+  // gap. seedTestChannelConnection() itself stays unchanged (its own
+  // default-tenantId path is also used by scripts/amazon-pull-orders-
+  // smoke-test.ts, which never goes through that discovery query at all --
+  // see that script's own doc comment) -- its optional tenantId parameter
+  // already exists for exactly this "attach to a tenant that already
+  // exists" case.
+  const testTenantId = randomUUID();
+  const seedAdmin = new Client({ connectionString: process.env.DATABASE_URL });
+  await seedAdmin.connect();
+  await seedAdmin.query(`INSERT INTO tenants (id, name) VALUES ($1, $2)`, [
+    testTenantId,
+    `amazon-sync-e2e-test-${testTenantId.slice(0, 8)}`,
+  ]);
+  await seedAdmin.end();
+
+  const seeded = await seedTestChannelConnection(appPool, testTenantId);
   tenantId = seeded.tenantId;
 
   await withTenant(appPool, tenantId, async (client) => {
@@ -115,6 +136,7 @@ after(async () => {
   await admin.query("DELETE FROM inventory_events WHERE tenant_id = $1", [tenantId]);
   await admin.query("DELETE FROM orders WHERE tenant_id = $1", [tenantId]); // cascades order_lines
   await admin.query("DELETE FROM inventory_levels WHERE tenant_id = $1", [tenantId]);
+  await admin.query("DELETE FROM tenants WHERE id = $1", [tenantId]);
   await admin.end();
 
   await withTenant(appPool, tenantId, (client) => client.query("DELETE FROM channel_listings WHERE tenant_id = $1", [tenantId]));

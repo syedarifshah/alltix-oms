@@ -363,6 +363,15 @@ export interface SyncAmazonOrdersParams {
  * -- every real order.received event now has two independent subscribers,
  * neither aware of the other, exactly the decoupling CLAUDE.md §1's Event
  * Bus section describes.
+ *
+ * The discovery query below joins `tenants` and requires `'amazon' = ANY
+ * (t.enabled_channels)` -- closing the gap CLAUDE.md §12 flagged: §15's
+ * channel feature flags used to gate only *connecting* a new channel,
+ * leaving an already-connected channel's sync running even after a tenant
+ * turned its flag off. Every other channel's own discovery query below
+ * (Shopify, Walmart, eBay, Temu, TikTok, plus the Shopify catalog sync) got
+ * the identical one-line join for the same reason -- see CLAUDE.md's
+ * "Channel Feature Flags" section for the updated scope note.
  */
 export async function syncAmazonOrders(params: SyncAmazonOrdersParams): Promise<TenantSyncResult[]> {
   const { appPool, adminPool, eventBus } = params;
@@ -374,9 +383,11 @@ export async function syncAmazonOrders(params: SyncAmazonOrdersParams): Promise<
   usageReporter.attach(eventBus);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
-    `SELECT DISTINCT tenant_id FROM channel_connections
-      WHERE channel = 'amazon' AND status = 'active'
-        AND (rate_limited_until IS NULL OR rate_limited_until <= now())`,
+    `SELECT DISTINCT cc.tenant_id FROM channel_connections cc
+      JOIN tenants t ON t.id = cc.tenant_id
+      WHERE cc.channel = 'amazon' AND cc.status = 'active'
+        AND (cc.rate_limited_until IS NULL OR cc.rate_limited_until <= now())
+        AND 'amazon' = ANY(t.enabled_channels)`,
   );
 
   const results: TenantSyncResult[] = [];
@@ -486,9 +497,11 @@ export async function syncShopifyOrders(params: SyncAmazonOrdersParams): Promise
   usageReporter.attach(eventBus);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
-    `SELECT DISTINCT tenant_id FROM channel_connections
-      WHERE channel = 'shopify' AND status = 'active'
-        AND (rate_limited_until IS NULL OR rate_limited_until <= now())`,
+    `SELECT DISTINCT cc.tenant_id FROM channel_connections cc
+      JOIN tenants t ON t.id = cc.tenant_id
+      WHERE cc.channel = 'shopify' AND cc.status = 'active'
+        AND (cc.rate_limited_until IS NULL OR cc.rate_limited_until <= now())
+        AND 'shopify' = ANY(t.enabled_channels)`,
   );
 
   const results: TenantSyncResult[] = [];
@@ -584,9 +597,11 @@ export async function syncWalmartOrders(params: SyncAmazonOrdersParams): Promise
   usageReporter.attach(eventBus);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
-    `SELECT DISTINCT tenant_id FROM channel_connections
-      WHERE channel = 'walmart' AND status = 'active'
-        AND (rate_limited_until IS NULL OR rate_limited_until <= now())`,
+    `SELECT DISTINCT cc.tenant_id FROM channel_connections cc
+      JOIN tenants t ON t.id = cc.tenant_id
+      WHERE cc.channel = 'walmart' AND cc.status = 'active'
+        AND (cc.rate_limited_until IS NULL OR cc.rate_limited_until <= now())
+        AND 'walmart' = ANY(t.enabled_channels)`,
   );
 
   const results: TenantSyncResult[] = [];
@@ -684,9 +699,11 @@ export async function syncEbayOrders(params: SyncAmazonOrdersParams): Promise<Te
   usageReporter.attach(eventBus);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
-    `SELECT DISTINCT tenant_id FROM channel_connections
-      WHERE channel = 'ebay' AND status = 'active'
-        AND (rate_limited_until IS NULL OR rate_limited_until <= now())`,
+    `SELECT DISTINCT cc.tenant_id FROM channel_connections cc
+      JOIN tenants t ON t.id = cc.tenant_id
+      WHERE cc.channel = 'ebay' AND cc.status = 'active'
+        AND (cc.rate_limited_until IS NULL OR cc.rate_limited_until <= now())
+        AND 'ebay' = ANY(t.enabled_channels)`,
   );
 
   const results: TenantSyncResult[] = [];
@@ -784,9 +801,11 @@ export async function syncTemuOrders(params: SyncAmazonOrdersParams): Promise<Te
   usageReporter.attach(eventBus);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
-    `SELECT DISTINCT tenant_id FROM channel_connections
-      WHERE channel = 'temu' AND status = 'active'
-        AND (rate_limited_until IS NULL OR rate_limited_until <= now())`,
+    `SELECT DISTINCT cc.tenant_id FROM channel_connections cc
+      JOIN tenants t ON t.id = cc.tenant_id
+      WHERE cc.channel = 'temu' AND cc.status = 'active'
+        AND (cc.rate_limited_until IS NULL OR cc.rate_limited_until <= now())
+        AND 'temu' = ANY(t.enabled_channels)`,
   );
 
   const results: TenantSyncResult[] = [];
@@ -883,9 +902,11 @@ export async function syncTikTokOrders(params: SyncAmazonOrdersParams): Promise<
   usageReporter.attach(eventBus);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
-    `SELECT DISTINCT tenant_id FROM channel_connections
-      WHERE channel = 'tiktok' AND status = 'active'
-        AND (rate_limited_until IS NULL OR rate_limited_until <= now())`,
+    `SELECT DISTINCT cc.tenant_id FROM channel_connections cc
+      JOIN tenants t ON t.id = cc.tenant_id
+      WHERE cc.channel = 'tiktok' AND cc.status = 'active'
+        AND (cc.rate_limited_until IS NULL OR cc.rate_limited_until <= now())
+        AND 'tiktok' = ANY(t.enabled_channels)`,
   );
 
   const results: TenantSyncResult[] = [];
@@ -996,9 +1017,11 @@ export async function syncShopifyCatalog(params: SyncShopifyCatalogParams): Prom
   const inventoryService = new InventoryService(appPool);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
-    `SELECT DISTINCT tenant_id FROM channel_connections
-      WHERE channel = 'shopify' AND status = 'active'
-        AND (rate_limited_until IS NULL OR rate_limited_until <= now())`,
+    `SELECT DISTINCT cc.tenant_id FROM channel_connections cc
+      JOIN tenants t ON t.id = cc.tenant_id
+      WHERE cc.channel = 'shopify' AND cc.status = 'active'
+        AND (cc.rate_limited_until IS NULL OR cc.rate_limited_until <= now())
+        AND 'shopify' = ANY(t.enabled_channels)`,
   );
 
   const results: CatalogSyncResult[] = [];

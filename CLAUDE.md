@@ -2209,12 +2209,11 @@ from there.
   two or more TikTok shops for the same tenant at once — needs that loading layer (and
   probably the scheduler) to change first; not built, deliberately out of scope for the
   picker pass.
-- **Channel feature flags don't gate ongoing sync** — §15's `tenants.enabled_channels`
-  only gates *connecting* a channel that has no `channel_connections` row yet. Turning a
-  flag off after a tenant is already connected does not pause/hide that channel's
-  scheduler sync, and there's no operator UI, only a CLI script
-  (`npm run platform:set-channel-flags`). Both deliberate, not oversights — see §15's
-  own "Scope boundary" and "No operator UI" paragraphs for the reasoning.
+- **No operator UI for channel flags** — `tenants.enabled_channels` (§15) has no
+  multi-tenant admin surface, only a CLI script (`npm run platform:set-channel-flags`).
+  Deliberate, not an oversight — see §15's own "No operator UI" paragraph for the
+  reasoning. (§15's *other* known gap — flags not gating already-running scheduler
+  sync — is now closed; see its "Scope" paragraph.)
 
 ## 13. Observability (Sentry — §5/§8 Phase 4's "Observability dashboards")
 
@@ -2511,21 +2510,32 @@ set-channel-flags.ts`'s own third copy, deliberately not imported from `@alltix/
 `src/` — see that script's own doc comment for why): a seventh channel connector means
 updating all three by hand.
 
-**Scope boundary, deliberate — gates *connecting*, not ongoing sync**: the check happens
+**Scope — gates both connecting AND ongoing sync**: the connect-time check happens
 exactly once, at the moment a tenant would start connecting a channel that has no
 existing `channel_connections` row yet (every OAuth-redirect GET connect handler —
 Amazon/eBay/TikTok — and every direct-credential POST connect handler —
 Shopify/Walmart/Temu/TikTok-manual — via `isChannelEnabled`/`isChannelEnabledForTenant`
-in `channel-flags.ts`). It does **not** touch `packages/scheduler`'s own discovery
-queries: a channel already connected before its flag was turned off keeps syncing
-normally, and turning a flag back on doesn't need to "reconnect" anything either. This
-mirrors the TikTok multi-shop picker's own honest scope note (§4.8.1) rather than
-overbuilding — genuinely revoking an already-connected channel's ongoing sync (and
-un-syncing/hiding its data) is a materially bigger, different feature, not attempted
-here. `/settings/channels` reflects this exactly: an enabled-but-not-yet-connected
-channel's card shows a plain "X isn't available for your account yet" notice in place of
-the Connect link/form (`ChannelNotEnabledNotice`); an already-connected channel's card
-is completely unaffected by this flag either way.
+in `channel-flags.ts`). `packages/scheduler`'s own discovery queries are now gated too,
+closing what CLAUDE.md §12 used to flag as a real gap: every `syncXOrders`/
+`syncShopifyCatalog` function's tenant-enumeration query (the one exception to this
+codebase's "always go through `app_user`/RLS" rule — see `SyncAmazonOrdersParams`'s own
+doc comment for why an admin-connection cross-tenant query is justified here) now joins
+`tenants` and adds `AND '<channel>' = ANY(t.enabled_channels)`, so turning a channel's
+flag off for a tenant stops that tenant's *ongoing sync* on the very next scheduled run,
+not just future connect attempts — and turning it back on resumes sync automatically
+(picking up from `last_order_sync_at`, unaffected by the flag toggle itself), no
+"reconnect" step needed either way. What this still deliberately does NOT do: it
+doesn't retroactively hide or un-sync data a disabled channel already pulled in (no
+soft-delete/archive of existing orders/inventory events), and disabling a channel mid-
+connection leaves the `channel_connections` row itself intact (status stays whatever it
+was) rather than marking it inactive — a tenant re-enabling the flag sees the exact same
+connection resume, not a fresh reconnect prompt. `/settings/channels` reflects the
+connect-time half of this exactly: an enabled-but-not-yet-connected channel's card shows
+a plain "X isn't available for your account yet" notice in place of the Connect
+link/form (`ChannelNotEnabledNotice`); an already-connected channel's settings card is
+unaffected by the flag either way (by design — the flag change takes effect for that
+tenant's *sync*, not by rewriting what their connect page shows for a channel they've
+already connected).
 
 **No operator UI — a CLI script instead, same reasoning as the LaunchDarkly call above**:
 `npm run platform:set-channel-flags` (`scripts/set-channel-flags.ts`) takes
@@ -2543,7 +2553,13 @@ need.
 CHECK constraint already makes that impossible in practice). No DB-layer test suite for
 the migration itself, same precedent migration 0031 set — verified instead via `tsc -b`,
 `next build`, and a manual rolled-back-transaction smoke test of the default value and
-the CHECK constraint against a real local Postgres.
+the CHECK constraint against a real local Postgres. The scheduler-side gating (the
+`tenants` join added to every discovery query, above) has real coverage instead:
+`packages/scheduler/test/sync-failure-tracking.test.ts` and `rate-limit-cooldown.test.ts`
+now seed a genuine `tenants` row per test tenant (previously a bare synthetic UUID with
+no backing row — see `seedBrokenShopifyConnection`'s own doc comment), which is itself
+an implicit proof the join doesn't silently exclude an enabled tenant, since a default
+`enabled_channels` row (every channel included) is exactly what a real signup produces.
 
 ## 16. API Rate Limiting (§6's own Security & Compliance item)
 

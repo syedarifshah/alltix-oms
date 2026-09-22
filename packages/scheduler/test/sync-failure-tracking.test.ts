@@ -66,9 +66,21 @@ interface ConnectionRow {
 
 /** A 'shopify' channel_connections row with no encrypted_access_token --
  *  see this file's header comment for why that's the deterministic,
- *  network-free failure trigger this whole file relies on. */
+ *  network-free failure trigger this whole file relies on.
+ *
+ *  Also seeds a real `tenants` row (via adminPool -- app_user has no INSERT
+ *  grant, migration 0010's own comment) -- needed now that
+ *  syncShopifyOrders()'s discovery query joins `tenants` and requires
+ *  'shopify' = ANY(enabled_channels), part of closing CLAUDE.md §12's
+ *  "channel feature flags don't gate ongoing sync" gap. Deleted by
+ *  cleanupSeededTenant() below, kept separate from cleanup() (see that
+ *  function's own doc comment for why). */
 async function seedBrokenShopifyConnection(): Promise<string> {
   const tenantId = randomUUID();
+  await adminPool.query(`INSERT INTO tenants (id, name) VALUES ($1, $2)`, [
+    tenantId,
+    `broken-test-tenant-${tenantId.slice(0, 8)}`,
+  ]);
   await withTenant(appPool, tenantId, (client) =>
     client.query(
       `INSERT INTO channel_connections (tenant_id, channel, marketplace, external_account_id)
@@ -96,6 +108,19 @@ async function cleanup(tenantId: string): Promise<void> {
   await withTenant(appPool, tenantId, (client) =>
     client.query("DELETE FROM channel_connections WHERE tenant_id = $1", [tenantId]),
   );
+}
+
+/** Deletes the `tenants` row seedBrokenShopifyConnection() now creates.
+ *  Kept separate from cleanup() rather than folded into it: cleanup() is
+ *  also used by the notifyTenantUsers() test below via
+ *  seedBrokenShopifyConnectionForTenant(), whose tenant is a REAL one
+ *  seeded (and cleaned up) by seedTenantWithUsers()/
+ *  cleanupTenantWithUsers() instead -- cleanupTenantWithUsers() must delete
+ *  `users` before `tenants` (the real FK, see seedTenantWithUsers()'s own
+ *  doc comment), so a shared cleanup() that also deleted `tenants` would
+ *  risk running before that ordering-sensitive users delete, not after. */
+async function cleanupSeededTenant(tenantId: string): Promise<void> {
+  await adminPool.query("DELETE FROM tenants WHERE id = $1", [tenantId]);
 }
 
 /** Same broken-connection shape as seedBrokenShopifyConnection(), but for a
@@ -173,6 +198,7 @@ test("a Shopify connection with no access token fails deterministically, with no
     assert.match(ourResult.error ?? "", /No active 'shopify' channel_connections row/);
   } finally {
     await cleanup(tenantId);
+    await cleanupSeededTenant(tenantId);
   }
 });
 
@@ -213,6 +239,7 @@ test(`status flips to 'error' after ${CONSECUTIVE_FAILURE_ERROR_THRESHOLD} conse
     );
   } finally {
     await cleanup(tenantId);
+    await cleanupSeededTenant(tenantId);
   }
 });
 
@@ -237,6 +264,7 @@ test("recordSyncSuccess resets consecutive_failures to 0 but leaves last_failure
     );
   } finally {
     await cleanup(tenantId);
+    await cleanupSeededTenant(tenantId);
   }
 });
 
@@ -264,6 +292,7 @@ test("recordSyncFailure does not keep incrementing an already-'error' row (self-
     );
   } finally {
     await cleanup(tenantId);
+    await cleanupSeededTenant(tenantId);
   }
 });
 

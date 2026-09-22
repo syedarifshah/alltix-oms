@@ -56,9 +56,21 @@ interface ConnectionRow {
 }
 
 /** Same deterministic, network-free broken 'shopify' row as
- *  sync-failure-tracking.test.ts's seedBrokenShopifyConnection(). */
+ *  sync-failure-tracking.test.ts's seedBrokenShopifyConnection() -- and,
+ *  like that function, also seeds a real `tenants` row (via adminPool --
+ *  app_user has no INSERT grant, migration 0010's own comment). Needed now
+ *  that syncShopifyOrders()'s discovery query joins `tenants` and requires
+ *  'shopify' = ANY(enabled_channels), part of closing CLAUDE.md §12's
+ *  "channel feature flags don't gate ongoing sync" gap. Every test in this
+ *  file uses this seed + cleanup() below (no shared-tenant case to worry
+ *  about, unlike sync-failure-tracking.test.ts), so cleanup() itself
+ *  deletes the tenants row too rather than needing a separate helper. */
 async function seedShopifyConnection(): Promise<string> {
   const tenantId = randomUUID();
+  await adminPool.query(`INSERT INTO tenants (id, name) VALUES ($1, $2)`, [
+    tenantId,
+    `rate-limit-test-tenant-${tenantId.slice(0, 8)}`,
+  ]);
   await withTenant(appPool, tenantId, (client) =>
     client.query(
       `INSERT INTO channel_connections (tenant_id, channel, marketplace, external_account_id)
@@ -95,6 +107,9 @@ async function cleanup(tenantId: string): Promise<void> {
   await withTenant(appPool, tenantId, (client) =>
     client.query("DELETE FROM channel_connections WHERE tenant_id = $1", [tenantId]),
   );
+  // app_user has no DELETE grant on tenants (migration 0010) -- adminPool,
+  // same as the INSERT in seedShopifyConnection() above.
+  await adminPool.query("DELETE FROM tenants WHERE id = $1", [tenantId]);
 }
 
 test("recordRateLimitTrip stamps rate_limited_until at least RATE_LIMIT_COOLDOWN_MS out, without touching status/consecutive_failures", async () => {
