@@ -4,6 +4,7 @@ import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
 import { recordAuditEvent } from "@/lib/audit-log";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -12,15 +13,20 @@ export const dynamic = "force-dynamic";
  *  stops this from touching another tenant's rule; the WHERE clause below
  *  is just the normal scoping every query in this app uses on top of that. */
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }): Promise<Response> {
-  const user = await requireCurrentUser(req, getAppPool());
+  const pool = getAppPool();
+  const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/rules", "not signed in");
   }
 
   const { id } = await ctx.params;
 
+  if (await checkRateLimit(pool, user.tenantId, "rules.toggle")) {
+    return redirectWithError(req, "/rules", RATE_LIMIT_ERROR_MESSAGE);
+  }
+
   try {
-    const result = await withTenant(getAppPool(), user.tenantId, async (client) => {
+    const result = await withTenant(pool, user.tenantId, async (client) => {
       const updateResult = await client.query<{ enabled: boolean }>(
         `UPDATE automation_rules SET enabled = NOT enabled, updated_at = now() WHERE id = $1 AND tenant_id = $2 RETURNING enabled`,
         [id, user.tenantId],

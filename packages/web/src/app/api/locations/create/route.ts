@@ -4,6 +4,7 @@ import type { LocationType } from "@alltix/shared";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -32,9 +33,14 @@ const LOCATION_TYPES: readonly LocationType[] = ["warehouse", "3pl", "fba", "wfs
  * page-driven mutation in this app.
  */
 export async function POST(req: NextRequest): Promise<Response> {
-  const user = await requireCurrentUser(req, getAppPool());
+  const pool = getAppPool();
+  const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/locations", "not signed in");
+  }
+
+  if (await checkRateLimit(pool, user.tenantId, "locations.create")) {
+    return redirectWithError(req, "/locations", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   const formData = await req.formData();
@@ -54,7 +60,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   try {
-    await withTenant(getAppPool(), user.tenantId, (client) =>
+    await withTenant(pool, user.tenantId, (client) =>
       client.query(`INSERT INTO locations (tenant_id, name, type, postal_code) VALUES ($1, $2, $3, $4)`, [
         user.tenantId,
         name,

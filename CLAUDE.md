@@ -2573,18 +2573,22 @@ same tenant/route can't both read a stale count and both slip through. Same "don
 stand up infra a single self-testing tenant hasn't earned yet" call this codebase
 already makes for BullMQ/Redis (§4.4), Kafka (§1), and §15's own channel feature flags.
 
-**Coverage — nine routes, deliberately not all ~30 mutation routes**: the order
+**Coverage — twenty routes, deliberately not all ~30 mutation routes**: the order
 lifecycle (`orders/[id]/{cancel,pack,ship,transition,return}`), picklists
 (`picklists` create, `picklists/[id]/assign`, `picklists/[id]/lines/[lineId]/record`),
-and `inventory/transfer` — the highest-frequency, highest-consequence operational hot
-path (the one a stuck retry loop or a warehouse floor bug is most likely to actually
-hit hard, and where DB contention has real downstream cost). Connector-credential
-routes, rules, locations, HR, and products are **not yet covered** — same
-`checkRateLimit(pool, tenantId, routeKey)` one-line addition extends to any of them
-whenever it's actually needed; not applied everywhere up front because most of this
-app's ~30 `requireCurrentUser`-based routes don't share a single chokepoint `with-
-tenant-auth.ts` could enforce this from centrally (see the next paragraph) — retrofitting
-the rest is real, bounded, low-risk future work, not an oversight.
+`inventory/transfer` — the original nine, the highest-frequency, highest-consequence
+operational hot path — plus a second pass extending the identical one-line
+`checkRateLimit(pool, tenantId, routeKey)` addition to `rules` (create, `[id]/toggle`),
+`locations` (create, `[id]/rename`, `[id]/set-postal-code`), `products/create`, and
+every `hr/employees`/`hr/time-entries` mutation (`employees/create`, `employees/[id]/
+update`, `time-entries/clock-in`, `time-entries/[id]/clock-out`, `time-entries/manual`)
+— all at `DEFAULT_RATE_LIMIT_PER_MINUTE`, none of these has the order/picklist hot
+path's reason to tune a route-specific limit. Only the connector-credential `connect`
+routes (`channels/{amazon,ebay,shopify,walmart,temu,tiktok}/connect`) remain **not yet
+covered** — those already go through `withTenantAuth`, not `requireCurrentUser`, so
+extending this pattern to them means threading the check through that different
+call shape rather than the same copy-paste; real, bounded, low-risk future work, not
+an oversight.
 
 **Why not enforced centrally in `withTenantAuth`/`requireCurrentUser` itself**: only 4
 of this codebase's ~34 authenticated routes actually go through `withTenantAuth` (see

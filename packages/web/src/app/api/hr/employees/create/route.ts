@@ -3,6 +3,7 @@ import { withTenant } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -16,9 +17,14 @@ export const dynamic = "force-dynamic";
  * compute a gross wage for that employee until it is).
  */
 export async function POST(req: NextRequest): Promise<Response> {
-  const user = await requireCurrentUser(req, getAppPool());
+  const pool = getAppPool();
+  const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/hr", "not signed in");
+  }
+
+  if (await checkRateLimit(pool, user.tenantId, "hr.employees.create")) {
+    return redirectWithError(req, "/hr", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   const formData = await req.formData();
@@ -40,7 +46,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   try {
-    await withTenant(getAppPool(), user.tenantId, (client) =>
+    await withTenant(pool, user.tenantId, (client) =>
       client.query(
         `INSERT INTO employees (tenant_id, name, role, location_id, hourly_rate) VALUES ($1, $2, $3, $4, $5)`,
         [user.tenantId, name, role, locationId, hourlyRate],

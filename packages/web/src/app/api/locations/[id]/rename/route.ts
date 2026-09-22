@@ -3,6 +3,7 @@ import { withTenant } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -22,9 +23,14 @@ export const dynamic = "force-dynamic";
  * all of that first.
  */
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }): Promise<Response> {
-  const user = await requireCurrentUser(req, getAppPool());
+  const pool = getAppPool();
+  const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/locations", "not signed in");
+  }
+
+  if (await checkRateLimit(pool, user.tenantId, "locations.rename")) {
+    return redirectWithError(req, "/locations", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   const { id } = await ctx.params;
@@ -36,7 +42,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   }
 
   try {
-    const result = await withTenant(getAppPool(), user.tenantId, (client) =>
+    const result = await withTenant(pool, user.tenantId, (client) =>
       client.query(`UPDATE locations SET name = $1, updated_at = now() WHERE id = $2 AND tenant_id = $3`, [
         name,
         id,

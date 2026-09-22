@@ -4,6 +4,7 @@ import type { EmployeeStatus } from "@alltix/shared";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -23,9 +24,14 @@ const EMPLOYEE_STATUSES: readonly EmployeeStatus[] = ["active", "inactive"];
  * referencing this row regardless of status).
  */
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }): Promise<Response> {
-  const user = await requireCurrentUser(req, getAppPool());
+  const pool = getAppPool();
+  const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/hr", "not signed in");
+  }
+
+  if (await checkRateLimit(pool, user.tenantId, "hr.employees.update")) {
+    return redirectWithError(req, "/hr", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   const { id } = await ctx.params;
@@ -51,7 +57,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   }
 
   try {
-    const result = await withTenant(getAppPool(), user.tenantId, (client) =>
+    const result = await withTenant(pool, user.tenantId, (client) =>
       client.query(
         `UPDATE employees SET role = $1, location_id = $2, hourly_rate = $3, status = $4, updated_at = now()
           WHERE id = $5 AND tenant_id = $6`,

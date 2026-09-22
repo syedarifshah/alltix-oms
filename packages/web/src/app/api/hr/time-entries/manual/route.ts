@@ -3,6 +3,7 @@ import { withTenant } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -27,9 +28,14 @@ export const dynamic = "force-dynamic";
  * guessed "fix" that could be wrong in the other direction.
  */
 export async function POST(req: NextRequest): Promise<Response> {
-  const user = await requireCurrentUser(req, getAppPool());
+  const pool = getAppPool();
+  const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/hr", "not signed in");
+  }
+
+  if (await checkRateLimit(pool, user.tenantId, "hr.time_entries.manual")) {
+    return redirectWithError(req, "/hr", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   const formData = await req.formData();
@@ -56,7 +62,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   const clockOut = new Date(clockIn.getTime() + hours * 60 * 60 * 1000);
 
   try {
-    await withTenant(getAppPool(), user.tenantId, (client) =>
+    await withTenant(pool, user.tenantId, (client) =>
       client.query(
         `INSERT INTO time_entries (tenant_id, employee_id, location_id, clock_in, clock_out, entry_source, notes)
          VALUES ($1, $2, $3, $4, $5, 'manual', $6)`,

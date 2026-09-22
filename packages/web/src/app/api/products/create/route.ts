@@ -3,6 +3,7 @@ import { withTenant } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -20,9 +21,14 @@ export const dynamic = "force-dynamic";
  * persistence, never a deliberate "start a new listing from scratch" path.
  */
 export async function POST(req: NextRequest): Promise<Response> {
-  const user = await requireCurrentUser(req, getAppPool());
+  const pool = getAppPool();
+  const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/products", "not signed in");
+  }
+
+  if (await checkRateLimit(pool, user.tenantId, "products.create")) {
+    return redirectWithError(req, "/products", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   const formData = await req.formData();
@@ -34,7 +40,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   try {
-    await withTenant(getAppPool(), user.tenantId, (client) =>
+    await withTenant(pool, user.tenantId, (client) =>
       client.query(`INSERT INTO products (tenant_id, internal_sku, name) VALUES ($1, $2, $3)`, [
         user.tenantId,
         internalSku,

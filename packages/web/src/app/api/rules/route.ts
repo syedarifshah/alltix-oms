@@ -4,6 +4,7 @@ import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
 import { recordAuditEvent } from "@/lib/audit-log";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -31,9 +32,14 @@ function parseJsonArray(raw: FormDataEntryValue | null, fieldName: string): unkn
  *  contents are semantically sound (RulesEngine already fails closed on an
  *  unrecognized condition op or action type at evaluation time). */
 export async function POST(req: NextRequest): Promise<Response> {
-  const user = await requireCurrentUser(req, getAppPool());
+  const pool = getAppPool();
+  const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/rules", "not signed in");
+  }
+
+  if (await checkRateLimit(pool, user.tenantId, "rules.create")) {
+    return redirectWithError(req, "/rules", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   const formData = await req.formData();
@@ -59,7 +65,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   try {
-    await withTenant(getAppPool(), user.tenantId, async (client) => {
+    await withTenant(pool, user.tenantId, async (client) => {
       const result = await client.query<{ id: string }>(
         `INSERT INTO automation_rules (tenant_id, name, trigger_event, conditions, actions, priority, enabled)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
