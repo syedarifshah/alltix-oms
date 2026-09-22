@@ -2573,37 +2573,51 @@ same tenant/route can't both read a stale count and both slip through. Same "don
 stand up infra a single self-testing tenant hasn't earned yet" call this codebase
 already makes for BullMQ/Redis (§4.4), Kafka (§1), and §15's own channel feature flags.
 
-**Coverage — twenty routes, deliberately not all ~30 mutation routes**: the order
-lifecycle (`orders/[id]/{cancel,pack,ship,transition,return}`), picklists
-(`picklists` create, `picklists/[id]/assign`, `picklists/[id]/lines/[lineId]/record`),
-`inventory/transfer` — the original nine, the highest-frequency, highest-consequence
-operational hot path — plus a second pass extending the identical one-line
-`checkRateLimit(pool, tenantId, routeKey)` addition to `rules` (create, `[id]/toggle`),
-`locations` (create, `[id]/rename`, `[id]/set-postal-code`), `products/create`, and
-every `hr/employees`/`hr/time-entries` mutation (`employees/create`, `employees/[id]/
-update`, `time-entries/clock-in`, `time-entries/[id]/clock-out`, `time-entries/manual`)
-— all at `DEFAULT_RATE_LIMIT_PER_MINUTE`, none of these has the order/picklist hot
-path's reason to tune a route-specific limit. Only the connector-credential `connect`
-routes (`channels/{amazon,ebay,shopify,walmart,temu,tiktok}/connect`) remain **not yet
-covered** — those already go through `withTenantAuth`, not `requireCurrentUser`, so
-extending this pattern to them means threading the check through that different
-call shape rather than the same copy-paste; real, bounded, low-risk future work, not
-an oversight.
+**Coverage — every mutation route now protected**: the order lifecycle
+(`orders/[id]/{cancel,pack,ship,transition,return}`), picklists (`picklists` create,
+`picklists/[id]/assign`, `picklists/[id]/lines/[lineId]/record`), `inventory/transfer`
+— the original nine, the highest-frequency, highest-consequence operational hot path —
+a second pass extending the identical one-line `checkRateLimit(pool, tenantId,
+routeKey)` addition to `rules` (create, `[id]/toggle`), `locations` (create,
+`[id]/rename`, `[id]/set-postal-code`), `products/create`, and every `hr/employees`/
+`hr/time-entries` mutation (`employees/create`, `employees/[id]/update`,
+`time-entries/clock-in`, `time-entries/[id]/clock-out`, `time-entries/manual`) — all at
+`DEFAULT_RATE_LIMIT_PER_MINUTE`, none of these has the order/picklist hot path's reason
+to tune a route-specific limit — and a third pass closing the one remaining gap, the
+connector-credential `connect` routes (`channels/{amazon,ebay,shopify,walmart,temu,
+tiktok}/connect`). Those needed a different shape, not a copy-paste: Amazon,
+eBay, and TikTok's OAuth-initiate handler (`connectTikTokViaOAuth`) go through
+`withTenantAuth`, which already hands the handler an open, tenant-scoped `client` --
+for those, `recordRequestAndCheckRateLimit(client, tenantId, routeKey)` is called
+directly against that same transaction (same "reuse the open transaction" reasoning
+`recordAuditEvent` documents), with the thrown `RateLimitExceededError` caught and
+turned into a redirect right there rather than left to bubble past `withTenantAuth`'s
+own `withTenant` wrapper as a raw error. Shopify, Walmart, Temu, and TikTok's own
+manual-paste POST handler already capture `pool` via `requireCurrentUser`, so those
+get the ordinary pool-level `checkRateLimit` call like every other route in this
+section. TikTok's OAuth and manual-paste handlers share one URL path but are keyed
+separately (`channels.tiktok.connect_oauth` vs. `channels.tiktok.connect_manual`) --
+two genuinely different flows, so a burst against one doesn't consume the other's
+budget. Every check runs first, before that route's own channel-flags lookup (§15),
+matching the "right after resolving the caller, before any real work" ordering every
+rate-limited route in this app uses.
 
 **Why not enforced centrally in `withTenantAuth`/`requireCurrentUser` itself**: only 4
-of this codebase's ~34 authenticated routes actually go through `withTenantAuth` (see
-that function's own doc comment) — the other ~30, including every route this section
-covers, use `requireCurrentUser` instead specifically because their first real step is
-a network call or a service-layer transaction of their own, and `requireCurrentUser`'s
-return type (`CurrentUser | null`) is relied on by every one of those call sites to mean
+of this codebase's ~34 authenticated routes go through `withTenantAuth` (see that
+function's own doc comment) — Amazon/eBay/TikTok's OAuth-initiate handlers among them,
+which is why those three call `recordRequestAndCheckRateLimit` directly rather than
+`checkRateLimit` (see the Coverage paragraph above). The other ~30 use
+`requireCurrentUser` instead specifically because their first real step is a network
+call or a service-layer transaction of their own, and `requireCurrentUser`'s return
+type (`CurrentUser | null`) is relied on by every one of those call sites to mean
 exactly one thing: "not signed in." Silently overloading it to also mean "rate limited"
 would make every existing "not signed in" redirect lie to a legitimate signed-in tenant
 who's simply been rate limited, and changing its return shape to disambiguate would mean
 touching all ~30 files anyway — no smaller than applying the check directly at each site.
-So each protected route makes its own explicit `checkRateLimit(pool, user.tenantId,
-"<route_key>")` call, right after resolving `user` and before doing any real work,
-redirecting with `RATE_LIMIT_ERROR_MESSAGE` on a hit — one extra line of intent per
-route, not a hidden side effect of the shared auth helper.
+Either way, each protected route makes its own explicit rate-limit call, right after
+resolving the caller and before doing any real work, redirecting with
+`RATE_LIMIT_ERROR_MESSAGE` on a hit — one extra line of intent per route, not a hidden
+side effect of the shared auth helper.
 
 **Limits are tuned per route, not one global number**: `DEFAULT_RATE_LIMIT_PER_MINUTE`
 (120/tenant/route/minute) covers the order-lifecycle and picklist-assign/create routes;

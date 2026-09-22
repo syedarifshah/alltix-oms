@@ -7,6 +7,12 @@ import { createOAuthState } from "@/lib/tiktok-oauth-state";
 import { readTikTokOAuthAppConfig } from "@/lib/tiktok-oauth-config";
 import { persistTikTokConnection } from "@/lib/tiktok-connection";
 import { isChannelEnabled, isChannelEnabledForTenant } from "@/lib/channel-flags";
+import {
+  checkRateLimit,
+  recordRequestAndCheckRateLimit,
+  RateLimitExceededError,
+  RATE_LIMIT_ERROR_MESSAGE,
+} from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -28,8 +34,26 @@ export const dynamic = "force-dynamic";
  * exists to test it against (see tiktok-oauth.ts's own "UNVERIFIED IN
  * PRACTICE" note). Both paths check the same flag -- see the POST handler
  * below.
+ *
+ * Rate-limited via {@link recordRequestAndCheckRateLimit} against the
+ * already-open `client` -- see /api/channels/amazon/connect's own doc
+ * comment for why a withTenantAuth-wrapped handler uses this instead of the
+ * pool-level {@link checkRateLimit} convenience the POST handler below
+ * uses. Keyed separately from the POST handler's own route_key below (same
+ * URL path, but two genuinely different flows -- an OAuth redirect here vs.
+ * a manual-credential network round trip there -- so a burst against one
+ * doesn't consume the other's budget).
  */
 async function connectTikTokViaOAuth(req: NextRequest, { tenantId, client }: TenantRequestContext): Promise<Response> {
+  try {
+    await recordRequestAndCheckRateLimit(client, tenantId, "channels.tiktok.connect_oauth");
+  } catch (err) {
+    if (err instanceof RateLimitExceededError) {
+      return redirectWithError(req, "/settings/channels", RATE_LIMIT_ERROR_MESSAGE);
+    }
+    throw err;
+  }
+
   if (!(await isChannelEnabled(client, tenantId, "tiktok"))) {
     return redirectWithError(req, "/settings/channels", "tiktok_channel_not_enabled");
   }
@@ -89,6 +113,10 @@ export async function POST(req: NextRequest): Promise<Response> {
   const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/settings/channels", "not signed in");
+  }
+
+  if (await checkRateLimit(pool, user.tenantId, "channels.tiktok.connect_manual")) {
+    return redirectWithError(req, "/settings/channels", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   if (!(await isChannelEnabledForTenant(pool, user.tenantId, "tiktok"))) {

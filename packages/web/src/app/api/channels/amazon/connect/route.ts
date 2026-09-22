@@ -5,6 +5,7 @@ import { createOAuthState } from "@/lib/amazon-oauth-state";
 import { readAmazonOAuthAppConfig, isAmazonOAuthAppDraft } from "@/lib/amazon-oauth-config";
 import { isChannelEnabled } from "@/lib/channel-flags";
 import { redirectWithError } from "@/lib/route-helpers";
+import { recordRequestAndCheckRateLimit, RateLimitExceededError, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -26,8 +27,27 @@ export const dynamic = "force-dynamic";
  * reaches Amazon's own authorize screen at all, no error code prefix (same
  * "Amazon's own error codes carry no distinguishing prefix" reasoning
  * /settings/channels' own catch-all banner already documents).
+ *
+ * Rate-limited via {@link recordRequestAndCheckRateLimit} directly against
+ * the already-open `client` withTenantAuth hands this handler -- not the
+ * pool-level {@link checkRateLimit} convenience CLAUDE.md §16's other
+ * routes use, since this route already has a tenant-scoped transaction
+ * open and opening a second one just for the rate-limit check would be
+ * pure waste (same "reuse the open transaction" reasoning recordAuditEvent's
+ * own doc comment gives). Checked first, before the channel-flags lookup
+ * above -- "right after resolving the caller, before any real work," same
+ * ordering every other rate-limited route in this app uses.
  */
 async function connectAmazon(req: NextRequest, { tenantId, client }: TenantRequestContext): Promise<Response> {
+  try {
+    await recordRequestAndCheckRateLimit(client, tenantId, "channels.amazon.connect");
+  } catch (err) {
+    if (err instanceof RateLimitExceededError) {
+      return redirectWithError(req, "/settings/channels", RATE_LIMIT_ERROR_MESSAGE);
+    }
+    throw err;
+  }
+
   if (!(await isChannelEnabled(client, tenantId, "amazon"))) {
     return redirectWithError(req, "/settings/channels", "channel_not_enabled");
   }
