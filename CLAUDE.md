@@ -2103,22 +2103,42 @@ eBay/Temu v1" scope decision.
     to, not a replacement for. The two signals can and do disagree (a product can be
     "LOW" by buffer but not "reorder soon" by velocity, or vice versa) — both are
     shown, deliberately, rather than one silently overriding the other.
-  - Reorder threshold: `DEFAULT_REORDER_THRESHOLD_DAYS = 14`, an admittedly arbitrary
-    but documented default (same status `/inventory`'s own
-    `LOW_STOCK_FALLBACK_THRESHOLD` already carries) — not yet a real per-tenant
-    setting anywhere; `assessStockForecast`'s own `reorderThresholdDays` parameter
-    exists for that to be added later without changing this function's shape.
+  - **Reorder threshold — now a real per-tenant setting, closing the gap this bullet
+    used to flag as open**: `assessStockForecast`'s own `reorderThresholdDays`
+    parameter existed from day one for exactly this, unused by either real caller until
+    now. `tenants.reorder_threshold_days` (migration `0031_tenants_reorder_threshold_
+    days.sql`, `INT NOT NULL DEFAULT 14 CHECK (BETWEEN 1 AND 365)`) — `DEFAULT 14` is
+    not arbitrary, it's the exact value `DEFAULT_REORDER_THRESHOLD_DAYS` already
+    hardcoded, so a tenant who never touches the new setting sees IDENTICAL forecast
+    behavior to before this migration; genuinely additive. `/inventory` now has a
+    "Reorder threshold" form (POSTs to the new `/api/inventory/reorder-threshold`,
+    `UPDATE tenants SET reorder_threshold_days = ...`) and both `/inventory` and
+    `/reports` read the tenant's own value and pass it into every `assessStockForecast`
+    call instead of relying on the function's own default. One setting, read in two
+    places, edited in one — `/reports` links back to `/inventory` to change it rather
+    than duplicating the form.
+    `packages/web/src/lib/reorder-threshold.ts`'s `parseReorderThresholdDays()` mirrors
+    the DB's own CHECK constraint (1-365) at the app layer — defense-in-depth, same
+    "never rely on one layer alone" principle CLAUDE.md §6 applies to tenant isolation,
+    applied here to input validation. `LOW_STOCK_FALLBACK_THRESHOLD` (`/inventory`'s
+    OTHER, buffer-based risk badge — see the "two signals can and do disagree" note
+    above) stays a flat constant, not a per-tenant setting — a real, deliberate scope
+    boundary, not an inconsistency: that badge has no natural "days" unit to make
+    tenant-configurable the same way, and wasn't part of this pass.
   - Unit-tested (`packages/inventory-service/test/forecast.test.ts`, 14 tests, pure
     functions, no DB needed — same "pure-function-first" precedent
     `extractUsShippingZip`/`rankByDistanceToShippingZip` already set in
-    `packages/order-service/test/nearest-location-routing.test.ts`). The two pages'
-    own SQL (`sum(-quantity_delta) ... WHERE event_type = 'sale'`) is NOT
-    independently integration-tested against live Postgres this pass — consistent
-    with every other read-only query already on `/inventory`/`/reports` (neither page
-    has a test file at all; both inherit correctness from the ledger-writing services,
-    which ARE tested, e.g. `recordShipmentSaleEvents`'s own sign convention this
-    query relies on). Worth a quick visual sanity check against real data once this
-    is live, same as every other report figure's own "first pass" status.
+    `packages/order-service/test/nearest-location-routing.test.ts`; the new
+    `parseReorderThresholdDays()` gets its own 7-test pure-function file,
+    `packages/web/test/reorder-threshold.test.ts`). The two pages'
+    own SQL (`sum(-quantity_delta) ... WHERE event_type = 'sale'`, and the new
+    `SELECT reorder_threshold_days FROM tenants`) is NOT independently
+    integration-tested against live Postgres this pass — consistent with every other
+    read-only query already on `/inventory`/`/reports` (neither page has a test file at
+    all; both inherit correctness from the ledger-writing services, which ARE tested,
+    e.g. `recordShipmentSaleEvents`'s own sign convention this query relies on). Worth a
+    quick visual sanity check against real data once this is live, same as every other
+    report figure's own "first pass" status.
 - **Phase 5 — Scale features (Months 9-12+)**: eBay, Temu, and TikTok Shop — all three
   built and wired into the app ahead of the rest of this phase, see §4.6/§4.7/§4.8 (all
   three remain UNVERIFIED against real infrastructure — no live credentials/sandbox for

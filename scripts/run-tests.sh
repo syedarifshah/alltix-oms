@@ -25,6 +25,7 @@ SAFE_TESTS=(
   "packages/web/test/amazon-oauth-state.test.ts"
   "packages/web/test/tiktok-oauth-state.test.ts"
   "packages/web/test/tiktok-oauth-pending.test.ts"
+  "packages/web/test/reorder-threshold.test.ts"
   "packages/web/test/tenant-isolation.e2e.test.ts"
   "packages/warehouse-service/test/generate-and-pick.test.ts"
   "packages/warehouse-service/test/assign-picklist-concurrency.test.ts"

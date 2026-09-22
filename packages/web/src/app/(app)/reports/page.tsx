@@ -101,6 +101,11 @@ function parsePeriodDays(raw: string | undefined): number {
  * window, via @alltix/inventory-service's `assessStockForecast` -- the same
  * pure function `/inventory` uses with its own fixed 30-day window. See that
  * function's own doc comment for what it does and doesn't claim to predict.
+ * The threshold itself (`reorderThresholdDays`, "N or fewer days left counts
+ * as soon") is a real per-tenant setting now (`tenants.reorder_threshold_days`,
+ * migration 0031) -- read here, not edited here; /inventory's own "Reorder
+ * threshold" form is the only place it's changed, and both pages apply
+ * whatever the tenant set there.
  *
  * "Revenue" here means gross order-line revenue for non-cancelled orders in
  * the selected period (`orders.placed_at`, not `created_at` -- a channel
@@ -135,10 +140,17 @@ export default async function ReportsPage({ searchParams }: ReportsPageProps): P
 
   const since = new Date(Date.now() - periodDays * 24 * 60 * 60 * 1000);
 
-  const { salesByChannel, topSkus, returnsSummary, inventorySnapshot, troubleSpots, reorderCandidates } = await withTenant(
-    pool,
-    tenantId,
-    async (client) => {
+  const { salesByChannel, topSkus, returnsSummary, inventorySnapshot, troubleSpots, reorderCandidates, reorderThresholdDays } =
+    await withTenant(pool, tenantId, async (client) => {
+      // This tenant's own "reorder soon" threshold (migration 0031) -- same
+      // value /inventory's own settings form edits, not a second,
+      // independent report-only setting. See /inventory's own doc comment
+      // for the RLS-already-scopes-this-row reasoning.
+      const tenantResult = await client.query<{ reorder_threshold_days: number }>(
+        `SELECT reorder_threshold_days FROM tenants WHERE id = $1`,
+        [tenantId],
+      );
+
       const salesByChannelResult = await client.query<SalesByChannelRow>(
         `SELECT o.channel,
                 count(DISTINCT o.id)::text AS order_count,
@@ -251,9 +263,9 @@ export default async function ReportsPage({ searchParams }: ReportsPageProps): P
         },
         troubleSpots: troubleSpotsResult.rows,
         reorderCandidates: reorderCandidatesResult.rows,
+        reorderThresholdDays: tenantResult.rows[0]!.reorder_threshold_days,
       };
-    },
-  );
+    });
 
   const totalRevenue = salesByChannel.reduce((sum, row) => sum + Number(row.revenue), 0);
   const totalOrders = salesByChannel.reduce((sum, row) => sum + Number(row.order_count), 0);
@@ -265,7 +277,7 @@ export default async function ReportsPage({ searchParams }: ReportsPageProps): P
   const reorderSoon = reorderCandidates
     .map((row) => ({
       ...row,
-      forecast: assessStockForecast(row.available, Number(row.units_sold), periodDays),
+      forecast: assessStockForecast(row.available, Number(row.units_sold), periodDays, reorderThresholdDays),
     }))
     .filter((row) => row.forecast.reorderSoon)
     .sort((a, b) => (a.forecast.daysRemaining ?? 0) - (b.forecast.daysRemaining ?? 0))
@@ -417,11 +429,12 @@ export default async function ReportsPage({ searchParams }: ReportsPageProps): P
 
       <h2>Reorder soon</h2>
       <p className="subtitle">
-        Still in stock, but recent sales velocity over the last {periodDays} days puts them on track to run out soon — a
-        separate, velocity-based signal from the out-of-stock list above. See <a href="/inventory">/inventory</a> for the
-        per-row figure (fixed 30-day window) and every product/location, not just the top 10 most urgent shown here. A
-        product with low stock but no recent sales in this window won't appear here — see the inventory page's own note on
-        why that's a deliberate "unknown," not "safe."
+        Still in stock, but recent sales velocity over the last {periodDays} days puts them at {reorderThresholdDays} or
+        fewer estimated days of stock remaining — a separate, velocity-based signal from the out-of-stock list above. See{" "}
+        <a href="/inventory">/inventory</a> for the per-row figure (fixed 30-day window), every product/location not just
+        the top 10 most urgent shown here, and to change the {reorderThresholdDays}-day threshold itself. A product with
+        low stock but no recent sales in this window won't appear here — see the inventory page's own note on why that's a
+        deliberate "unknown," not "safe."
       </p>
       {reorderSoon.length === 0 ? (
         <p className="empty">Nothing trending toward stockout in this period.</p>

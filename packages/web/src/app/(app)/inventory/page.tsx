@@ -2,10 +2,11 @@ import type { ReactElement } from "react";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { withTenant } from "@alltix/db";
-import { assessStockForecast, DEFAULT_REORDER_THRESHOLD_DAYS, type StockForecast } from "@alltix/inventory-service";
+import { assessStockForecast, type StockForecast } from "@alltix/inventory-service";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { MIN_REORDER_THRESHOLD_DAYS, MAX_REORDER_THRESHOLD_DAYS } from "@/lib/reorder-threshold";
 
 export const dynamic = "force-dynamic";
 
@@ -41,7 +42,7 @@ interface SalesVelocityRow {
 const VELOCITY_WINDOW_DAYS = 30;
 
 interface InventoryPageProps {
-  searchParams: Promise<{ error?: string; transferred?: string }>;
+  searchParams: Promise<{ error?: string; transferred?: string; reorderThresholdUpdated?: string }>;
 }
 
 type Risk = "zero" | "low" | "ok";
@@ -96,7 +97,13 @@ function forecastCell(forecast: StockForecast | undefined): ReactElement {
  * scope, @alltix/inventory-service's `assessStockForecast`) is a SEPARATE,
  * velocity-based signal from the "Risk" column's buffer-based one above --
  * see StockForecast's own doc comment for exactly how they differ and why
- * both are shown rather than one replacing the other.
+ * both are shown rather than one replacing the other. The "reorder soon"
+ * threshold itself is now a real per-tenant setting (`tenants.
+ * reorder_threshold_days`, migration 0031) instead of
+ * `assessStockForecast`'s own hardcoded `DEFAULT_REORDER_THRESHOLD_DAYS`
+ * fallback -- editable via the "Reorder threshold" form below, which POSTs
+ * to /api/inventory/reorder-threshold. /reports' own "Reorder soon" section
+ * reads and applies the same tenant setting, not a second, independent one.
  */
 export default async function InventoryPage({ searchParams }: InventoryPageProps): Promise<ReactElement> {
   const authContext = await getAuthContext(await headers());
@@ -106,7 +113,7 @@ export default async function InventoryPage({ searchParams }: InventoryPageProps
 
   const pool = getAppPool();
   const tenantId = await resolveTenantId(pool, authContext.clerkUserId);
-  const { error, transferred } = await searchParams;
+  const { error, transferred, reorderThresholdUpdated } = await searchParams;
   if (!tenantId) {
     return (
       <main className="page">
@@ -118,7 +125,15 @@ export default async function InventoryPage({ searchParams }: InventoryPageProps
 
   const velocityWindowSince = new Date(Date.now() - VELOCITY_WINDOW_DAYS * 24 * 60 * 60 * 1000);
 
-  const { rows, locations, velocityByKey } = await withTenant(pool, tenantId, async (client) => {
+  const { rows, locations, velocityByKey, reorderThresholdDays } = await withTenant(pool, tenantId, async (client) => {
+    // This tenant's own "reorder soon" threshold (migration 0031) -- RLS
+    // already scopes `tenants` to this one row (see that table's own
+    // policy), the WHERE clause here just mirrors billing-service's own
+    // `SELECT ... FROM tenants WHERE id = $1` convention.
+    const tenantResult = await client.query<{ reorder_threshold_days: number }>(
+      `SELECT reorder_threshold_days FROM tenants WHERE id = $1`,
+      [tenantId],
+    );
     const result = await client.query<InventoryRow>(
       `SELECT il.product_id, il.location_id, il.on_hand, il.reserved, il.available, il.channel_buffer, il.updated_at,
               p.internal_sku, p.name AS product_name, loc.name AS location_name
@@ -149,7 +164,15 @@ export default async function InventoryPage({ searchParams }: InventoryPageProps
       [velocityWindowSince.toISOString()],
     );
     const velocityMap = new Map(velocityResult.rows.map((r) => [`${r.product_id}:${r.location_id}`, Number(r.units_sold)]));
-    return { rows: result.rows, locations: locationsResult.rows, velocityByKey: velocityMap };
+    return {
+      rows: result.rows,
+      locations: locationsResult.rows,
+      velocityByKey: velocityMap,
+      // tenants.reorder_threshold_days is NOT NULL (migration 0031), so this
+      // row always exists once tenantId itself resolved -- no fallback
+      // needed the way a nullable column would require one.
+      reorderThresholdDays: tenantResult.rows[0]!.reorder_threshold_days,
+    };
   });
 
   // Every transferable product already has at least one inventory_levels
@@ -166,7 +189,7 @@ export default async function InventoryPage({ searchParams }: InventoryPageProps
     rows.map((r) => {
       const key = `${r.product_id}:${r.location_id}`;
       const unitsSold = velocityByKey.get(key) ?? 0;
-      return [key, assessStockForecast(r.available, unitsSold, VELOCITY_WINDOW_DAYS)];
+      return [key, assessStockForecast(r.available, unitsSold, VELOCITY_WINDOW_DAYS, reorderThresholdDays)];
     }),
   );
   const reorderSoonCount = [...forecastByKey.values()].filter((f) => f.reorderSoon).length;
@@ -182,14 +205,15 @@ export default async function InventoryPage({ searchParams }: InventoryPageProps
           {lowStockCount > 0 && <span className="badge badge-warning">{lowStockCount} running low</span>}
           {reorderSoonCount > 0 && (
             <span className="badge badge-warning">
-              {reorderSoonCount} reorder soon (≤{DEFAULT_REORDER_THRESHOLD_DAYS}d left)
+              {reorderSoonCount} reorder soon (≤{reorderThresholdDays}d left)
             </span>
           )}
         </div>
       )}
 
       {transferred === "1" && <div className="alert alert-success">Stock transferred.</div>}
-      {error && <div className="alert alert-danger">{describeTransferError(error)}</div>}
+      {reorderThresholdUpdated === "1" && <div className="alert alert-success">Reorder threshold updated.</div>}
+      {error && <div className="alert alert-danger">{describeInventoryError(error)}</div>}
 
       {products.length > 0 && locations.length >= 2 && (
         <details className="stack" style={{ marginBottom: 16 }}>
@@ -197,6 +221,11 @@ export default async function InventoryPage({ searchParams }: InventoryPageProps
           <TransferStockForm products={products} locations={locations} />
         </details>
       )}
+
+      <details className="stack" style={{ marginBottom: 16 }}>
+        <summary>Reorder threshold</summary>
+        <ReorderThresholdForm currentValue={reorderThresholdDays} />
+      </details>
 
       {rows.length === 0 ? (
         <p className="empty">No inventory records yet.</p>
@@ -316,8 +345,43 @@ function TransferStockForm({
   );
 }
 
-function describeTransferError(error: string): string {
-  if (error === "not signed in") return "You must be signed in to transfer stock.";
+/**
+ * The /inventory page's "Reorder threshold" settings form -- POSTs to
+ * /api/inventory/reorder-threshold, same plain-HTML-form-no-client-JS
+ * convention as TransferStockForm right above. `min`/`max` mirror
+ * parseReorderThresholdDays' own bounds (and migration 0031's DB-level
+ * CHECK constraint) -- a browser-level nudge only, the real validation
+ * happens server-side either way, same "never rely on client-side
+ * validation alone" posture every other form in this app already takes.
+ */
+function ReorderThresholdForm({ currentValue }: { currentValue: number }): ReactElement {
+  return (
+    <form
+      action="/api/inventory/reorder-threshold"
+      method="POST"
+      className="row"
+      style={{ gap: 6, marginTop: 8, flexWrap: "wrap", alignItems: "center" }}
+    >
+      <label htmlFor="reorderThresholdDays">Flag a product as &quot;reorder soon&quot; when</label>
+      <input
+        type="number"
+        id="reorderThresholdDays"
+        name="reorderThresholdDays"
+        min={MIN_REORDER_THRESHOLD_DAYS}
+        max={MAX_REORDER_THRESHOLD_DAYS}
+        step="1"
+        defaultValue={currentValue}
+        required
+        style={{ width: 80 }}
+      />
+      <span>or fewer estimated days of stock remain</span>
+      <button type="submit">Save</button>
+    </form>
+  );
+}
+
+function describeInventoryError(error: string): string {
+  if (error === "not signed in") return "You must be signed in to make changes here.";
   if (error === "inventory_transfer_missing_fields") return "Choose a product, both locations, and a quantity before submitting.";
   if (error === "inventory_transfer_same_location") return "The source and destination locations must be different.";
   if (error === "inventory_transfer_invalid_quantity") return "Quantity must be a positive whole number.";
@@ -328,6 +392,9 @@ function describeTransferError(error: string): string {
   }
   if (error.startsWith("inventory_transfer_failed:")) {
     return `Could not transfer stock: ${error.slice("inventory_transfer_failed:".length)}`;
+  }
+  if (error === "inventory_reorder_threshold_invalid") {
+    return `Reorder threshold must be a whole number of days between ${MIN_REORDER_THRESHOLD_DAYS} and ${MAX_REORDER_THRESHOLD_DAYS}.`;
   }
   return error;
 }
