@@ -12,11 +12,21 @@ export const dynamic = "force-dynamic";
  * clocked in", not a zero-length shift, per migration 0028's own comment).
  * Refuses a second concurrent open shift for the same employee rather than
  * silently creating overlapping entries that would double-count hours in
- * task #33's gross-wage calculation -- the checked SELECT + INSERT run
- * inside one withTenant transaction, so a double-submit from the same page
- * either both see the same open entry (second one rejected) or both race
- * fresh (Postgres row-level locking within the transaction serializes them,
- * since both write the same employee_id).
+ * task #33's gross-wage calculation.
+ *
+ * The checked SELECT ... FOR UPDATE below is only a fast, friendly
+ * early-exit for the common sequential case (an employee who's already
+ * clocked in clicking the button again) -- it does NOT by itself prevent
+ * the race migration 0029 closes: `FOR UPDATE` only locks rows that
+ * already exist, and when there's no open shift yet (the common case),
+ * that SELECT returns zero rows and locks nothing, so two genuinely
+ * concurrent clock-ins for the same employee could both see "no open
+ * shift" and both INSERT. The real guarantee is
+ * `idx_time_entries_one_open_shift_per_employee` (migration 0029), a
+ * partial UNIQUE index on `(tenant_id, employee_id) WHERE clock_out IS
+ * NULL` -- a second concurrent INSERT fails with a real unique_violation
+ * (23505), caught below the same way /api/products/create already catches
+ * a duplicate-SKU 23505.
  */
 export async function POST(req: NextRequest): Promise<Response> {
   const user = await requireCurrentUser(req, getAppPool());
@@ -49,6 +59,13 @@ export async function POST(req: NextRequest): Promise<Response> {
     });
   } catch (err) {
     if (errorMessage(err) === "already_clocked_in") {
+      return redirectWithError(req, "/hr", "time_entry_already_clocked_in");
+    }
+    // Postgres unique_violation on idx_time_entries_one_open_shift_per_employee
+    // (migration 0029) -- the real guard against two concurrent clock-ins for
+    // the same employee both racing past the SELECT above and both INSERTing.
+    const pgCode = (err as { code?: string } | null)?.code;
+    if (pgCode === "23505") {
       return redirectWithError(req, "/hr", "time_entry_already_clocked_in");
     }
     return redirectWithError(req, "/hr", `time_entry_clock_in_failed:${errorMessage(err)}`);

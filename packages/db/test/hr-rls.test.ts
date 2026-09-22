@@ -160,3 +160,80 @@ test("time_entries: CHECK constraint rejects clock_out at or before clock_in", a
     /violates check constraint/i,
   );
 });
+
+// Migration 0029's own regression coverage -- proves the real concurrency
+// guarantee /api/hr/time-entries/clock-in relies on, not just that the
+// index exists. Found auditing that route: its SELECT ... FOR UPDATE check
+// locks nothing when an employee has no open shift yet (the common case),
+// so two concurrent clock-ins used to be able to both pass that check and
+// both INSERT, leaving two overlapping open shifts for the same employee
+// (which would double-count hours in task #33's gross-wage calculation).
+
+test("time_entries: a second sequential open shift for the same employee is rejected outright", async () => {
+  const employeeA = await insertEmployee(tenantA.tenantId);
+  await withTenant(pool, tenantA.tenantId, (client) =>
+    client.query(`INSERT INTO time_entries (tenant_id, employee_id, clock_in) VALUES ($1, $2, now())`, [
+      tenantA.tenantId,
+      employeeA,
+    ]),
+  );
+
+  await assert.rejects(
+    withTenant(pool, tenantA.tenantId, (client) =>
+      client.query(`INSERT INTO time_entries (tenant_id, employee_id, clock_in) VALUES ($1, $2, now())`, [
+        tenantA.tenantId,
+        employeeA,
+      ]),
+    ),
+    /duplicate key value violates unique constraint "idx_time_entries_one_open_shift_per_employee"/i,
+  );
+});
+
+test("time_entries: exactly 1 of 10 concurrent clock-ins for the same never-yet-clocked-in employee succeeds", async () => {
+  const employeeA = await insertEmployee(tenantA.tenantId);
+  const ATTEMPTS = 10;
+
+  // Reproduces /api/hr/time-entries/clock-in/route.ts's own transaction
+  // shape exactly (SELECT ... FOR UPDATE, then INSERT if nothing open) --
+  // not a simplified stand-in -- so this proves the real route's logic is
+  // safe under concurrency, not just that a raw INSERT is.
+  async function attemptClockIn(): Promise<"clocked_in" | "already_clocked_in"> {
+    try {
+      await withTenant(pool, tenantA.tenantId, async (client) => {
+        const open = await client.query(
+          `SELECT id FROM time_entries WHERE tenant_id = $1 AND employee_id = $2 AND clock_out IS NULL FOR UPDATE`,
+          [tenantA.tenantId, employeeA],
+        );
+        if ((open.rowCount ?? 0) > 0) {
+          throw new Error("already_clocked_in");
+        }
+        await client.query(
+          `INSERT INTO time_entries (tenant_id, employee_id, clock_in, entry_source) VALUES ($1, $2, now(), 'clock')`,
+          [tenantA.tenantId, employeeA],
+        );
+      });
+      return "clocked_in";
+    } catch (err) {
+      const pgCode = (err as { code?: string } | null)?.code;
+      if (pgCode === "23505" || (err as Error).message === "already_clocked_in") {
+        return "already_clocked_in";
+      }
+      throw err;
+    }
+  }
+
+  const results = await Promise.all(Array.from({ length: ATTEMPTS }, () => attemptClockIn()));
+  const clockedIn = results.filter((r) => r === "clocked_in").length;
+  const rejected = results.filter((r) => r === "already_clocked_in").length;
+
+  assert.equal(clockedIn, 1, "exactly one concurrent clock-in must succeed");
+  assert.equal(rejected, ATTEMPTS - 1, "every other concurrent clock-in must be rejected, none silently duplicated");
+
+  const openShifts = await withTenant(pool, tenantA.tenantId, (client) =>
+    client.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM time_entries WHERE tenant_id = $1 AND employee_id = $2 AND clock_out IS NULL`,
+      [tenantA.tenantId, employeeA],
+    ),
+  );
+  assert.equal(openShifts.rows[0]?.count, "1", "the employee must end up with exactly one open shift, never two");
+});

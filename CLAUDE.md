@@ -1917,14 +1917,42 @@ from there.
   locations/orders/picklists). `POST /api/hr/time-entries/clock-in` /
   `[id]/clock-out` drive the per-employee "Clock in"/"Clock out" button pair (only
   one button renders per employee, whichever their current open-shift state calls
-  for); `clock-in` refuses a second concurrent open shift for the same employee
-  (`SELECT ... FOR UPDATE` inside the same transaction as the INSERT) so task #33's
-  hours sum can never double-count an overlapping pair. `POST
-  /api/hr/time-entries/manual` adds a shift after the fact — still a real
-  clock_in/clock_out pair (`clockIn` + `hours` computes `clockOut` server-side), not
-  a separate shape; flagged there as a known limitation that `datetime-local`'s
-  timezone-free string is parsed in the *server's* local timezone, not the
-  browser's, since no tenant-timezone setting exists anywhere in this schema yet.
+  for); `clock-in` refuses a second open shift for the same employee so task #33's
+  hours sum can never double-count an overlapping pair — see the real-concurrency
+  fix below, since the obvious-looking guard here (`SELECT ... FOR UPDATE`) turned
+  out not to be enough on its own. `POST /api/hr/time-entries/manual` adds a shift
+  after the fact — still a real clock_in/clock_out pair (`clockIn` + `hours`
+  computes `clockOut` server-side), not a separate shape; flagged there as a known
+  limitation that `datetime-local`'s timezone-free string is parsed in the
+  *server's* local timezone, not the browser's, since no tenant-timezone setting
+  exists anywhere in this schema yet.
+  - **Concurrency gap found and fixed (routine audit, not production)** — closing
+    a real gap this section itself used to imply was already closed: `clock-in`'s
+    `SELECT id FROM time_entries WHERE ... clock_out IS NULL FOR UPDATE` only locks
+    ROWS THAT ALREADY EXIST. When an employee has no open shift yet (the common
+    case — their last shift closed normally, or this is their first ever clock-in),
+    that SELECT returns zero rows and locks nothing, so two genuinely concurrent
+    clock-ins for the same employee (a double-click, two people at a shared kiosk)
+    could both see "no open shift" and both INSERT — exactly the double-open-shift
+    outcome this route's own doc comment already said it was trying to prevent, via
+    a guard that didn't actually prevent it under real concurrency. Same class of
+    bug CLAUDE.md's own allocation/transfer code is careful about elsewhere (§2.2,
+    §3) — missed here because the HR module's business logic lives inline in the
+    route rather than in a service package with its own concurrency test, per
+    `packages/db/test/hr-rls.test.ts`'s own "no HTTP API test suite for these
+    routes yet" admission. **Fixed** the way this codebase always closes this class
+    of gap: at the database, not the application SELECT (migration
+    `0029_time_entries_one_open_shift_per_employee.sql`, a partial UNIQUE index on
+    `time_entries (tenant_id, employee_id) WHERE clock_out IS NULL`). A second
+    concurrent INSERT now fails with a real `unique_violation` (23505), caught by
+    the route the same way `/api/products/create` already catches a duplicate-SKU
+    23505 — same friendly `time_entry_already_clocked_in` redirect error either
+    way. The pre-existing `SELECT ... FOR UPDATE` stays as a fast, friendly
+    early-exit for the common sequential case; it's no longer the correctness
+    guarantee. Regression-tested in `packages/db/test/hr-rls.test.ts` — a direct
+    reproduction of the route's own SELECT+INSERT transaction shape, run 10-way
+    concurrently, proving exactly one clock-in succeeds and the employee never ends
+    up with more than one open shift.
 - **App wiring — `/hr/payroll` (task #33, gross wage calculation)**: a read-only
   report, same "plain Postgres query, not a separate read-optimized store" call
   `/reports` already makes (see its own doc comment) — `from`/`to` date-range GET
