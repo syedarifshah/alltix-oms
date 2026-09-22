@@ -6,6 +6,10 @@
   "outputDirectory": "packages/web/.next",
   "crons": [
     {
+      "path": "/api/cron/rate-limit-window-cleanup",
+      "schedule": "0 3 * * *"
+    },
+    {
       "path": "/api/cron/amazon-order-sync",
       "schedule": "0 4 * * *"
     },

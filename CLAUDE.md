@@ -2644,12 +2644,18 @@ concurrency-sensitive action, not something a legitimate workflow does dozens of
 minute). All comfortably above any plausible human-driven usage, tight enough to stop a
 runaway loop well before it can meaningfully load the database.
 
-**No periodic cleanup job** — `api_rate_limit_windows` grows by one row per
-tenant/route/minute with no expiry in this pass, same "add the infra once actual scale
-demands it" call §15 already makes for not building an operator UI. Negligible at this
-platform's current single-self-testing-tenant stage; a scheduled `DELETE WHERE
-window_start < now() - interval '1 day'` is real, cheap, explicitly deferred future
-work — see the migration's own comment.
+**Periodic cleanup job — built**: `api_rate_limit_windows` grows by one row per
+tenant/route/minute, across every mutation route in the app now (not just the original
+nine) — worth a real cleanup job rather than the "negligible growth, deferred" call this
+section used to make. `cleanupRateLimitWindows` (`packages/scheduler/src/index.ts`)
+deletes every row with `window_start` older than 24 hours, via `adminPool` (this is a
+single cross-tenant maintenance sweep by `window_start` alone, not scoped to one
+tenant — same reasoning `SyncAmazonOrdersParams.adminPool`'s own doc comment gives for
+the scheduler's sync discovery queries). Triggered daily by
+`/api/cron/rate-limit-window-cleanup` (Vercel Cron, `vercel.json`'s `crons` entry, `0 3
+* * *` — before the 4am+ order-sync crons start), same `CRON_SECRET`-authenticated shape
+as every other `/api/cron/*` route; idempotent by construction (re-running it against an
+already-clean table just deletes zero rows).
 
 **Tests**: `packages/web/test/rate-limit.test.ts` covers the two pure functions
 (`computeWindowStart`, `computeRetryAfterSeconds`) — same "extract the pure decision,

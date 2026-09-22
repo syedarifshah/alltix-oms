@@ -1181,6 +1181,41 @@ async function syncShopifyCatalogForTenant(
   };
 }
 
+/** How long an `api_rate_limit_windows` row (migration 0033) is kept before
+ *  {@link cleanupRateLimitWindows} deletes it. A full day, not the 1-minute
+ *  window itself -- a window's own doc comment/CLAUDE.md's "Audit Log" and
+ *  reporting pages keep no comparable retention story, so there's no
+ *  pressure to delete aggressively; a day of history is cheap and useful
+ *  if this table is ever eyeballed for "was a tenant actually rate-limited
+ *  recently," and this job runs daily (see the cron route this backs). */
+const RATE_LIMIT_WINDOW_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Deletes every `api_rate_limit_windows` row (migration 0033) older than
+ * `retentionMs`. Migration 0033's own comment named this exact cleanup as
+ * deferred, cheap future work "once it's worth writing" -- it's worth
+ * writing now that CLAUDE.md §16's rate limiting covers every mutation
+ * route in the app (originally nine, not just the order/picklist/inventory
+ * hot path), so this table grows meaningfully faster than when that
+ * deferral was written.
+ *
+ * Uses `adminPool`, not a per-tenant `withTenant` loop: this is a single
+ * global maintenance sweep across every tenant's rows by `window_start`
+ * alone, the same kind of inherently cross-tenant operation
+ * `SyncAmazonOrdersParams.adminPool`'s own doc comment justifies the admin
+ * connection for elsewhere in this file -- RLS's per-tenant scoping has
+ * nothing to offer a query that isn't about any one tenant. Returns the
+ * number of rows deleted, for the cron route's own response body/logging.
+ */
+export async function cleanupRateLimitWindows(
+  adminPool: Pool,
+  retentionMs: number = RATE_LIMIT_WINDOW_RETENTION_MS,
+): Promise<number> {
+  const cutoff = new Date(Date.now() - retentionMs);
+  const result = await adminPool.query("DELETE FROM api_rate_limit_windows WHERE window_start < $1", [cutoff]);
+  return result.rowCount ?? 0;
+}
+
 // The recurring trigger this file's own header comment above flagged as
 // separate, later infrastructure work -- see cron-runner.ts for why
 // node-cron (not BullMQ) and what "later" means concretely.

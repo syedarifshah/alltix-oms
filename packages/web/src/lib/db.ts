@@ -31,14 +31,14 @@ export function getAppPool(): Pool {
  * exception to "never use DATABASE_URL in application code" documented on
  * getAppPool() above and, at more length, on
  * packages/scheduler/src/index.ts's SyncAmazonOrdersParams.adminPool.
- * "Which tenants have an active Amazon connection" is inherently a
- * cross-tenant query RLS makes impossible through the normal app_user path
- * by design, and the only caller of this pool is
- * api/cron/amazon-order-sync/route.ts, which uses it for exactly that one
- * enumeration query and nothing else -- every subsequent per-tenant
- * operation still goes through getAppPool() via withTenant(), scoped
- * exactly like the rest of the app. Do not reach for this pool anywhere
- * else.
+ * "Which tenants have an active X connection" (or, for
+ * cleanupRateLimitWindows, "every tenant's expired rate-limit rows") is
+ * inherently a cross-tenant operation RLS makes impossible through the
+ * normal app_user path by design. Every `/api/cron/*` route uses this pool
+ * for exactly that one cross-tenant step and nothing else -- every
+ * subsequent per-tenant operation still goes through getAppPool() via
+ * withTenant(), scoped exactly like the rest of the app. Do not reach for
+ * this pool anywhere else.
  */
 export function getAdminPool(): Pool {
   if (!globalThis.__alltixAdminPool) {
