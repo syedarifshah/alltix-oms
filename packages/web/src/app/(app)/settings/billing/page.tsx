@@ -23,6 +23,17 @@ interface BillingPageProps {
  * Checkout/Customer Portal (POST /api/billing/checkout,
  * /api/billing/portal) -- no card-collection UI lives in this app
  * (CLAUDE.md §6).
+ *
+ * summary.usageBasedBillingConfigured (real usage-based billing --
+ * @alltix/billing-service's UsageReporter) decides which of two captions
+ * this page shows under the usage bar: whether going over orderLimit is
+ * still purely informational, or genuinely billed as metered overage on
+ * this tenant's next Checkout. It says nothing about *this* tenant's
+ * current subscription specifically -- it's a platform-wide setting
+ * (STRIPE_METERED_ORDERS_PRICE_ID) -- so a tenant who subscribed before it
+ * was turned on won't see overage billed until they resubscribe through
+ * Checkout again (createCheckoutSession() only adds the metered line item
+ * to *new* Checkout Sessions, see its own doc comment).
  */
 export default async function BillingPage({ searchParams }: BillingPageProps): Promise<ReactElement> {
   const authContext = await getAuthContext(await headers());
@@ -105,7 +116,9 @@ export default async function BillingPage({ searchParams }: BillingPageProps): P
         <div>{summary.skuCount} SKUs</div>
       </div>
       <p className="muted">
-        Usage limits are informational only in this pass — nothing is blocked for being over a limit yet.
+        {summary.usageBasedBillingConfigured
+          ? "Orders beyond the plan limit are billed as metered overage on your next Checkout — nothing is blocked for being over a limit, but going over does cost something now."
+          : "Usage limits are informational only in this pass — nothing is blocked for being over a limit yet."}
       </p>
     </main>
   );

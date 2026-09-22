@@ -15,6 +15,7 @@ import {
 import { InventoryService } from "@alltix/inventory-service";
 import { OrderService } from "@alltix/order-service";
 import { RulesEngine } from "@alltix/rules-engine";
+import { UsageReporter } from "@alltix/billing-service";
 
 // The scheduled job that actually invokes pullOrders()/persistPulledOrders()
 // on a real cadence -- CLAUDE.md §4.4's "Rate-Limited Job Queue" layer,
@@ -357,7 +358,11 @@ export interface SyncAmazonOrdersParams {
  * -- this is the first real (non-test) code path where that wiring exists:
  * a routing rule genuinely gets a chance to run before allocation for a
  * real sandbox order pulled through this job, not just in
- * order-received-integration.test.ts's direct construction.
+ * order-received-integration.test.ts's direct construction. UsageReporter
+ * (@alltix/billing-service) is attached the same way, alongside RulesEngine
+ * -- every real order.received event now has two independent subscribers,
+ * neither aware of the other, exactly the decoupling CLAUDE.md §1's Event
+ * Bus section describes.
  */
 export async function syncAmazonOrders(params: SyncAmazonOrdersParams): Promise<TenantSyncResult[]> {
   const { appPool, adminPool, eventBus } = params;
@@ -365,6 +370,8 @@ export async function syncAmazonOrders(params: SyncAmazonOrdersParams): Promise<
   const orderService = new OrderService(appPool, eventBus);
   const rulesEngine = new RulesEngine(appPool);
   rulesEngine.attach(eventBus);
+  const usageReporter = new UsageReporter(appPool);
+  usageReporter.attach(eventBus);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
     `SELECT DISTINCT tenant_id FROM channel_connections
@@ -475,6 +482,8 @@ export async function syncShopifyOrders(params: SyncAmazonOrdersParams): Promise
   const orderService = new OrderService(appPool, eventBus);
   const rulesEngine = new RulesEngine(appPool);
   rulesEngine.attach(eventBus);
+  const usageReporter = new UsageReporter(appPool);
+  usageReporter.attach(eventBus);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
     `SELECT DISTINCT tenant_id FROM channel_connections
@@ -571,6 +580,8 @@ export async function syncWalmartOrders(params: SyncAmazonOrdersParams): Promise
   const orderService = new OrderService(appPool, eventBus);
   const rulesEngine = new RulesEngine(appPool);
   rulesEngine.attach(eventBus);
+  const usageReporter = new UsageReporter(appPool);
+  usageReporter.attach(eventBus);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
     `SELECT DISTINCT tenant_id FROM channel_connections
@@ -669,6 +680,8 @@ export async function syncEbayOrders(params: SyncAmazonOrdersParams): Promise<Te
   const orderService = new OrderService(appPool, eventBus);
   const rulesEngine = new RulesEngine(appPool);
   rulesEngine.attach(eventBus);
+  const usageReporter = new UsageReporter(appPool);
+  usageReporter.attach(eventBus);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
     `SELECT DISTINCT tenant_id FROM channel_connections
@@ -767,6 +780,8 @@ export async function syncTemuOrders(params: SyncAmazonOrdersParams): Promise<Te
   const orderService = new OrderService(appPool, eventBus);
   const rulesEngine = new RulesEngine(appPool);
   rulesEngine.attach(eventBus);
+  const usageReporter = new UsageReporter(appPool);
+  usageReporter.attach(eventBus);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
     `SELECT DISTINCT tenant_id FROM channel_connections
@@ -864,6 +879,8 @@ export async function syncTikTokOrders(params: SyncAmazonOrdersParams): Promise<
   const orderService = new OrderService(appPool, eventBus);
   const rulesEngine = new RulesEngine(appPool);
   rulesEngine.attach(eventBus);
+  const usageReporter = new UsageReporter(appPool);
+  usageReporter.attach(eventBus);
 
   const tenants = await adminPool.query<{ tenant_id: string }>(
     `SELECT DISTINCT tenant_id FROM channel_connections

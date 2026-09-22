@@ -1785,7 +1785,76 @@ eBay/Temu v1" scope decision.
   no-op; a non-string value throws; a blank string falls back to the
   default message) — all against real seeded `tenants`/`users` rows, not
   mocks, same rigor `sync-failure-tracking.test.ts`'s own
-  `notifyTenantUsers()` test already established. Returns
+  `notifyTenantUsers()` test already established.
+
+  **Real usage-based billing — built**, closing the other half of §1's
+  Billing/Subscription line ("usage metering ... for tiered SaaS pricing")
+  that basic Stripe Checkout/Portal wiring (`@alltix/billing-service` — one
+  flat plan, webhook-driven subscription status, `tenant_usage.orders_processed`
+  displayed but not billed against) left open; that migration's own doc
+  comment (`0016_billing.sql`) explicitly named this counter "the seed of a
+  real Stripe usage-record report later," so this isn't scope creep, it's
+  finishing a call already made. This SDK version (`stripe@22.6.1`, API
+  version confirmed against `node_modules/stripe/cjs/apiVersion.js`) has no
+  legacy `subscriptionItems.createUsageRecord` — usage reporting goes
+  through the modern Billing Meters API instead
+  (`stripe.billing.meterEvents.create`/`stripe.billing.meters.create`,
+  confirmed against the installed SDK's own type definitions before writing
+  any of this, not assumed from training data). A new `UsageReporter`
+  class (`packages/billing-service/src/index.ts`) subscribes to
+  `order.received` on the same `EventBus` `RulesEngine` already does —
+  deliberately mirroring its decoupled-subscriber pattern rather than
+  calling Stripe from inside `OrderService.persistPulledOrders()` itself —
+  and reports one metered usage unit per order via
+  `buildOrderUsageMeterEventParams()` (pure, unit-tested), whose
+  `identifier` (`order-usage:<orderId>`) doubles as Stripe's own
+  idempotency key for the Meter Events API (dedupes "within a rolling
+  period of at least 24 hours" per the installed types), the same
+  idempotency-key discipline `inventory_events.idempotency_key` already
+  applies to the stock ledger. Deliberately silent and best-effort like
+  every other optional integration in this codebase, with two guard
+  clauses before ever touching Stripe: `STRIPE_SECRET_KEY` unset (most
+  environments, including this one) is a same-shape no-op to `sendEmail()`'s
+  own unset-key behavior, and a tenant with no `stripe_customer_id` yet
+  (never visited `/settings/billing`) is skipped rather than lazily
+  Stripe-customer-created from a background job. Unlike `sendEmail()`
+  (console-log-only on failure), a thrown error from the actual Stripe call
+  is reported via `captureError()` — a usage report that silently and
+  systematically fails is a revenue-metering bug worth paging on, not
+  merely cosmetic. Only subscribes to `order.received`, not
+  `order.backordered` — `persistPulledOrders()` increments
+  `tenant_usage.orders_processed` unconditionally on insert, before
+  allocation runs, so counting a backorder again would double-count the
+  same order. `createCheckoutSession()` now adds a second, `quantity`-less
+  metered line item (`buildCheckoutSessionLineItems()`, pure, unit-tested)
+  when `STRIPE_METERED_ORDERS_PRICE_ID` is configured — omitted entirely,
+  not just inert, when it isn't, so this stays fully backward-compatible
+  for any tenant who already subscribed before this existed. That price is
+  itself created (idempotently, mirroring `stripe-setup-mvp-plan.ts`'s own
+  conventions) by the new `scripts/stripe-setup-usage-metered-price.ts`: a
+  Billing Meter plus a `tiers_mode: 'graduated'` metered Price whose first
+  tier (`up_to: MVP_PLAN_ORDER_LIMIT_PER_MONTH`) is free and whose second
+  (`up_to: 'inf'`) charges a placeholder per-order rate — giving
+  `MVP_PLAN_ORDER_LIMIT_PER_MONTH` a second, now load-bearing meaning
+  beyond the display-only number `getBillingSummary()` already showed.
+  `/settings/billing`'s own caption now reads differently depending on
+  `BillingSummary.usageBasedBillingConfigured` (`Boolean(process.env.
+  STRIPE_METERED_ORDERS_PRICE_ID)`), so it never claims overage is
+  "informational only" once it genuinely isn't. Testing note worth being
+  explicit about, same carve-out reasoning as `AMAZON_SANDBOX_TESTS` in
+  `scripts/run-tests.sh`: this SDK's default HTTP client is Node's own
+  `http`/`https` modules, not `fetch`, so it can't be intercepted the
+  lightweight way this codebase already overrides `globalThis.fetch` for
+  Resend — `packages/billing-service/test/usage-reporter.test.ts` therefore
+  proves the pure param-building functions directly and proves
+  `UsageReporter` never reaches a real Stripe call under either guard
+  clause (key unset; no customer yet, even with a fake key set) rather than
+  mocking a live Meter Event call; genuinely verifying delivery is a manual
+  step (run the setup script with a real test-mode key, trigger a real
+  sync, check the Stripe Dashboard's Meters view), same as this repo has
+  never had a stripe-mock server wired in.
+
+  Returns
   handling — **built**, see §2.2/§3. Rate-limit
   hardening, circuit breakers — **built**, see §4.4. Observability dashboards —
   **built**, see §13: Sentry is wired end-to-end across packages/web and every

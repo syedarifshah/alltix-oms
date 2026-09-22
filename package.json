@@ -24,6 +24,7 @@
     "amazon:order-sync-job": "tsx scripts/amazon-order-sync-job.ts",
     "amazon:order-sync-scheduler": "tsx scripts/amazon-order-sync-scheduler.ts",
     "stripe:setup-mvp-plan": "tsx scripts/stripe-setup-mvp-plan.ts",
+    "stripe:setup-usage-metered-price": "tsx scripts/stripe-setup-usage-metered-price.ts",
     "shopify:sandbox-smoke-test": "tsx scripts/shopify-sandbox-smoke-test.ts",
     "shopify:order-sync-job": "tsx scripts/shopify-order-sync-job.ts",
     "shopify:order-sync-scheduler": "tsx scripts/shopify-order-sync-scheduler.ts",

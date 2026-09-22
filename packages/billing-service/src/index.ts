@@ -1,6 +1,13 @@
 import Stripe from "stripe";
 import type { Pool } from "pg";
 import { withTenant, withStripeCustomer } from "@alltix/db";
+import {
+  DomainEvent,
+  captureError,
+  type DomainEventEnvelope,
+  type EventBus,
+  type OrderReceivedPayload,
+} from "@alltix/shared";
 
 // Billing/Subscription module (CLAUDE.md §1, §5 Stripe Billing) -- basic
 // scope per CLAUDE.md §8 Phase 2: Stripe Customer + hosted Checkout/Portal,
@@ -11,6 +18,22 @@ import { withTenant, withStripeCustomer } from "@alltix/db";
 // Checked before writing any of this: no Stripe dependency, API key
 // reference, webhook route, or stripe-prefixed table existed anywhere in
 // this repo -- this is genuinely new, not wiring up something half-built.
+//
+// UPDATE (real usage-based billing): the deferral above is now partly
+// lifted. tenant_usage.orders_processed (migration 0016_billing.sql) was
+// explicitly pre-architected as "the seed of a real Stripe usage-record
+// report later" -- see that migration's own doc comment -- and this file
+// now closes that gap via {@link UsageReporter}, an EventBus subscriber that
+// reports each persisted order to Stripe's Billing Meters API. This SDK
+// version (confirmed against node_modules/stripe/cjs/apiVersion.js) predates
+// nothing here -- the legacy `subscriptionItems.createUsageRecord` API is
+// gone from it, so this deliberately uses the modern
+// `stripe.billing.meterEvents.create` / `stripe.billing.meters.create` calls
+// (confirmed against the installed SDK's own type definitions, not assumed
+// from training data -- see node_modules/stripe/esm/resources/Billing/
+// {MeterEvents,Meters,Prices}.d.ts). Multi-tier pricing is still not built;
+// this adds one metered dimension (orders processed) alongside the existing
+// flat plan, not a pricing matrix.
 
 function readRequiredEnv(name: string): string {
   const value = process.env[name];
@@ -42,6 +65,13 @@ export function getStripeClient(): Stripe {
  *  in this pass blocks a sync or a write once a tenant is over it. */
 export const MVP_PLAN_ORDER_LIMIT_PER_MONTH = 500;
 
+/** Stripe Billing Meter event_name for order-usage reporting (see
+ *  {@link UsageReporter}) -- also the `event_name` a metered Price must be
+ *  configured against (scripts/stripe-setup-usage-metered-price.ts creates
+ *  both the Meter and the Price with this same name, so they can never
+ *  drift apart). */
+export const ORDERS_PROCESSED_METER_EVENT_NAME = "orders_processed";
+
 export interface BillingSummary {
   hasStripeCustomer: boolean;
   subscriptionStatus: string | null;
@@ -49,6 +79,14 @@ export interface BillingSummary {
   ordersThisMonth: number;
   orderLimit: number;
   skuCount: number;
+  /** True once STRIPE_METERED_ORDERS_PRICE_ID is set -- i.e. once real
+   *  usage-based overage billing (not just the display-only orderLimit
+   *  above) is actually wired up for new subscriptions. Lets
+   *  /settings/billing say plainly whether going over orderLimit today
+   *  means anything, instead of always showing the same "informational
+   *  only" caveat regardless of how this tenant's plan is actually
+   *  configured. */
+  usageBasedBillingConfigured: boolean;
 }
 
 /**
@@ -99,19 +137,49 @@ export interface CreateCheckoutSessionParams {
   cancelUrl: string;
 }
 
+/** Pure -- builds the Checkout Session line items for the flat MVP plan
+ *  plus, when configured, the metered orders-processed price. Split out
+ *  from {@link createCheckoutSession} so this shape (no `quantity` on the
+ *  metered item -- the Checkout Session type's own doc comment is explicit
+ *  that "Quantity should not be defined when recurring.usage_type=metered",
+ *  confirmed against node_modules/stripe/esm/resources/Checkout/Sessions.d.ts)
+ *  is testable without a real Stripe call. `meteredPriceId` is optional and
+ *  omitted entirely -- not just left inert -- when unset, so a tenant
+ *  subscribing before STRIPE_METERED_ORDERS_PRICE_ID exists gets exactly the
+ *  same one-line-item Checkout Session this always created; running
+ *  scripts/stripe-setup-usage-metered-price.ts and setting the env var is
+ *  what turns real usage-based overage billing on for every *subsequent*
+ *  checkout, without touching this function again. */
+export function buildCheckoutSessionLineItems(
+  flatPriceId: string,
+  meteredPriceId?: string,
+): Stripe.Checkout.SessionCreateParams.LineItem[] {
+  const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = [{ price: flatPriceId, quantity: 1 }];
+  if (meteredPriceId) {
+    lineItems.push({ price: meteredPriceId });
+  }
+  return lineItems;
+}
+
 /** Starts a subscription via Stripe's hosted Checkout -- no custom card
  *  form anywhere in this app (CLAUDE.md §6: raw card data never touches
  *  this app directly). `client_reference_id` is set alongside the
  *  `customer` link purely for traceability in the Stripe Dashboard; the
- *  webhook handler resolves the tenant via `customer`, not this field. */
+ *  webhook handler resolves the tenant via `customer`, not this field.
+ *
+ *  Adds a second, metered line item (orders processed) when
+ *  STRIPE_METERED_ORDERS_PRICE_ID is configured -- see
+ *  {@link buildCheckoutSessionLineItems}'s doc comment for why this is
+ *  fully backward-compatible when it isn't. */
 export async function createCheckoutSession(pool: Pool, params: CreateCheckoutSessionParams): Promise<{ url: string }> {
   const customerId = await getOrCreateStripeCustomer(pool, params.tenantId);
   const priceId = readRequiredEnv("STRIPE_MVP_PRICE_ID");
+  const meteredPriceId = process.env.STRIPE_METERED_ORDERS_PRICE_ID || undefined;
 
   const session = await getStripeClient().checkout.sessions.create({
     mode: "subscription",
     customer: customerId,
-    line_items: [{ price: priceId, quantity: 1 }],
+    line_items: buildCheckoutSessionLineItems(priceId, meteredPriceId),
     success_url: params.successUrl,
     cancel_url: params.cancelUrl,
     client_reference_id: params.tenantId,
@@ -315,6 +383,123 @@ export async function getBillingSummary(pool: Pool, tenantId: string): Promise<B
       ordersThisMonth: usageResult.rows[0]?.orders_processed ?? 0,
       orderLimit: MVP_PLAN_ORDER_LIMIT_PER_MONTH,
       skuCount: Number(skuResult.rows[0]?.count ?? 0),
+      usageBasedBillingConfigured: Boolean(process.env.STRIPE_METERED_ORDERS_PRICE_ID),
     };
   });
+}
+
+/** Pure -- builds the Meter Event params for one persisted order, given the
+ *  tenant's already-resolved Stripe customer id (see
+ *  {@link UsageReporter.handleOrderReceived} for why resolving that id is
+ *  its caller's job, not this function's). `payload` supplies exactly the
+ *  two keys a Meter's default `customer_mapping`/`value_settings` expect
+ *  (`stripe_customer_id` / `value`, both confirmed default event_payload_key
+ *  values against node_modules/stripe/esm/resources/Billing/Meters.d.ts) --
+ *  scripts/stripe-setup-usage-metered-price.ts creates the Meter without
+ *  overriding either, so this never needs to know a different key name.
+ *
+ *  `identifier` doubles as Stripe's own idempotency key: the Meter Events
+ *  API rejects/dedupes a repeated identifier "within a rolling period of at
+ *  least 24 hours" (same doc file). Deriving it from `orderId` alone --
+ *  never a random value -- means a redelivered or retried order.received
+ *  event (EventBus.publish() already tolerates and retries nothing itself,
+ *  but a future at-least-once bus, or simply two sync passes somehow
+ *  re-publishing for the same order, would) reports that order's usage at
+ *  most once, the same idempotency-key discipline
+ *  inventory_events.idempotency_key already applies to the ledger. */
+export function buildOrderUsageMeterEventParams(stripeCustomerId: string, orderId: string): Stripe.Billing.MeterEventCreateParams {
+  return {
+    event_name: ORDERS_PROCESSED_METER_EVENT_NAME,
+    identifier: `order-usage:${orderId}`,
+    payload: {
+      stripe_customer_id: stripeCustomerId,
+      value: "1",
+    },
+  };
+}
+
+/**
+ * Reports each persisted order to Stripe as one unit of metered usage
+ * (CLAUDE.md §1 Billing/Subscription's "usage metering," and
+ * migration 0016_billing.sql's own doc comment naming this exact feature as
+ * the intended next step for tenant_usage). An EventBus subscriber, not a
+ * change to order-service or a call inlined into
+ * OrderService.persistPulledOrders() -- mirrors RulesEngine's own
+ * decoupled-subscriber pattern exactly (packages/rules-engine/src/index.ts's
+ * class doc comment): order-service publishes `order.received` without
+ * knowing or caring that Stripe usage reporting is one of its subscribers,
+ * the same way it doesn't know about rule evaluation.
+ *
+ * Subscribes to `order.received` only, not `order.backordered` -- a
+ * backordered order was already counted as "processed" the moment it was
+ * received (persistPulledOrders() increments tenant_usage.orders_processed
+ * unconditionally on insert, before allocation even runs -- see
+ * packages/order-service/src/index.ts), so reporting it again on backorder
+ * would double-count the same order's usage.
+ *
+ * Deliberately silent, best-effort, and never throws back into
+ * EventBus.publish() -- same "email is additive, not load-bearing"
+ * precedent RulesEngine's send_notification and
+ * packages/scheduler/src/index.ts's notifyTenantUsers() already establish,
+ * applied here to a different external call: a Stripe outage or a
+ * misconfigured price must never be able to affect order ingestion, which
+ * is why this owns its own try/catch rather than relying on
+ * InProcessEventBus's own per-subscriber catch (CLAUDE.md's oversell-safety
+ * concerns are about the allocation path, and this must never become a
+ * reason that path degrades). Unlike sendEmail() (which only logs), a
+ * failure here is reported via captureError() -- a usage report that
+ * silently and systematically fails is a revenue-metering bug worth paging
+ * on, not merely cosmetic (see packages/shared/src/observability.ts's own
+ * captureError() doc comment on that distinction).
+ */
+export class UsageReporter {
+  constructor(private readonly pool: Pool) {}
+
+  /** Registers this subscriber on `eventBus` -- called once during service
+   *  wiring alongside RulesEngine.attach(), same eventBus OrderService
+   *  publishes on (see packages/scheduler/src/index.ts's six syncXOrders()
+   *  functions for where both are wired together). */
+  attach(eventBus: EventBus): void {
+    eventBus.subscribe<OrderReceivedPayload>(DomainEvent.OrderReceived, (event) => this.handleOrderReceived(event));
+  }
+
+  private async handleOrderReceived(event: DomainEventEnvelope<OrderReceivedPayload>): Promise<void> {
+    // Mirrors sendEmail()'s own unset-key no-op (packages/shared/src/email.ts):
+    // STRIPE_SECRET_KEY is unset in most environments (dev, CI, and any
+    // tenant who hasn't been handed real credentials yet) -- this must stay
+    // completely inert rather than throwing readRequiredEnv()'s error on
+    // every single order pulled. Checked directly (not via getStripeClient(),
+    // which throws) so this never constructs a Stripe client at all when
+    // unconfigured.
+    if (!process.env.STRIPE_SECRET_KEY) {
+      return;
+    }
+
+    const { tenantId, payload } = event;
+    try {
+      const stripeCustomerId = await withTenant(this.pool, tenantId, async (client) => {
+        const result = await client.query<{ stripe_customer_id: string | null }>(
+          `SELECT stripe_customer_id FROM tenants WHERE id = $1`,
+          [tenantId],
+        );
+        return result.rows[0]?.stripe_customer_id ?? null;
+      });
+
+      // No Stripe customer yet -- this tenant has never visited
+      // /settings/billing (getOrCreateStripeCustomer is what lazily creates
+      // one, on that page's first load). Deliberately does NOT create one
+      // here: usage metering only means something once there's a
+      // subscription to meter against, and lazily creating a bare customer
+      // from a background sync job -- with no email, no checkout, nothing --
+      // would just be Stripe Dashboard clutter for a tenant that never
+      // subscribed.
+      if (!stripeCustomerId) {
+        return;
+      }
+
+      await getStripeClient().billing.meterEvents.create(buildOrderUsageMeterEventParams(stripeCustomerId, payload.orderId));
+    } catch (err) {
+      captureError(err, { tenantId, orderId: payload.orderId, context: "UsageReporter.handleOrderReceived" });
+    }
+  }
 }
