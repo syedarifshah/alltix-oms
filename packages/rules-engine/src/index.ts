@@ -38,9 +38,40 @@ export interface ResolvedAction {
  *  {@link RulesEngine.handleOrderEvent}'s doc comment for why the send
  *  itself is deliberately outside that method's DB transaction. */
 export interface RuleNotification {
+  kind: "notification";
   subject: string;
   text: string;
 }
+
+/** An outbound HTTP call a `webhook` action wants made, built (pure, no I/O)
+ *  during rule execution and actually dispatched afterward -- same
+ *  "collect during the transaction, fire after it commits" discipline
+ *  {@link RuleNotification} already established, applied to a second kind
+ *  of outbound call. See {@link RulesEngine.buildRuleWebhookCall} for the
+ *  validation `url` has already passed by the time this is constructed. */
+export interface RuleWebhookCall {
+  kind: "webhook";
+  url: string;
+  body: Record<string, unknown>;
+}
+
+/** Either a `send_notification` action's email or a `webhook` action's HTTP
+ *  call -- collected together in {@link RulesEngine.handleOrderEvent} into
+ *  one `pendingSideEffects` list (rather than two separately-typed lists)
+ *  so adding a future third kind of deferred side effect is one more union
+ *  member and one more `case`, not a third parallel array threaded through
+ *  the same method. */
+export type RuleSideEffect = RuleNotification | RuleWebhookCall;
+
+/** Outbound webhook POSTs time out after this long rather than hanging --
+ *  a slow or unresponsive tenant-configured endpoint must never be able to
+ *  stall the rules engine (there is nothing else waiting on this call by
+ *  the time it fires -- see handleOrderEvent's doc comment -- but an
+ *  unbounded wait would still tie up a Node event-loop timer/socket
+ *  indefinitely for no reason). Five seconds is a generous, arbitrary
+ *  default -- no SLA has been promised to tenants about webhook delivery
+ *  speed. */
+export const WEBHOOK_TIMEOUT_MS = 5000;
 
 function getByPath(obj: unknown, path: string): unknown {
   return path.split(".").reduce<unknown>((current, key) => {
@@ -79,6 +110,43 @@ function matchesConditions(conditions: AutomationRuleCondition[], payload: unkno
   });
 }
 
+/** Hostnames/IP literals a `webhook` action's URL is never allowed to
+ *  target -- loopback, link-local (including 169.254.169.254, the AWS/GCP/
+ *  Azure instance-metadata endpoint every cloud SSRF writeup calls out
+ *  first), private RFC1918/ULA ranges, and bare `localhost`/`*.local`.
+ *  Exported and pure so it's directly unit-testable without constructing a
+ *  whole rule/action. A deliberately honest, DOCUMENTED limitation (see
+ *  {@link RulesEngine.buildRuleWebhookCall}'s own doc comment): this checks
+ *  the literal hostname/IP text in the URL a tenant typed, not the IP
+ *  address `fetch()` actually resolves and connects to at request time --
+ *  it does not defend against DNS rebinding (a public-looking hostname
+ *  whose DNS record points at an internal address). Full protection would
+ *  mean resolving DNS here first and validating *that* IP, then pinning the
+ *  connection to it -- meaningfully more infrastructure than this pass
+ *  builds; flagged here rather than silently left as an unstated gap. */
+export function isBlockedWebhookHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  if (lower === "localhost" || lower.endsWith(".local")) return true;
+
+  // IPv6 literals arrive bracketed in a URL's hostname, e.g. "[::1]" --
+  // URL.hostname strips the brackets, so this compares the bare form.
+  if (lower === "::1" || lower.startsWith("fe80:") || lower.startsWith("fc") || lower.startsWith("fd")) return true;
+
+  const ipv4Match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(lower);
+  if (!ipv4Match) return false; // a normal DNS hostname -- not an IP literal at all
+  const octets = ipv4Match.slice(1, 5).map(Number);
+  if (octets.some((o) => o > 255)) return false; // not actually a valid IPv4 literal
+  const [a, b] = octets as [number, number, number, number];
+  return (
+    a === 127 || // loopback
+    a === 10 || // RFC1918
+    (a === 172 && b >= 16 && b <= 31) || // RFC1918
+    (a === 192 && b === 168) || // RFC1918
+    (a === 169 && b === 254) || // link-local, incl. cloud metadata endpoint
+    a === 0 // "this network"
+  );
+}
+
 /**
  * Evaluates stored condition -> action `automation_rules` against incoming
  * domain events (CLAUDE.md §1). Deliberately built as its own module rather
@@ -96,8 +164,9 @@ function matchesConditions(conditions: AutomationRuleCondition[], payload: unkno
  * created_at ascending (the rule made first wins -- an explicable story,
  * unlike an arbitrary id comparison). The algorithm is action-type-general,
  * not hardcoded to routing, so it didn't need reworking when a second
- * action type ('hold_order', see {@link executeAction}) was added, or a
- * third ('send_notification', same section).
+ * action type ('hold_order', see {@link executeAction}) was added, a
+ * third ('send_notification', same section), or a fourth ('webhook',
+ * same section).
  *
  * Two trigger events, not one: `order.received` (the original) and
  * `order.backordered` (added alongside `send_notification` -- a backorder
@@ -225,32 +294,35 @@ export class RulesEngine {
    * reasoning EventBus.publish() applies one level up for a whole
    * subscriber's failure.
    *
-   * `send_notification` actions are collected into `pendingNotifications`
-   * rather than dispatched inline from inside {@link executeAction} --
-   * deliberately, and NOT sent until after the surrounding `withTenant`
-   * transaction has committed. sendEmail() makes a real outbound HTTP
-   * request; making that request while still holding open the same
-   * transaction that's writing `rule_executions` (and, for a matched
-   * `hold_order`, the order's own status) would tie this transaction's
-   * lifetime -- and the connection it holds from the pool -- to an external
-   * service's latency, for no benefit (email delivery has no bearing on
-   * whether the rest of this transaction should commit). Same
-   * "email is additive, not load-bearing" precedent
-   * packages/scheduler/src/index.ts's recordSyncFailure() already
-   * establishes by calling its own notifyTenantUsers() only after its
-   * UPDATE's transaction returns -- this mirrors that, at the level of one
-   * whole rule-execution transaction rather than one UPDATE. A consequence
-   * worth being explicit about: a `send_notification` action's own
-   * `rule_executions` row always records `applied: true, error: null` once
-   * its message is built (building the message can't itself fail -- see
-   * {@link buildRuleNotification}), regardless of whether the email actually
-   * gets delivered afterward -- sendEmail() itself never throws and logs its
-   * own failures, matching every other place in this codebase email is
-   * fire-and-forget best-effort, not a tracked outcome.
+   * `send_notification` and `webhook` actions are collected into
+   * `pendingSideEffects` ({@link RuleSideEffect}) rather than dispatched
+   * inline from inside {@link executeAction} -- deliberately, and NOT fired
+   * until after the surrounding `withTenant` transaction has committed.
+   * Both make a real outbound HTTP request; making that request while still
+   * holding open the same transaction that's writing `rule_executions` (and,
+   * for a matched `hold_order`, the order's own status) would tie this
+   * transaction's lifetime -- and the connection it holds from the pool --
+   * to an external service's latency, for no benefit (neither an email nor
+   * a tenant's own webhook endpoint has any bearing on whether the rest of
+   * this transaction should commit). Same "email is additive, not
+   * load-bearing" precedent packages/scheduler/src/index.ts's
+   * recordSyncFailure() already establishes by calling its own
+   * notifyTenantUsers() only after its UPDATE's transaction returns -- this
+   * mirrors that, at the level of one whole rule-execution transaction
+   * rather than one UPDATE, and now covers a second kind of deferred call
+   * alongside the first. A consequence worth being explicit about: both
+   * actions' own `rule_executions` rows always record
+   * `applied: true, error: null` once their side effect is *built* (which
+   * can't itself fail once validation passes -- see
+   * {@link buildRuleNotification}/{@link buildRuleWebhookCall}), regardless
+   * of whether the email/webhook actually gets delivered afterward --
+   * neither dispatch call throws, matching every other place in this
+   * codebase an outbound notification is fire-and-forget best-effort, not a
+   * tracked outcome.
    */
   private async handleOrderEvent(event: DomainEventEnvelope<{ orderId: string }>): Promise<void> {
     const { tenantId, payload } = event;
-    const pendingNotifications: RuleNotification[] = [];
+    const pendingSideEffects: RuleSideEffect[] = [];
 
     await withTenant(this.pool, tenantId, async (client) => {
       const rules = await this.loadEnabledRulesWithClient(client, tenantId, event.name);
@@ -260,8 +332,8 @@ export class RulesEngine {
         let error: string | null = null;
         if (applied) {
           try {
-            const notification = await this.executeAction(client, tenantId, payload.orderId, action, rule, event.name);
-            if (notification) pendingNotifications.push(notification);
+            const sideEffect = await this.executeAction(client, tenantId, payload.orderId, action, rule, event.name);
+            if (sideEffect) pendingSideEffects.push(sideEffect);
           } catch (err) {
             error = err instanceof Error ? err.message : String(err);
           }
@@ -276,21 +348,28 @@ export class RulesEngine {
       }
     });
 
-    for (const notification of pendingNotifications) {
-      await this.notifyTenantUsers(tenantId, notification.subject, notification.text);
+    for (const sideEffect of pendingSideEffects) {
+      if (sideEffect.kind === "notification") {
+        await this.notifyTenantUsers(tenantId, sideEffect.subject, sideEffect.text);
+      } else {
+        await this.dispatchWebhook(sideEffect.url, sideEffect.body);
+      }
     }
   }
 
-  /** Dispatches one applied action. Three action types are implemented
+  /** Dispatches one applied action. Four action types are implemented
    *  today: 'route_to_warehouse' (CLAUDE.md §8 Phase 3: "order routing at
    *  minimum"), 'hold_order' (places a matching order on_hold instead of
    *  letting it proceed toward allocation -- see {@link placeOrderOnHold}),
-   *  and 'send_notification' (emails the tenant's own users -- see
-   *  {@link buildRuleNotification} and {@link handleOrderEvent}'s own doc
-   *  comment on why the actual send happens outside this method/transaction).
-   *  Other action types (tagging, webhooks, etc.) are future work, not built
-   *  speculatively; an unrecognized type throws (caught by the caller and
-   *  recorded as this row's error) rather than silently no-op-ing. */
+   *  'send_notification' (emails the tenant's own users -- see
+   *  {@link buildRuleNotification}), and 'webhook' (POSTs the event as JSON
+   *  to a tenant-configured URL -- see {@link buildRuleWebhookCall}). Both
+   *  of the latter two only *build* their side effect here; see
+   *  {@link handleOrderEvent}'s own doc comment on why the actual
+   *  send/dispatch happens outside this method/transaction. Other action
+   *  types (order tagging, etc.) are future work, not built speculatively;
+   *  an unrecognized type throws (caught by the caller and recorded as this
+   *  row's error) rather than silently no-op-ing. */
   private async executeAction(
     client: PoolClient,
     tenantId: string,
@@ -298,13 +377,17 @@ export class RulesEngine {
     action: AutomationRuleAction,
     rule: AutomationRule,
     triggerEvent: string,
-  ): Promise<RuleNotification | void> {
+  ): Promise<RuleSideEffect | void> {
     if (action.type === "hold_order") {
       return this.placeOrderOnHold(client, tenantId, orderId);
     }
 
     if (action.type === "send_notification") {
       return RulesEngine.buildRuleNotification(rule, triggerEvent, orderId, action);
+    }
+
+    if (action.type === "webhook") {
+      return RulesEngine.buildRuleWebhookCall(rule, triggerEvent, orderId, action);
     }
 
     if (action.type !== "route_to_warehouse") {
@@ -421,6 +504,7 @@ export class RulesEngine {
     const customMessage = typeof action.value === "string" && action.value.trim().length > 0 ? action.value.trim() : null;
 
     return {
+      kind: "notification",
       subject: `Automation alert: ${rule.name}`,
       text: [
         customMessage ?? `Your automation rule "${rule.name}" matched a ${triggerEvent} event for order ${orderId}.`,
@@ -428,6 +512,92 @@ export class RulesEngine {
         `View this order: /orders/${orderId}`,
       ].join("\n"),
     };
+  }
+
+  /**
+   * Builds a `webhook` action's outbound POST -- pure, no I/O (see
+   * {@link handleOrderEvent}'s doc comment on what that means for this
+   * action's own `rule_executions.error`). `action.value` must be a
+   * non-empty string URL; anything else (missing, wrong type, unparseable,
+   * non-https, or targeting a blocked host per {@link isBlockedWebhookHost})
+   * throws, caught and recorded by {@link handleOrderEvent}'s caller the
+   * same way every other action's bad config already is -- there's no valid
+   * "no custom target" default the way `send_notification`'s value is
+   * optional, so unlike that action's value, this one is required.
+   *
+   * https-only, not just "URL-shaped": this is CLAUDE.md §6's "raw card
+   * data never touches this app directly" caution applied to a related but
+   * distinct concern -- order data (customer/shipping fields could end up
+   * in a future, richer payload) leaving this app over a tenant-configured
+   * destination should never be plaintext-over-the-wire by default, and
+   * there is no legitimate reason a production integration target needs
+   * http://.
+   *
+   * Body is deliberately minimal -- `orderId`, not the order's full
+   * customer/shipping/line-item detail -- same "don't type/send ahead of a
+   * real consumer" discipline OrderBackorderedPayload's own doc comment
+   * describes; a receiving endpoint that needs more can look the order up
+   * by id via the public API. `ruleId`/`ruleName` let one shared endpoint
+   * distinguish which of a tenant's rules fired without parsing `event`.
+   */
+  private static buildRuleWebhookCall(
+    rule: AutomationRule,
+    triggerEvent: string,
+    orderId: string,
+    action: AutomationRuleAction,
+  ): RuleWebhookCall {
+    if (typeof action.value !== "string" || action.value.trim().length === 0) {
+      throw new Error(`webhook requires a non-empty string URL, got ${JSON.stringify(action.value)}`);
+    }
+
+    let url: URL;
+    try {
+      url = new URL(action.value.trim());
+    } catch {
+      throw new Error(`webhook: '${action.value}' is not a valid URL`);
+    }
+
+    if (url.protocol !== "https:") {
+      throw new Error(`webhook: URL must use https:, got '${url.protocol}' (${action.value})`);
+    }
+    if (isBlockedWebhookHost(url.hostname)) {
+      throw new Error(`webhook: '${url.hostname}' is a private/internal address and cannot be used as a webhook target`);
+    }
+
+    return {
+      kind: "webhook",
+      url: url.toString(),
+      body: {
+        event: triggerEvent,
+        orderId,
+        ruleId: rule.id,
+        ruleName: rule.name,
+        occurredAt: new Date().toISOString(),
+      },
+    };
+  }
+
+  /** Actually POSTs a built {@link RuleWebhookCall} -- see
+   *  {@link handleOrderEvent}'s doc comment for why this runs after the
+   *  rule-execution transaction commits, and why it never throws back into
+   *  that caller (mirrors sendEmail()'s own fire-and-forget contract: a
+   *  down or slow tenant endpoint logs, it doesn't fail order ingestion).
+   *  Bounded by {@link WEBHOOK_TIMEOUT_MS} via AbortSignal.timeout() so a
+   *  hanging endpoint can't hold this open indefinitely. */
+  private async dispatchWebhook(url: string, body: Record<string, unknown>): Promise<void> {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
+      });
+      if (!response.ok) {
+        console.error(`RulesEngine: webhook POST to ${url} returned HTTP ${response.status}`);
+      }
+    } catch (err) {
+      console.error(`RulesEngine: webhook POST to ${url} failed`, err);
+    }
   }
 
   /**

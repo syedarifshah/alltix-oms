@@ -94,10 +94,13 @@ export default async function RulesPage({ searchParams }: RulesPageProps): Promi
         Order automation on two triggers — order.received and order.backordered. Actions: route_to_warehouse (sets a
         preferred warehouse, order.received only), hold_order (places the order on_hold instead of letting it
         proceed toward allocation, for manual review — order.received only; on order.backordered the order has
-        already left &apos;received&apos;, so this action will fail and show as an error below), and
-        send_notification (emails everyone on your team — a rule with an empty/omitted value sends a generic
-        message naming the rule and order; a non-empty string is sent verbatim instead). Lower priority number wins
-        when two enabled rules&apos; actions of the same type conflict.
+        already left &apos;received&apos;, so this action will fail and show as an error below), send_notification
+        (emails everyone on your team — a rule with an empty/omitted value sends a generic message naming the rule
+        and order; a non-empty string is sent verbatim instead), and webhook (POSTs a small JSON body —
+        event/orderId/ruleId/ruleName/occurredAt — to a URL you configure; the URL must be https:// and can&apos;t
+        point at a private/internal address; delivery is best-effort and not retried, so this row still shows
+        &ldquo;applied&rdquo; even if your endpoint is down). Lower priority number wins when two enabled
+        rules&apos; actions of the same type conflict.
       </p>
 
       {error && <div className="alert alert-danger">{decodeURIComponent(error)}</div>}
@@ -200,8 +203,9 @@ export default async function RulesPage({ searchParams }: RulesPageProps): Promi
         <div className="form-row">
           <label htmlFor="actions">
             Actions (JSON array — &quot;route_to_warehouse&quot; (value = a warehouse location name),
-            &quot;hold_order&quot; (value ignored), or &quot;send_notification&quot; (value = an optional custom
-            message string; omit or leave blank for a generic default) are implemented)
+            &quot;hold_order&quot; (value ignored), &quot;send_notification&quot; (value = an optional custom
+            message string; omit or leave blank for a generic default), or &quot;webhook&quot; (value = an https://
+            URL, required, not pointing at a private/internal address) are implemented)
           </label>
           <textarea
             id="actions"

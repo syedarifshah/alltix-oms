@@ -1854,6 +1854,56 @@ eBay/Temu v1" scope decision.
   sync, check the Stripe Dashboard's Meters view), same as this repo has
   never had a stripe-mock server wired in.
 
+  **Rules engine: `webhook` action — built**, a fourth action type
+  alongside `route_to_warehouse`/`hold_order`/`send_notification` —
+  POSTs a small JSON body (`event`, `orderId`, `ruleId`, `ruleName`,
+  `occurredAt`) to a tenant-configured URL, the general-purpose escape
+  hatch into any external system (Slack via an incoming webhook, Zapier,
+  a tenant's own internal service) that doesn't need a purpose-built
+  integration. Same "collect during the transaction, dispatch after it
+  commits" discipline `send_notification` already established
+  (`RuleSideEffect`, a small discriminated union of `RuleNotification` |
+  `RuleWebhookCall`, replaces the old single-purpose `pendingNotifications`
+  list so a third kind of deferred side effect is one more union member
+  and `case`, not a third parallel array) — `dispatchWebhook()` never
+  throws and isn't retried, so (like `send_notification`) a
+  `rule_executions` row shows `applied: true` once the call is *built*,
+  regardless of whether the tenant's endpoint actually receives it.
+  `buildRuleWebhookCall()` requires `action.value` to be a non-empty,
+  `https:`-only URL (no bare-string "no target" default the way
+  `send_notification`'s value is optional — a webhook needs somewhere
+  real to go) and rejects it outright — before ever calling `fetch()` —
+  if it targets a private/internal address, via a new exported pure
+  helper, `isBlockedWebhookHost()`: loopback, RFC1918/link-local ranges,
+  `169.254.169.254` (the AWS/GCP/Azure instance-metadata endpoint, the
+  first thing any SSRF writeup checks), and bare `localhost`/`*.local`.
+  **Honest, documented limitation, not silently swept under the rug**:
+  this checks the literal hostname/IP text in the URL a tenant typed, not
+  the IP `fetch()` actually resolves and connects to at request time — it
+  does not defend against DNS rebinding (a public-looking hostname whose
+  DNS record points at an internal address). Real protection against that
+  would mean resolving DNS here first, validating *that* IP, and pinning
+  the outbound connection to it — meaningfully more infrastructure than
+  this pass builds, flagged plainly rather than left as an unstated gap,
+  the same "wire it now, note the real limitation" discipline this
+  codebase already applies elsewhere (e.g. `CHANNEL_CREDENTIALS_ENCRYPTION_KEY`'s
+  own "interim stand-in for the KMS-backed encryption CLAUDE.md §6 calls
+  for" framing). Bounded by a 5s timeout (`WEBHOOK_TIMEOUT_MS`, via
+  `AbortSignal.timeout()`) so a hanging tenant endpoint can never stall
+  the rules engine. `/rules`' own subtitle and action-JSON help text
+  document all of this plainly, same as `hold_order`-on-`order.backordered`'s
+  own caveat already does. Tested in `packages/rules-engine/test/
+  webhook-integration.test.ts` (7 tests: the happy-path POST body shape;
+  firing on `order.backordered` too, not just `order.received`; non-https
+  rejected; a blocked/internal target rejected *before* `fetch()` is ever
+  called; a missing/empty value rejected; a failed/500 delivery still
+  recording `applied: true`; and `isBlockedWebhookHost()`'s own pure
+  unit-test table) — via the same `globalThis.fetch` interception this
+  codebase already uses for Resend, since (unlike Stripe's SDK, which
+  defaults to Node's own `http`/`https` client) this action's outbound
+  call is deliberately implemented with `fetch()` specifically so it's
+  testable this way.
+
   Returns
   handling — **built**, see §2.2/§3. Rate-limit
   hardening, circuit breakers — **built**, see §4.4. Observability dashboards —
