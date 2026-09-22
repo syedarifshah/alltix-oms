@@ -6,6 +6,7 @@ import { createEbayConnectorFromChannelConnection, type EbayBusinessPolicies } f
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { getEnabledChannels } from "@/lib/channel-flags";
 
 export const dynamic = "force-dynamic";
 
@@ -163,6 +164,18 @@ interface ChannelsSettingsPageProps {
 }
 
 /**
+ * Renders in place of a "Connect X" link/form when the tenant's own
+ * `tenants.enabled_channels` (migration 0032, see channel-flags.ts) doesn't
+ * include this channel yet -- CLAUDE.md's "Channel Feature Flags" section
+ * has the full design. Only ever shown for a channel with NO existing
+ * connection (see isXEnabled's own comment above): an already-connected
+ * channel keeps its normal connected-state card regardless of this flag.
+ */
+function ChannelNotEnabledNotice({ channel }: { channel: string }): ReactElement {
+  return <p className="muted">{channel} isn&apos;t available for your account yet.</p>;
+}
+
+/**
  * Shows whether Amazon is connected for the signed-in tenant, with a
  * "Connect Amazon" link to /api/channels/amazon/connect when it isn't.
  * Auth/tenant resolution mirrors src/app/orders/page.tsx exactly -- see that
@@ -190,10 +203,16 @@ export default async function ChannelsSettingsPage({
     );
   }
 
-  const { connection, shopifyConnection, walmartConnection, ebayConnection, temuConnection, tiktokConnection } = await withTenant(
+  const { connection, shopifyConnection, walmartConnection, ebayConnection, temuConnection, tiktokConnection, enabledChannels } = await withTenant(
     pool,
     tenantId,
     async (client) => {
+      // Feature-flag gate (migration 0032, packages/web/src/lib/channel-flags.ts)
+      // -- fetched once up front so the six sections below can each decide
+      // whether to show a real "Connect X" link or a not-enabled notice
+      // for a tenant that hasn't been rolled out to that channel yet. See
+      // CLAUDE.md's "Channel Feature Flags" section for the full design.
+      const enabledChannels = await getEnabledChannels(client, tenantId);
       const amazonResult = await client.query<ChannelConnectionRow>(
         `SELECT external_account_id, marketplace, status, created_at, last_order_sync_at, lwa_client_id,
                 consecutive_failures, last_failure_at, last_failure_message
@@ -252,6 +271,7 @@ export default async function ChannelsSettingsPage({
         ebayConnection: ebayResult.rows[0] ?? null,
         temuConnection: temuResult.rows[0] ?? null,
         tiktokConnection: tiktokResult.rows[0] ?? null,
+        enabledChannels,
       };
     },
   );
@@ -263,6 +283,17 @@ export default async function ChannelsSettingsPage({
   const isEbayConnected = ebayConnection?.status === "active";
   const isTemuConnected = temuConnection?.status === "active";
   const isTikTokConnected = tiktokConnection?.status === "active";
+  // Feature-flag gate -- see the enabledChannels query above and
+  // ChannelNotEnabledNotice below. Only consulted for the "not connected
+  // yet" branch of each card: a channel already connected before it was
+  // flagged off keeps syncing (see CLAUDE.md's "Channel Feature Flags"
+  // section for why that's a deliberate scope boundary, not an oversight).
+  const isAmazonEnabled = enabledChannels.includes("amazon");
+  const isShopifyEnabled = enabledChannels.includes("shopify");
+  const isWalmartEnabled = enabledChannels.includes("walmart");
+  const isEbayEnabled = enabledChannels.includes("ebay");
+  const isTemuEnabled = enabledChannels.includes("temu");
+  const isTikTokEnabled = enabledChannels.includes("tiktok");
   const hasEbaySellingSetup =
     !!ebayConnection?.ebay_fulfillment_policy_id &&
     !!ebayConnection?.ebay_payment_policy_id &&
@@ -381,8 +412,10 @@ export default async function ChannelsSettingsPage({
             )}
             {!isConnected && <a href="/api/channels/amazon/connect">Reconnect Amazon</a>}
           </div>
-        ) : (
+        ) : isAmazonEnabled ? (
           <a href="/api/channels/amazon/connect">Connect Amazon</a>
+        ) : (
+          <ChannelNotEnabledNotice channel="Amazon" />
         )}
       </div>
 
@@ -420,8 +453,10 @@ export default async function ChannelsSettingsPage({
                 rather than only when disconnected. */}
             <ShopifyConnectForm buttonLabel="Reconnect Shopify" />
           </div>
-        ) : (
+        ) : isShopifyEnabled ? (
           <ShopifyConnectForm buttonLabel="Connect Shopify" />
+        ) : (
+          <ChannelNotEnabledNotice channel="Shopify" />
         )}
       </div>
 
@@ -459,8 +494,10 @@ export default async function ChannelsSettingsPage({
                 a fresh/corrected clientId+clientSecret pair. */}
             <WalmartConnectForm buttonLabel="Reconnect Walmart" />
           </div>
-        ) : (
+        ) : isWalmartEnabled ? (
           <WalmartConnectForm buttonLabel="Connect Walmart" />
+        ) : (
+          <ChannelNotEnabledNotice channel="Walmart" />
         )}
       </div>
 
@@ -518,8 +555,10 @@ export default async function ChannelsSettingsPage({
               </div>
             )}
           </div>
-        ) : (
+        ) : isEbayEnabled ? (
           <a href="/api/channels/ebay/connect">Connect eBay</a>
+        ) : (
+          <ChannelNotEnabledNotice channel="eBay" />
         )}
       </div>
 
@@ -558,8 +597,10 @@ export default async function ChannelsSettingsPage({
                 a fresh/corrected appKey+appSecret+accessToken triple. */}
             <TemuConnectForm buttonLabel="Reconnect Temu" />
           </div>
-        ) : (
+        ) : isTemuEnabled ? (
           <TemuConnectForm buttonLabel="Connect Temu" />
+        ) : (
+          <ChannelNotEnabledNotice channel="Temu" />
         )}
       </div>
 
@@ -596,7 +637,7 @@ export default async function ChannelsSettingsPage({
             <a href="/api/channels/tiktok/connect">Reconnect via TikTok OAuth</a>
             <TikTokConnectForm buttonLabel="Reconnect TikTok Shop (manual)" />
           </div>
-        ) : (
+        ) : isTikTokEnabled ? (
           <div className="stack">
             <a href="/api/channels/tiktok/connect">Connect via TikTok OAuth</a>
             <div className="muted">
@@ -605,6 +646,8 @@ export default async function ChannelsSettingsPage({
             </div>
             <TikTokConnectForm buttonLabel="Connect TikTok Shop (manual)" />
           </div>
+        ) : (
+          <ChannelNotEnabledNotice channel="TikTok Shop" />
         )}
       </div>
     </main>

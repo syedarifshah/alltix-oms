@@ -4,6 +4,7 @@ import { WalmartConnector, WALMART_PRODUCTION_BASE_URL } from "@alltix/channel-c
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { isChannelEnabledForTenant } from "@/lib/channel-flags";
 
 export const dynamic = "force-dynamic";
 
@@ -42,6 +43,10 @@ export async function POST(req: NextRequest): Promise<Response> {
   const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/settings/channels", "not signed in");
+  }
+
+  if (!(await isChannelEnabledForTenant(pool, user.tenantId, "walmart"))) {
+    return redirectWithError(req, "/settings/channels", "walmart_channel_not_enabled");
   }
 
   const formData = await req.formData();

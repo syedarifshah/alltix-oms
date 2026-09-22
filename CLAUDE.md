@@ -2156,7 +2156,8 @@ eBay/Temu v1" scope decision.
 - **Database migrations**: versioned, backward-compatible (expand/contract pattern) so
   deploys never require simultaneous app+schema cutover.
 - **Feature flags** (LaunchDarkly or open-source alt) for gradually rolling out new
-  channel connectors per tenant.
+  channel connectors per tenant. **A lightweight, in-house version of this is
+  built** — see §15.
 - **Disaster recovery**: point-in-time DB recovery (Postgres WAL), event bus replay
   capability to reconstruct inventory state after an incident rather than trusting a
   single mutable snapshot.
@@ -2204,6 +2205,12 @@ from there.
   two or more TikTok shops for the same tenant at once — needs that loading layer (and
   probably the scheduler) to change first; not built, deliberately out of scope for the
   picker pass.
+- **Channel feature flags don't gate ongoing sync** — §15's `tenants.enabled_channels`
+  only gates *connecting* a channel that has no `channel_connections` row yet. Turning a
+  flag off after a tenant is already connected does not pause/hide that channel's
+  scheduler sync, and there's no operator UI, only a CLI script
+  (`npm run platform:set-channel-flags`). Both deliberate, not oversights — see §15's
+  own "Scope boundary" and "No operator UI" paragraphs for the reasoning.
 
 ## 13. Observability (Sentry — §5/§8 Phase 4's "Observability dashboards")
 
@@ -2466,6 +2473,73 @@ processor per tenant, not one row per channel/marketplace pair.
 `packages/` service/connector code, and — most importantly — whether Check's real
 pricing is viable at this platform's current single-self-testing-tenant stage (§0).
 Revisit once Arif has a real quote.
+
+## 15. Channel Feature Flags (per-tenant rollout gating, §9's own future item)
+
+**Status: built.** §9's DevOps table listed "Feature flags (LaunchDarkly or open-source
+alt) for gradually rolling out new channel connectors per tenant" as future work; this
+is that feature, deliberately built as a plain `tenants.enabled_channels TEXT[]` column
+(migration `0032_tenants_enabled_channels.sql`) rather than a real LaunchDarkly/Unleash/
+etc. integration — same "don't stand up infra a single self-testing tenant hasn't
+earned yet" call this codebase already makes for BullMQ/Redis (§4.4) and Kafka (§1). A
+real flag-management vendor is worth revisiting once there's more than one tenant and
+an operator UI to build flags into — not before.
+
+**Why this is worth having even with one tenant**: `/settings/channels`' own subtitle
+already says it plainly — Walmart/eBay/Temu/TikTok's wiring is "complete but UNVERIFIED
+against real infrastructure." Before this, any signed-up tenant could click "Connect
+Temu" and walk straight into an integration nobody has ever round-tripped against real
+infrastructure. This lets a real quote or credential get verified against ONE tenant's
+connection first, with every other tenant's "Connect X" simply not appearing, before a
+channel is rolled out generally — the actual "gradual rollout" §9 asked for.
+
+**Schema** (`0032_tenants_enabled_channels.sql`): `tenants.enabled_channels TEXT[] NOT
+NULL DEFAULT ARRAY['amazon','shopify','walmart','ebay','temu','tiktok']` — every channel
+this codebase has a connector for, so a tenant nobody has touched this for sees IDENTICAL
+behavior before and after this migration (same "genuinely additive, zero behavior
+change until someone opts a tenant out" discipline migration 0031's own
+`reorder_threshold_days` used). A `CHECK (enabled_channels <@ ARRAY[...])` mirrors the
+identical list hardcoded at the app layer (`packages/web/src/lib/channel-flags.ts`'s own
+`ALL_CHANNELS`) — defense-in-depth, same "never rely on one layer alone" principle §6
+already applies to tenant isolation, applied here to input validation instead. There is
+no single source of truth these two lists derive from (nor does `scripts/
+set-channel-flags.ts`'s own third copy, deliberately not imported from `@alltix/web`'s
+`src/` — see that script's own doc comment for why): a seventh channel connector means
+updating all three by hand.
+
+**Scope boundary, deliberate — gates *connecting*, not ongoing sync**: the check happens
+exactly once, at the moment a tenant would start connecting a channel that has no
+existing `channel_connections` row yet (every OAuth-redirect GET connect handler —
+Amazon/eBay/TikTok — and every direct-credential POST connect handler —
+Shopify/Walmart/Temu/TikTok-manual — via `isChannelEnabled`/`isChannelEnabledForTenant`
+in `channel-flags.ts`). It does **not** touch `packages/scheduler`'s own discovery
+queries: a channel already connected before its flag was turned off keeps syncing
+normally, and turning a flag back on doesn't need to "reconnect" anything either. This
+mirrors the TikTok multi-shop picker's own honest scope note (§4.8.1) rather than
+overbuilding — genuinely revoking an already-connected channel's ongoing sync (and
+un-syncing/hiding its data) is a materially bigger, different feature, not attempted
+here. `/settings/channels` reflects this exactly: an enabled-but-not-yet-connected
+channel's card shows a plain "X isn't available for your account yet" notice in place of
+the Connect link/form (`ChannelNotEnabledNotice`); an already-connected channel's card
+is completely unaffected by this flag either way.
+
+**No operator UI — a CLI script instead, same reasoning as the LaunchDarkly call above**:
+`npm run platform:set-channel-flags` (`scripts/set-channel-flags.ts`) takes
+`TENANT_ID`/`ENABLED_CHANNELS` (comma-separated) and replaces that tenant's list
+wholesale — same "general-purpose, production-safe, env-var-driven" shape
+`scripts/add-channel-listing.ts` already established, not a throwaway-test-data script.
+There is no multi-tenant admin surface anywhere in this codebase yet to hang a real
+toggle UI off of; building one purely for this would be scope creep this feature doesn't
+need.
+
+**Tests**: `packages/web/test/channel-flags.test.ts` covers the one pure function here
+(`filterKnownChannels` — same "extract the pure decision, test it directly" precedent
+`reorder-threshold.test.ts` set) — unrecognized values dropped, not passed through
+(defense-in-depth against a hypothetically stale/corrupt array, even though the DB
+CHECK constraint already makes that impossible in practice). No DB-layer test suite for
+the migration itself, same precedent migration 0031 set — verified instead via `tsc -b`,
+`next build`, and a manual rolled-back-transaction smoke test of the default value and
+the CHECK constraint against a real local Postgres.
 
 ---
 

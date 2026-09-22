@@ -6,6 +6,7 @@ import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers
 import { createOAuthState } from "@/lib/tiktok-oauth-state";
 import { readTikTokOAuthAppConfig } from "@/lib/tiktok-oauth-config";
 import { persistTikTokConnection } from "@/lib/tiktok-connection";
+import { isChannelEnabled, isChannelEnabledForTenant } from "@/lib/channel-flags";
 
 export const dynamic = "force-dynamic";
 
@@ -14,19 +15,24 @@ export const dynamic = "force-dynamic";
  * consent screen (the "Connect via TikTok OAuth" link on /settings/channels),
  * added alongside the POST manual-paste form below rather than replacing
  * it. Mirrors /api/channels/ebay/connect exactly (see that route's own doc
- * comment for the withTenantAuth-for-its-auth-step-only reasoning) --
- * genuine differences are pushed down into buildTikTokAuthorizeUrl() itself
- * (no redirectUri param; see tiktok-oauth.ts's own header comment), not
- * this route.
+ * comment for the withTenantAuth-for-its-auth-step-only reasoning, and the
+ * channel-flags check below, CLAUDE.md's "Channel Feature Flags" section)
+ * -- genuine differences are pushed down into buildTikTokAuthorizeUrl()
+ * itself (no redirectUri param; see tiktok-oauth.ts's own header comment),
+ * not this route.
  *
  * The manual-paste POST form stays: it remains the only path for a tenant
  * whose TikTok Shop application issues long-lived tokens directly (no
  * consent-screen flow to redirect through), and is a useful fallback if the
  * OAuth path below turns out to be wrong once a real TikTok application
  * exists to test it against (see tiktok-oauth.ts's own "UNVERIFIED IN
- * PRACTICE" note).
+ * PRACTICE" note). Both paths check the same flag -- see the POST handler
+ * below.
  */
-async function connectTikTokViaOAuth(_req: NextRequest, { tenantId }: TenantRequestContext): Promise<Response> {
+async function connectTikTokViaOAuth(req: NextRequest, { tenantId, client }: TenantRequestContext): Promise<Response> {
+  if (!(await isChannelEnabled(client, tenantId, "tiktok"))) {
+    return redirectWithError(req, "/settings/channels", "tiktok_channel_not_enabled");
+  }
   const { appKey } = readTikTokOAuthAppConfig();
   const state = createOAuthState(tenantId);
   const authorizeUrl = buildTikTokAuthorizeUrl(appKey, state);
@@ -71,13 +77,22 @@ export const GET = withTenantAuth(connectTikTokViaOAuth);
  * were never readable during this connector's research pass (same
  * "unreadable JS SPA" problem Temu's own docs had). Submitting a wrong or
  * placeholder set of values here will correctly fail at the authenticate()
- * step below rather than silently "connecting" nothing.
+ * step below rather than silently "connecting" nothing. Checks the same
+ * channel-flags gate the GET handler above does, via the pool-level
+ * {@link isChannelEnabledForTenant} (no open client here to reuse
+ * {@link isChannelEnabled} with -- see that function's own doc comment) --
+ * before the network round trip below, so a not-enabled tenant's
+ * credentials never even reach TikTok.
  */
 export async function POST(req: NextRequest): Promise<Response> {
   const pool = getAppPool();
   const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/settings/channels", "not signed in");
+  }
+
+  if (!(await isChannelEnabledForTenant(pool, user.tenantId, "tiktok"))) {
+    return redirectWithError(req, "/settings/channels", "tiktok_channel_not_enabled");
   }
 
   const formData = await req.formData();

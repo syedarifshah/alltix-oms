@@ -3,6 +3,8 @@ import { buildAmazonAuthorizeUrl } from "@alltix/channel-connectors";
 import { withTenantAuth, type TenantRequestContext } from "@/lib/with-tenant-auth";
 import { createOAuthState } from "@/lib/amazon-oauth-state";
 import { readAmazonOAuthAppConfig, isAmazonOAuthAppDraft } from "@/lib/amazon-oauth-config";
+import { isChannelEnabled } from "@/lib/channel-flags";
+import { redirectWithError } from "@/lib/route-helpers";
 
 export const dynamic = "force-dynamic";
 
@@ -18,9 +20,17 @@ export const dynamic = "force-dynamic";
  * Wrapped in withTenantAuth purely for its auth/tenant-resolution step (the
  * transaction it opens goes unused here) so this route is gated the exact
  * same way every other authenticated route in the app is, instead of a
- * second, parallel auth check.
+ * second, parallel auth check. That same open transaction/client is what
+ * the new channel-flags check below reads through -- see CLAUDE.md's
+ * "Channel Feature Flags" section: an amazon-not-enabled tenant never
+ * reaches Amazon's own authorize screen at all, no error code prefix (same
+ * "Amazon's own error codes carry no distinguishing prefix" reasoning
+ * /settings/channels' own catch-all banner already documents).
  */
-async function connectAmazon(_req: NextRequest, { tenantId }: TenantRequestContext): Promise<Response> {
+async function connectAmazon(req: NextRequest, { tenantId, client }: TenantRequestContext): Promise<Response> {
+  if (!(await isChannelEnabled(client, tenantId, "amazon"))) {
+    return redirectWithError(req, "/settings/channels", "channel_not_enabled");
+  }
   const { applicationId } = readAmazonOAuthAppConfig();
   const state = createOAuthState(tenantId);
   const authorizeUrl = buildAmazonAuthorizeUrl(applicationId, state, isAmazonOAuthAppDraft());

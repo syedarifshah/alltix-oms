@@ -4,6 +4,7 @@ import { TemuConnector, TEMU_API_PRODUCTION_BASE_URL } from "@alltix/channel-con
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { isChannelEnabledForTenant } from "@/lib/channel-flags";
 
 export const dynamic = "force-dynamic";
 
@@ -47,6 +48,10 @@ export async function POST(req: NextRequest): Promise<Response> {
   const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/settings/channels", "not signed in");
+  }
+
+  if (!(await isChannelEnabledForTenant(pool, user.tenantId, "temu"))) {
+    return redirectWithError(req, "/settings/channels", "temu_channel_not_enabled");
   }
 
   const formData = await req.formData();
