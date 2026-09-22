@@ -1758,7 +1758,9 @@ eBay/Temu v1" scope decision.
 - **Tenant isolation**: RLS at the DB layer (§2.4) + application-layer tenant checks
   as defense-in-depth, never rely on one alone.
 - **SOC 2**: not needed for MVP, but architect logging/access-control from day one —
-  retrofitting audit trails later is expensive.
+  retrofitting audit trails later is expensive. **A general-purpose audit trail is
+  built, covering the highest-value mutations** — see §17 for what's covered and the
+  honest scope note on what isn't yet.
 - **Webhook verification**: validate signatures on every inbound webhook (Amazon SNS
   message signing, Shopify HMAC, etc.) — don't trust unsigned payloads.
 - **Rate-limit/DDoS protection** on the public API — a buggy customer integration
@@ -2623,6 +2625,87 @@ not a new DB-layer test suite" call migrations 0031/0032 already made) — the u
 `INSERT ... ON CONFLICT DO UPDATE` pattern itself is the same one CLAUDE.md's own §7
 "property-based/fuzz testing for concurrent allocation" line already trusts Postgres to
 serialize correctly.
+
+## 17. Audit Log (§6's own "architect logging/access-control from day one" item)
+
+**Status: built, for the highest-value mutations.** §6 flags this as unaddressed:
+"retrofitting audit trails later is expensive." Until now `inventory_events` (§2.2) was
+the only audit trail in this schema — who cancelled an order, created or toggled an
+automation rule, or changed a tenant setting was tracked nowhere. Migration
+`0034_audit_log.sql`'s `audit_log` table closes that, plus a real read surface
+(`/settings/activity`) so this isn't a write-only trail nobody can see.
+
+**Schema — generic, not one table per mutation type**: `audit_log(tenant_id, user_id
+NULLABLE, action, entity_type, entity_id NULLABLE, details JSONB, created_at)`. `action`
+is free text, dot-namespaced (`rule.created`, `settings.reorder_threshold_changed`) —
+same "this app's own vocabulary keeps growing" reasoning `employees.role` and
+`api_rate_limit_windows.route_key` already established (migrations 0028, 0033), not a
+fixed enum a new audited route would need a migration to extend. `user_id` is nullable
+specifically for operator-run scripts (`scripts/set-channel-flags.ts`) that have no
+Clerk session to attribute a change to — NULL means "the platform operator, outside the
+app," never a fabricated system-user row. `details` is a free-form JSONB blob, not a
+structured before/after pair — capturing a true before-image would mean every
+instrumented route re-reading its row before mutating it, which none of them need for
+their own logic today; a stronger before/after guarantee is real, separate future work,
+not attempted here.
+
+**Append-only by construction, not by convention**: the migration's `GRANT` covers only
+`SELECT`/`INSERT` for `app_user` — no `UPDATE`/`DELETE` — so the application literally
+cannot edit or erase a row, verified directly against a real Postgres (a smoke-tested
+`UPDATE`/`DELETE` both fail with `permission denied for table audit_log`, not just "no
+code path happens to call it").
+
+**Atomicity — same transaction as the mutation it records, always**: `audit-log.ts`'s
+`recordAuditEvent(client, event)` deliberately takes an already-open, tenant-scoped
+`client` rather than offering a pool-level convenience the way `channel-flags.ts`/
+`rate-limit.ts` each do — every instrumented route already does its mutation via
+`withTenant(pool, tenantId, (client) => ...)`, so recording the audit row through that
+SAME client, inside that SAME transaction, means a rolled-back mutation never leaves a
+committed audit row behind. This is *why* coverage is narrower than rate limiting's own
+nine routes (§16): only routes that already do their own direct `client.query(...)`
+inside `withTenant` (not ones that delegate to a service class's own internal
+transaction, like `OrderService.transition`/`WarehouseService`) get this for free without
+changing business-logic code in another package.
+
+**Coverage — four call sites, deliberately not order/picklist/warehouse actions**:
+`rules` (create), `rules/[id]/toggle`, `inventory/reorder-threshold`, and
+`scripts/set-channel-flags.ts` (inlined there rather than imported from
+`packages/web/src/lib/audit-log.ts` — same "scripts never reach into `@alltix/web`'s own
+`src/`" boundary `set-channel-flags.ts`'s own `ALL_CHANNELS` comment already
+established). The order lifecycle, picklists, and inventory transfer — §16's own rate-
+limited hot path — route through `OrderService`/`WarehouseService`/`InventoryService`,
+each opening its own internal transaction the Route Handler never sees; auditing those
+for real (with the same same-transaction atomicity guarantee) means threading an actor
+and an audit write into each service method itself, not the route. Real, bounded,
+explicitly deferred future work — not attempted here to avoid touching business logic in
+three other packages in the same pass as everything else this session already shipped.
+
+**New RLS policy on `users`, invited by that table's own migration comment**: migration
+0010's own doc comment on `self_lookup_users` already named this exact need — "a future
+'list my org's teammates' feature needs an additional policy branch scoped by
+`app.tenant_id`... add a second policy" — this migration adds exactly that
+(`tenant_scoped_read_users`, `SELECT`-only), which is what lets `/settings/activity`'s
+join resolve OTHER users' emails within the same tenant (the original self-lookup
+policy only ever matches the CURRENT request's own `clerk_user_id`, and a
+`withTenant`-scoped query doesn't even set that session variable — see
+`packages/db/src/pool.ts`'s own doc comment). Postgres combines multiple permissive
+policies for the same command with `OR`, so this is purely additive; smoke-tested
+directly against a real Postgres alongside the append-only and cross-tenant-isolation
+checks above.
+
+**`/settings/activity`**: read-only, newest-first, capped at 200 rows, no
+filter/search/pagination UI yet — same "start simple" call every other first-pass list
+page in this app makes. A generic `describeAction()` formatter (dot/underscore →
+spaced, sentence-cased) renders any action string sensibly with no per-action lookup
+table to maintain as more routes get instrumented.
+
+**Tests**: no dedicated test file — `recordAuditEvent` is a thin, direct SQL wrapper
+with no pure decision logic to extract the way `reorder-threshold.ts`/`rate-limit.ts`
+each had (same as `route-helpers.ts`'s own `redirectWithError`/`redirectTo`, which also
+have none). Verified instead via `tsc -b`, `next build`, and a manual smoke test against
+a real local Postgres covering: same-transaction recording with a real actor, a
+system-actor (NULL `user_id`) entry, the `/settings/activity` join query itself,
+cross-tenant isolation, and the append-only `UPDATE`/`DELETE` rejection — all passed.
 
 ---
 

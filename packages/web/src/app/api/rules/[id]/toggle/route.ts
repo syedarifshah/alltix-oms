@@ -3,6 +3,7 @@ import { withTenant } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { recordAuditEvent } from "@/lib/audit-log";
 
 export const dynamic = "force-dynamic";
 
@@ -19,12 +20,25 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const { id } = await ctx.params;
 
   try {
-    const result = await withTenant(getAppPool(), user.tenantId, (client) =>
-      client.query(
-        `UPDATE automation_rules SET enabled = NOT enabled, updated_at = now() WHERE id = $1 AND tenant_id = $2`,
+    const result = await withTenant(getAppPool(), user.tenantId, async (client) => {
+      const updateResult = await client.query<{ enabled: boolean }>(
+        `UPDATE automation_rules SET enabled = NOT enabled, updated_at = now() WHERE id = $1 AND tenant_id = $2 RETURNING enabled`,
         [id, user.tenantId],
-      ),
-    );
+      );
+      if (updateResult.rowCount === 0 || updateResult.rows.length === 0) {
+        return updateResult;
+      }
+      // Same transaction as the UPDATE above -- see recordAuditEvent's own
+      // doc comment for why that matters.
+      await recordAuditEvent(client, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        action: updateResult.rows[0]!.enabled ? "rule.enabled" : "rule.disabled",
+        entityType: "automation_rule",
+        entityId: id,
+      });
+      return updateResult;
+    });
     if (result.rowCount === 0) {
       return redirectWithError(req, "/rules", `Rule ${id} not found.`);
     }

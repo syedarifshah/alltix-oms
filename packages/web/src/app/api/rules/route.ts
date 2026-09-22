@@ -3,6 +3,7 @@ import { withTenant } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { recordAuditEvent } from "@/lib/audit-log";
 
 export const dynamic = "force-dynamic";
 
@@ -58,13 +59,25 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   try {
-    await withTenant(getAppPool(), user.tenantId, (client) =>
-      client.query(
+    await withTenant(getAppPool(), user.tenantId, async (client) => {
+      const result = await client.query<{ id: string }>(
         `INSERT INTO automation_rules (tenant_id, name, trigger_event, conditions, actions, priority, enabled)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id`,
         [user.tenantId, name, triggerEvent, JSON.stringify(conditions), JSON.stringify(actions), priority, enabled],
-      ),
-    );
+      );
+      // Same transaction as the INSERT above -- see recordAuditEvent's own
+      // doc comment for why that matters (a rolled-back rule create never
+      // leaves a committed audit row behind).
+      await recordAuditEvent(client, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        action: "rule.created",
+        entityType: "automation_rule",
+        entityId: result.rows[0]!.id,
+        details: { name, triggerEvent, priority, enabled },
+      });
+    });
   } catch (err) {
     return redirectWithError(req, "/rules", errorMessage(err));
   }

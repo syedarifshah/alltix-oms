@@ -4,6 +4,7 @@ import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError } from "@/lib/route-helpers";
 import { parseReorderThresholdDays } from "@/lib/reorder-threshold";
+import { recordAuditEvent } from "@/lib/audit-log";
 
 export const dynamic = "force-dynamic";
 
@@ -37,9 +38,19 @@ export async function POST(req: NextRequest): Promise<Response> {
     return redirectWithError(req, "/inventory", "inventory_reorder_threshold_invalid");
   }
 
-  await withTenant(getAppPool(), user.tenantId, (client) =>
-    client.query(`UPDATE tenants SET reorder_threshold_days = $1, updated_at = now() WHERE id = $2`, [parsed, user.tenantId]),
-  );
+  await withTenant(getAppPool(), user.tenantId, async (client) => {
+    await client.query(`UPDATE tenants SET reorder_threshold_days = $1, updated_at = now() WHERE id = $2`, [parsed, user.tenantId]);
+    // Same transaction as the UPDATE above -- see recordAuditEvent's own
+    // doc comment for why that matters.
+    await recordAuditEvent(client, {
+      tenantId: user.tenantId,
+      userId: user.id,
+      action: "settings.reorder_threshold_changed",
+      entityType: "tenant",
+      entityId: user.tenantId,
+      details: { reorderThresholdDays: parsed },
+    });
+  });
 
   return redirectTo(req, "/inventory?reorderThresholdUpdated=1");
 }

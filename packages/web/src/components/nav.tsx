@@ -53,6 +53,7 @@ export async function Nav(): Promise<ReactElement> {
       <a href="/reports">Reports</a>
       <a href="/settings/billing">Billing</a>
       <a href="/settings/channels">Settings</a>
+      <a href="/settings/activity">Activity</a>
       <div className="nav-spacer" />
       <ThemeToggle />
       {isTestBypass ? (
