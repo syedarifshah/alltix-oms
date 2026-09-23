@@ -157,7 +157,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   // the shop-picker's POST target -- see persistTikTokConnection's own doc
   // comment.
   try {
-    await persistTikTokConnection(pool, user.tenantId, { appKey, appSecret, accessToken, refreshToken, shopCipher });
+    await persistTikTokConnection(pool, user.tenantId, { appKey, appSecret, accessToken, refreshToken, shopCipher }, user.id);
   } catch (err) {
     return redirectWithError(req, "/settings/channels", `tiktok_save_failed:${errorMessage(err)}`);
   }

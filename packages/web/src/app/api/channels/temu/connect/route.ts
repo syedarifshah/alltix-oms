@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant, encryptChannelSecret } from "@alltix/db";
+import { withTenant, encryptChannelSecret, recordAuditEvent } from "@alltix/db";
 import { TemuConnector, TEMU_API_PRODUCTION_BASE_URL } from "@alltix/channel-connectors";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
@@ -95,7 +95,7 @@ export async function POST(req: NextRequest): Promise<Response> {
       // Walmart's/eBay's own clientId reuse. Reconnecting with the SAME
       // appKey updates the existing row; a different appKey inserts a
       // second row rather than silently overwriting the first.
-      await client.query(
+      const result = await client.query<{ id: string; is_new: boolean }>(
         `INSERT INTO channel_connections
            (tenant_id, channel, marketplace, external_account_id, lwa_client_id,
             encrypted_client_secret, encrypted_access_token, status)
@@ -106,9 +106,23 @@ export async function POST(req: NextRequest): Promise<Response> {
            encrypted_client_secret = EXCLUDED.encrypted_client_secret,
            encrypted_access_token = EXCLUDED.encrypted_access_token,
            status = 'active',
-           updated_at = now()`,
+           updated_at = now()
+         RETURNING id, (xmax = 0) AS is_new`,
         [user.tenantId, appKey, encryptedAppSecret, encryptedAccessToken],
       );
+      const { id, is_new: isNew } = result.rows[0]!;
+
+      // Never logs a secret value, only which channel/account changed --
+      // see amazon/callback/route.ts's identical comment for the full
+      // xmax = 0 reasoning.
+      await recordAuditEvent(client, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        action: isNew ? "channel_connection.connected" : "channel_connection.credentials_rotated",
+        entityType: "channel_connection",
+        entityId: id,
+        details: { channel: "temu", marketplace: "", externalAccountId: appKey },
+      });
     });
   } catch (err) {
     return redirectWithError(req, "/settings/channels", `temu_save_failed:${errorMessage(err)}`);

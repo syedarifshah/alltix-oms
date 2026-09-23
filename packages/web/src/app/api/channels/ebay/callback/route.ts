@@ -1,9 +1,9 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { withTenant, encryptChannelSecret } from "@alltix/db";
+import { withTenant, encryptChannelSecret, recordAuditEvent } from "@alltix/db";
 import { parseEbayOAuthCallback, exchangeEbayAuthorizationCode } from "@alltix/channel-connectors";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
-import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { resolveCurrentUser } from "@/lib/with-tenant-auth";
 import { verifyOAuthState } from "@/lib/ebay-oauth-state";
 import { readEbayOAuthAppConfig, isEbayOAuthSandbox } from "@/lib/ebay-oauth-config";
 
@@ -61,8 +61,8 @@ export async function GET(req: NextRequest): Promise<Response> {
     return redirectWithError(req, "ebay_not_signed_in");
   }
   const pool = getAppPool();
-  const tenantIdFromSession = await resolveTenantId(pool, authContext.clerkUserId);
-  if (!tenantIdFromSession || tenantIdFromSession !== tenantIdFromState) {
+  const currentUser = await resolveCurrentUser(pool, authContext.clerkUserId);
+  if (!currentUser || currentUser.tenantId !== tenantIdFromState) {
     return redirectWithError(req, "ebay_tenant_mismatch");
   }
 
@@ -94,7 +94,7 @@ export async function GET(req: NextRequest): Promise<Response> {
     const encryptedClientSecret = await encryptChannelSecret(client, clientSecret);
     const encryptedRefreshToken = await encryptChannelSecret(client, refreshToken);
 
-    await client.query(
+    const result = await client.query<{ id: string; is_new: boolean }>(
       `INSERT INTO channel_connections
          (tenant_id, channel, marketplace, external_account_id, lwa_client_id, encrypted_client_secret, encrypted_refresh_token, status)
        VALUES ($1, 'ebay', '', $2, $2, $3, $4, 'active')
@@ -104,9 +104,23 @@ export async function GET(req: NextRequest): Promise<Response> {
          encrypted_client_secret = EXCLUDED.encrypted_client_secret,
          encrypted_refresh_token = EXCLUDED.encrypted_refresh_token,
          status = 'active',
-         updated_at = now()`,
+         updated_at = now()
+       RETURNING id, (xmax = 0) AS is_new`,
       [tenantIdFromState, clientId, encryptedClientSecret, encryptedRefreshToken],
     );
+    const { id, is_new: isNew } = result.rows[0]!;
+
+    // Never logs a secret value, only which channel/account changed -- see
+    // amazon/callback/route.ts's identical comment for why this runs inside
+    // the same transaction as the INSERT above and what xmax = 0 means.
+    await recordAuditEvent(client, {
+      tenantId: tenantIdFromState,
+      userId: currentUser.id,
+      action: isNew ? "channel_connection.connected" : "channel_connection.credentials_rotated",
+      entityType: "channel_connection",
+      entityId: id,
+      details: { channel: "ebay", marketplace: "", externalAccountId: clientId },
+    });
   });
 
   const url = new URL("/settings/channels", req.url);

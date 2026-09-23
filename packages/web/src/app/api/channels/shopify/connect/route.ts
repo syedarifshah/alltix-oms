@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant, encryptChannelSecret } from "@alltix/db";
+import { withTenant, encryptChannelSecret, recordAuditEvent } from "@alltix/db";
 import { ShopifyConnector } from "@alltix/channel-connectors";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
@@ -115,7 +115,7 @@ export async function POST(req: NextRequest): Promise<Response> {
       // Shopify row has nothing to put in (0019). encrypted_client_secret
       // is the one 0019-relaxed column that DOES now get a real Shopify
       // value -- see this route's header comment.
-      await client.query(
+      const result = await client.query<{ id: string; is_new: boolean }>(
         `INSERT INTO channel_connections
            (tenant_id, channel, marketplace, external_account_id, encrypted_access_token, encrypted_client_secret, status)
          VALUES ($1, 'shopify', '', $2, $3, $4, 'active')
@@ -124,9 +124,23 @@ export async function POST(req: NextRequest): Promise<Response> {
            encrypted_access_token = EXCLUDED.encrypted_access_token,
            encrypted_client_secret = COALESCE(EXCLUDED.encrypted_client_secret, channel_connections.encrypted_client_secret),
            status = 'active',
-           updated_at = now()`,
+           updated_at = now()
+         RETURNING id, (xmax = 0) AS is_new`,
         [user.tenantId, shopDomain, encryptedAccessToken, encryptedClientSecret],
       );
+      const { id, is_new: isNew } = result.rows[0]!;
+
+      // Never logs a secret value, only which channel/account changed --
+      // see amazon/callback/route.ts's identical comment for the full
+      // xmax = 0 reasoning.
+      await recordAuditEvent(client, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        action: isNew ? "channel_connection.connected" : "channel_connection.credentials_rotated",
+        entityType: "channel_connection",
+        entityId: id,
+        details: { channel: "shopify", marketplace: "", externalAccountId: shopDomain },
+      });
     });
   } catch (err) {
     return redirectWithError(req, "/settings/channels", `shopify_save_failed:${errorMessage(err)}`);

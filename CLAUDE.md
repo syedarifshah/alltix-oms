@@ -2971,6 +2971,80 @@ call sites:
     the "Coverage" paragraph above, there is no unattributed-actor case here to default
     to `null` for.
 
+**Coverage — channel-connection credentials**: found via the same "grep every `POST
+route.ts` for the instrumentation marker, then read each unmatched file to tell a real
+gap from one already covered elsewhere" technique this codebase's RLS and rate-limiting
+passes already used (§16's own "fourth pass" section). 7 routes write highly sensitive
+encrypted API secrets into `channel_connections` — Amazon/eBay/TikTok's 3 OAuth
+callbacks, TikTok's shop-picker POST target, and Shopify/Temu/Walmart's 3 manual-paste
+connect forms — and none of them had ever recorded an audit event, despite this table
+holding exactly the kind of "who connected/rotated what, when" history an audit trail
+exists for:
+  - Every one of the 7 now records `channel_connection.connected` on a fresh row or
+    `channel_connection.credentials_rotated` on an existing one — two distinct action
+    strings for a materially different security event, same `employee.created`/
+    `employee.updated` precedent (§17's own HR paragraph above) applied here to a single
+    combined `INSERT ... ON CONFLICT DO UPDATE` via Postgres's own `(xmax = 0) AS
+    is_new` (`xmax = 0` is Postgres's tell for "this row was just inserted, not touched
+    by the UPDATE branch"), rather than needing two separate routes the way HR's create/
+    update split does. `entityType: "channel_connection"`, `entityId` is the connection
+    row's own `id`.
+  - **Hard rule, worth stating explicitly since this is the one place in the codebase an
+    audit `details` blob sits directly next to a secret being encrypted in the same
+    breath**: `details` NEVER includes the actual client secret, access token, or
+    refresh token — only `{channel, marketplace, externalAccountId}`. Verified directly
+    (see "Tests" below), not just by code inspection.
+  - Amazon's and eBay's OAuth callbacks each gained the `RETURNING id, (xmax = 0) AS
+    is_new` + `recordAuditEvent(...)` pair directly in their own `withTenant` block, and
+    swapped `resolveTenantId` for `resolveCurrentUser` (same function, one extra column,
+    no added round trip — see that function's own doc comment) purely to get the
+    caller's `users.id` for `userId` without a second query. Shopify/Temu/Walmart's
+    manual-paste connect routes got the identical treatment; all three already had
+    `user.id` via `requireCurrentUser`, so no auth-layer change was needed there.
+  - TikTok is the one channel with three real callers of a single shared upsert —
+    `persistTikTokConnection()` (`packages/web/src/lib/tiktok-connection.ts`, see its own
+    doc comment for why it's extracted at all) — so instrumenting THAT ONE function
+    covers the manual-paste POST, the OAuth callback's single-shop fast path, and the
+    shop-picker's `select-shop` POST target at once, same "instrument the shared
+    chokepoint once" reasoning `OrderService.transition()` already established for ~50
+    order-mutation call sites. It gained a new `actorUserId?: string | null` parameter
+    (default `null`, mirroring `transition()`'s own optional actor param) — the OAuth
+    callback and `select-shop` both needed the same `resolveTenantId` →
+    `resolveCurrentUser` swap as Amazon/eBay to have an actor id to pass in; the
+    manual-paste route already had one.
+  - **Deliberately not audited by this pass**: the 3 channels' own GET OAuth-initiate
+    handlers (`amazon/connect`, `ebay/connect`, `tiktok/connect`'s GET) — they only
+    redirect to the provider's consent screen; no credential write happens there, so
+    there is nothing to audit.
+
+**Tests**: no new dedicated test file, same reasoning as `recordAuditEvent` itself (see
+"Tests" below) — and these 7 routes are a worse fit for an e2e test than any other
+audited surface in this codebase: 6 of the 7 make a real network call to a live
+marketplace before ever reaching the INSERT/audit code (Amazon LWA, eBay's token
+exchange, TikTok's token exchange + authorized-shops lookup, Shopify/Temu/Walmart's own
+`verifyConnection()`/`authenticate()`), and every one of those integrations is already
+documented elsewhere in this codebase as UNVERIFIED IN PRACTICE against real provider
+infrastructure (see each connector's own class doc comment) — an e2e test through the
+real route would either need to fake that network call (which none of this codebase's
+existing e2e tests do — they exercise real `next dev` routes end-to-end) or would just
+never get past it. Verified instead via `tsc -b`, `npm run typecheck --workspaces`,
+`bash scripts/run-tests.sh` (the full existing 50-file suite, unaffected — none of these
+routes had a test file exercising them before), and a manual smoke test against real
+Postgres that runs the exact same SQL/`recordAuditEvent` shape each route now runs
+(bypassing only the network call each route makes first, which is the one part every one
+of these 7 routes already documents as unverifiable in this environment): a first
+Amazon connect recording `channel_connection.connected` with `details` containing only
+`channel`/`marketplace`/`externalAccountId` and no secret string anywhere in the row
+(checked by substring search on the raw JSONB text, not just by not-passing one in); a
+second Amazon upsert with the same key recording `channel_connection.credentials_rotated`
+instead; eBay's own `external_account_id = clientId` reuse; the real (fully modified)
+`persistTikTokConnection()` called twice — new shop, then same shop with rotated
+secrets — producing the same connected/rotated split, plus a third call with no
+`actorUserId` argument at all to prove the optional-parameter default doesn't crash and
+correctly records a NULL `user_id`; Shopify's own upsert shape; and a cross-tenant
+isolation check (a second tenant's `channel_connection`-audit row never appears under
+the first tenant's `tenant_id`) — 15 assertions, all passed.
+
 **New RLS policy on `users`, invited by that table's own migration comment**: migration
 0010's own doc comment on `self_lookup_users` already named this exact need — "a future
 'list my org's teammates' feature needs an additional policy branch scoped by

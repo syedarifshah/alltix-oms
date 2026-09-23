@@ -1,9 +1,9 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { withTenant, encryptChannelSecret } from "@alltix/db";
+import { withTenant, encryptChannelSecret, recordAuditEvent } from "@alltix/db";
 import { parseAmazonOAuthCallback, exchangeAmazonAuthorizationCode } from "@alltix/channel-connectors";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
-import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { resolveCurrentUser } from "@/lib/with-tenant-auth";
 import { verifyOAuthState } from "@/lib/amazon-oauth-state";
 import { readAmazonOAuthAppConfig } from "@/lib/amazon-oauth-config";
 
@@ -57,8 +57,8 @@ export async function GET(req: NextRequest): Promise<Response> {
     return redirectWithError(req, "not_signed_in");
   }
   const pool = getAppPool();
-  const tenantIdFromSession = await resolveTenantId(pool, authContext.clerkUserId);
-  if (!tenantIdFromSession || tenantIdFromSession !== tenantIdFromState) {
+  const currentUser = await resolveCurrentUser(pool, authContext.clerkUserId);
+  if (!currentUser || currentUser.tenantId !== tenantIdFromState) {
     return redirectWithError(req, "tenant_mismatch");
   }
 
@@ -99,7 +99,7 @@ export async function GET(req: NextRequest): Promise<Response> {
     const encryptedClientSecret = await encryptChannelSecret(client, clientSecret);
     const encryptedRefreshToken = await encryptChannelSecret(client, refreshToken);
 
-    await client.query(
+    const result = await client.query<{ id: string; is_new: boolean }>(
       `INSERT INTO channel_connections
          (tenant_id, channel, marketplace, external_account_id, lwa_client_id, encrypted_client_secret, encrypted_refresh_token, status)
        VALUES ($1, 'amazon', $2, $3, $4, $5, $6, 'active')
@@ -109,9 +109,27 @@ export async function GET(req: NextRequest): Promise<Response> {
          encrypted_client_secret = EXCLUDED.encrypted_client_secret,
          encrypted_refresh_token = EXCLUDED.encrypted_refresh_token,
          status = 'active',
-         updated_at = now()`,
+         updated_at = now()
+       RETURNING id, (xmax = 0) AS is_new`,
       [tenantIdFromState, marketplace, callback.sellingPartnerId, clientId, encryptedClientSecret, encryptedRefreshToken],
     );
+    const { id, is_new: isNew } = result.rows[0]!;
+
+    // Never logs a secret value, only which channel/account changed --
+    // see recordAuditEvent's own doc comment for why this runs inside the
+    // same transaction as the INSERT above. `xmax = 0` (Postgres's own
+    // "this row was just inserted, not updated" tell on an INSERT ...
+    // ON CONFLICT DO UPDATE) distinguishes a brand-new connection from a
+    // credential rotation on an existing one -- materially different
+    // security events, worth two distinct action strings rather than one.
+    await recordAuditEvent(client, {
+      tenantId: tenantIdFromState,
+      userId: currentUser.id,
+      action: isNew ? "channel_connection.connected" : "channel_connection.credentials_rotated",
+      entityType: "channel_connection",
+      entityId: id,
+      details: { channel: "amazon", marketplace, externalAccountId: callback.sellingPartnerId },
+    });
   });
 
   const url = new URL("/settings/channels", req.url);

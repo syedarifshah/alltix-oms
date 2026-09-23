@@ -8,7 +8,7 @@ import {
 } from "@alltix/channel-connectors";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
-import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { resolveCurrentUser } from "@/lib/with-tenant-auth";
 import { verifyOAuthState } from "@/lib/tiktok-oauth-state";
 import { readTikTokOAuthAppConfig } from "@/lib/tiktok-oauth-config";
 import { persistTikTokConnection } from "@/lib/tiktok-connection";
@@ -86,8 +86,8 @@ export async function GET(req: NextRequest): Promise<Response> {
     return redirectWithError(req, "tiktok_not_signed_in");
   }
   const pool = getAppPool();
-  const tenantIdFromSession = await resolveTenantId(pool, authContext.clerkUserId);
-  if (!tenantIdFromSession || tenantIdFromSession !== tenantIdFromState) {
+  const currentUser = await resolveCurrentUser(pool, authContext.clerkUserId);
+  if (!currentUser || currentUser.tenantId !== tenantIdFromState) {
     return redirectWithError(req, "tiktok_tenant_mismatch");
   }
 
@@ -119,7 +119,12 @@ export async function GET(req: NextRequest): Promise<Response> {
   // the common case (a self-testing tenant's own single shop) and stays as
   // fast as it was before the picker existed.
   if (shops.length === 1) {
-    await persistTikTokConnection(pool, tenantIdFromState, { appKey, appSecret, accessToken, refreshToken, shopCipher: shops[0]!.cipher });
+    await persistTikTokConnection(
+      pool,
+      tenantIdFromState,
+      { appKey, appSecret, accessToken, refreshToken, shopCipher: shops[0]!.cipher },
+      currentUser.id,
+    );
     const url = new URL("/settings/channels", req.url);
     url.searchParams.set("connected", "tiktok");
     return NextResponse.redirect(url);

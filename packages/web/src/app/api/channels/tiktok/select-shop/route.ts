@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server";
 import { withTenant, decryptChannelSecret } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
-import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { resolveCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
 import { verifyPendingTikTokConnectionToken } from "@/lib/tiktok-oauth-pending";
 import { persistTikTokConnection } from "@/lib/tiktok-connection";
@@ -46,12 +46,12 @@ export async function POST(req: NextRequest): Promise<Response> {
     return redirectWithError(req, "/settings/channels", "tiktok_not_signed_in");
   }
   const pool = getAppPool();
-  const tenantIdFromSession = await resolveTenantId(pool, authContext.clerkUserId);
-  if (!tenantIdFromSession || tenantIdFromSession !== pending.tenantId) {
+  const currentUser = await resolveCurrentUser(pool, authContext.clerkUserId);
+  if (!currentUser || currentUser.tenantId !== pending.tenantId) {
     return redirectWithError(req, "/settings/channels", "tiktok_tenant_mismatch");
   }
 
-  if (await checkRateLimit(pool, tenantIdFromSession, "channels.tiktok.select_shop")) {
+  if (await checkRateLimit(pool, currentUser.tenantId, "channels.tiktok.select_shop")) {
     return redirectWithError(req, "/settings/channels", RATE_LIMIT_ERROR_MESSAGE);
   }
 
@@ -67,13 +67,18 @@ export async function POST(req: NextRequest): Promise<Response> {
       refreshToken: await decryptChannelSecret(client, Buffer.from(pending.encryptedRefreshToken, "base64")),
     }));
 
-    await persistTikTokConnection(pool, pending.tenantId, {
-      appKey: pending.appKey,
-      appSecret,
-      accessToken,
-      refreshToken,
-      shopCipher: chosenShop.cipher,
-    });
+    await persistTikTokConnection(
+      pool,
+      pending.tenantId,
+      {
+        appKey: pending.appKey,
+        appSecret,
+        accessToken,
+        refreshToken,
+        shopCipher: chosenShop.cipher,
+      },
+      currentUser.id,
+    );
   } catch (err) {
     return redirectWithError(req, "/settings/channels", `tiktok_save_failed:${errorMessage(err)}`);
   }

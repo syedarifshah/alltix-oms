@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant, encryptChannelSecret } from "@alltix/db";
+import { withTenant, encryptChannelSecret, recordAuditEvent } from "@alltix/db";
 import { WalmartConnector, WALMART_PRODUCTION_BASE_URL } from "@alltix/channel-connectors";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
@@ -93,7 +93,7 @@ export async function POST(req: NextRequest): Promise<Response> {
       // how a tenant could in principle hold more than one Amazon
       // connection today. encrypted_refresh_token is left NULL -- nothing
       // to put there for Walmart's client_credentials grant.
-      await client.query(
+      const result = await client.query<{ id: string; is_new: boolean }>(
         `INSERT INTO channel_connections
            (tenant_id, channel, marketplace, external_account_id, lwa_client_id, encrypted_client_secret, status)
          VALUES ($1, 'walmart', '', $2, $2, $3, 'active')
@@ -102,9 +102,23 @@ export async function POST(req: NextRequest): Promise<Response> {
            lwa_client_id = EXCLUDED.lwa_client_id,
            encrypted_client_secret = EXCLUDED.encrypted_client_secret,
            status = 'active',
-           updated_at = now()`,
+           updated_at = now()
+         RETURNING id, (xmax = 0) AS is_new`,
         [user.tenantId, clientId, encryptedClientSecret],
       );
+      const { id, is_new: isNew } = result.rows[0]!;
+
+      // Never logs a secret value, only which channel/account changed --
+      // see amazon/callback/route.ts's identical comment for the full
+      // xmax = 0 reasoning.
+      await recordAuditEvent(client, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        action: isNew ? "channel_connection.connected" : "channel_connection.credentials_rotated",
+        entityType: "channel_connection",
+        entityId: id,
+        details: { channel: "walmart", marketplace: "", externalAccountId: clientId },
+      });
     });
   } catch (err) {
     return redirectWithError(req, "/settings/channels", `walmart_save_failed:${errorMessage(err)}`);
