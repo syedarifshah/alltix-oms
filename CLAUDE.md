@@ -1200,6 +1200,40 @@ eBay/Temu v1" scope decision.
   same status Temu's and TikTok's connectors carry, for a related but distinct reason
   (those two lack readable official docs at all; this one has readable docs but a
   broken sandbox for exactly the scenario that would prove it).
+- **Update — actually attempted, against a real eBay Sandbox account, not just
+  researched secondhand this time: the community-reported checkout brokenness above
+  is now independently confirmed, not just cited**. Arif ran the full path by hand:
+  registered a real `TESTUSER_...` Sandbox buyer, navigated to a real, freshly-created
+  listing (`createListing()`'s own smoke-test run produced a real
+  `listingId: 110590778099` — this step itself worked cleanly, no issues), clicked
+  "Buy It Now," and got all the way through "Commit to buy" and card entry (a test
+  Visa number was accepted and saved) — materially further than the forum thread
+  quoted above, which failed earlier, at the API/checkout-error stage. The wall hit
+  here was narrower and different: the final "Ship to" step's address form
+  persistently rejects a fully-filled, valid US address (street/city/state/ZIP/phone
+  all present and well-formed) with a bare "Please check your address," no
+  field-level detail. Tried and did not clear it: re-filling every field by hand
+  after an initial validation-triggered reset, explicitly re-selecting the state from
+  its own dropdown (in case a pre-filled value wasn't firing the form's own change
+  event), and substituting a second, different real Seattle address entirely. This is
+  a real, reproducible bug in eBay's OWN sandbox checkout UI, external to this
+  codebase and unfixable from here — confirms rather than contradicts the community
+  reports above, now with a first-hand, more specific failure mode on record instead
+  of only a secondhand one. `confirmShipment()`'s status is unchanged by this attempt
+  (still unverified) but the reason is now a directly-confirmed sandbox defect, not
+  an inference from other people's forum posts.
+  - **Real, if minor, bug found and fixed along the way**: `scripts/
+    ebay-sandbox-smoke-test.ts`'s `createMerchantLocation()` opt-in step crashed the
+    whole script on a second run with the same `EBAY_SANDBOX_TEST_MERCHANT_LOCATION_KEY`
+    — eBay's `createInventoryLocation` (a real POST) isn't idempotent the way
+    `createOrReplaceInventoryItem`'s PUT is, so re-using an already-created key (the
+    normal case — a location only needs to be created once, then reused by every
+    later `createListing()` run) threw `400 25803: merchantLocationKey already
+    exists` and halted before ever reaching `createListing()`. Fixed: that one
+    specific error code is now treated as "already set up, continue" instead of
+    fatal; any other failure still throws. A test-script robustness fix, not a
+    change to `EbayConnector.createMerchantLocation()` itself, which is unchanged and
+    was already correctly reporting the real error eBay returned.
 - **Outbound listing creation — built, closing the prerequisite gap this section used
   to flag as out of scope entirely** (`EbayConnector.createListing()`,
   `fetchBusinessPolicies()`, `createMerchantLocation()`, migration
