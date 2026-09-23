@@ -2888,6 +2888,62 @@ anything that calls `persistPulledOrders`/`transition`/`generatePicklist`/`trans
 and friends) — confirmed zero orphaned rows after a full `bash scripts/run-tests.sh` run
 post-fix.
 
+## 18. A Recurring RLS Bug Class: the Unguarded `app.tenant_id` Cast
+
+**The bug, first found and fixed live in production (migration 0018, 11 Sept 2026)**:
+every `tenant_isolation_*` RLS policy originally cast `current_setting('app.tenant_id',
+true)::uuid` directly. Postgres's documented behavior for a custom (undeclared) GUC on a
+**pooled** connection: once `SET LOCAL app.tenant_id = '...'` has run at least once on a
+physical backend (i.e. any ordinary `withTenant()` call — nearly every request), the
+value that setting reverts to after `COMMIT` is an empty string `''`, not `NULL` — even
+though `current_setting(name, true)` is documented to return `NULL` for a setting that
+was never touched at all. `pg.Pool` reuses physical connections across unrelated
+requests, so a connection that just served a normal `withTenant()` call can later be
+handed to `withClerkUser()` or `withStripeCustomer()` (`packages/db/src/pool.ts`), both
+of which deliberately leave `app.tenant_id` unset for their own pre-tenant-resolution
+reasons — and the stale `''` then hits `''::uuid` and throws `invalid input syntax for
+type uuid: ""`, a real 500, not a permission-denied. Original fix: wrap the cast in
+`NULLIF(current_setting('app.tenant_id', true), '')` so a poisoned `''` becomes a real
+SQL `NULL` (casts to `NULL`, not an error) before the cast ever runs.
+
+**Round 2 (migration 0035)**: the fix in 0018 only touched the tables that existed at the
+time. Nothing in the migration workflow *enforces* the guarded pattern on a new table's
+policy, so five migrations since (0025 `early_channel_cancellations`, 0028 `employees` +
+`time_entries`, 0030 `users`, 0033 `api_rate_limit_windows`, 0034 `audit_log` + a second,
+duplicate `users` policy) all quietly went back to the bare, unguarded cast — the exact
+same class of bug, reintroduced piecemeal, seven policies across six tables. Found while
+investigating `packages/web/test/tenant-isolation.e2e.test.ts`, which every verification
+pass across many sessions had been logging as a "known pre-existing failure" and moving
+on from — it was never flaky or environment-specific, it was this bug, live: `users`'
+tenant-scoped SELECT policy (added by 0030, duplicated by 0034 without either noticing
+the other) is hit by `resolveTenantId()` (`packages/web/src/lib/with-tenant-auth.ts`) on
+**every single request that resolves a tenant from a Clerk session** — i.e. this was a
+real, intermittent, production-live crash on ordinary sign-in/tenant-resolution traffic
+whenever the connection pool happened to hand back a previously tenant-scoped
+connection, which at any real request volume is most of the time. Not caught earlier
+specifically because the assumption "e2e test failure = pre-existing, not this pass's
+concern" was never actually re-examined.
+
+**Fixed** the same way as 0018: `NULLIF(..., '')` on all seven policies, applied via
+`npm run db:migrate`. Also deduplicated `users`' two now-identical policies
+(`tenant_scoped_select_users` from 0030, `tenant_scoped_read_users` from 0034) into one,
+since Postgres evaluates every permissive policy on a command (even a redundant one) —
+harmless for correctness, pure waste otherwise. Verified: `tenant-isolation.e2e.test.ts`
+passes all 4 subtests for the first time this session (previously failing 3/4 with
+exactly this error); `bash scripts/run-tests.sh` — **all 46 test files pass**, zero
+exceptions, the first fully-green run this session; and a dedicated smoke test that
+forces single-connection reuse (`createAppPool({ max: 1 })`) to deterministically
+reproduce the poisoned-connection scenario against each of the six affected tables plus
+a real tenant-scoped read to confirm the `users` dedupe didn't lose legitimate access —
+8 assertions, all passed.
+
+**The actual lesson, not just the bugfix**: a test logged as "known pre-existing" is a
+claim that needs periodic re-verification, not a permanent exemption — especially for
+anything touching RLS/tenant isolation, this platform's single most safety-critical
+guarantee (§6, §11 item 6). A future new tenant-scoped table's migration should crib the
+guarded-cast form directly from this section or from 0018/0035, not from an older
+migration that might itself predate 0018.
+
 ---
 
 *This document reflects standard, well-documented patterns for multichannel OMS/IMS
