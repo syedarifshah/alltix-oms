@@ -1191,29 +1191,39 @@ async function syncShopifyCatalogForTenant(
 const RATE_LIMIT_WINDOW_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Deletes every `api_rate_limit_windows` row (migration 0033) older than
- * `retentionMs`. Migration 0033's own comment named this exact cleanup as
- * deferred, cheap future work "once it's worth writing" -- it's worth
- * writing now that CLAUDE.md §16's rate limiting covers every mutation
- * route in the app (originally nine, not just the order/picklist/inventory
- * hot path), so this table grows meaningfully faster than when that
- * deferral was written.
+ * Deletes every expired row from BOTH of this app's rate-limit window
+ * tables, older than `retentionMs`: `api_rate_limit_windows` (migration
+ * 0033, tenant-scoped) and `public_ip_rate_limit_windows` (migration 0036,
+ * IP-scoped, added when CLAUDE.md §16's own "fourth pass" note closed the
+ * `leads/demo-request` gap). Migration 0033's own comment named this exact
+ * cleanup as deferred, cheap future work "once it's worth writing" -- it's
+ * worth writing now that CLAUDE.md §16's rate limiting covers every
+ * mutation route in the app (originally nine, not just the order/picklist/
+ * inventory hot path), so this table grows meaningfully faster than when
+ * that deferral was written. Extended to the IP-scoped table rather than
+ * standing up a second daily cron for it -- same "one rate-limit window
+ * table, one shape, one retention story" reasoning that table's own
+ * migration comment gives for reusing this job instead of a second one.
  *
  * Uses `adminPool`, not a per-tenant `withTenant` loop: this is a single
- * global maintenance sweep across every tenant's rows by `window_start`
- * alone, the same kind of inherently cross-tenant operation
- * `SyncAmazonOrdersParams.adminPool`'s own doc comment justifies the admin
- * connection for elsewhere in this file -- RLS's per-tenant scoping has
- * nothing to offer a query that isn't about any one tenant. Returns the
- * number of rows deleted, for the cron route's own response body/logging.
+ * global maintenance sweep across every tenant's (or, for the IP-scoped
+ * table, every requester's) rows by `window_start` alone, the same kind of
+ * inherently cross-tenant operation `SyncAmazonOrdersParams.adminPool`'s
+ * own doc comment justifies the admin connection for elsewhere in this
+ * file -- RLS's per-tenant scoping has nothing to offer a query that isn't
+ * about any one tenant, and `public_ip_rate_limit_windows` has no tenant
+ * scoping to begin with (its own migration's `USING (true)` policy).
+ * Returns the total number of rows deleted across both tables, for the cron
+ * route's own response body/logging.
  */
 export async function cleanupRateLimitWindows(
   adminPool: Pool,
   retentionMs: number = RATE_LIMIT_WINDOW_RETENTION_MS,
 ): Promise<number> {
   const cutoff = new Date(Date.now() - retentionMs);
-  const result = await adminPool.query("DELETE FROM api_rate_limit_windows WHERE window_start < $1", [cutoff]);
-  return result.rowCount ?? 0;
+  const tenantScoped = await adminPool.query("DELETE FROM api_rate_limit_windows WHERE window_start < $1", [cutoff]);
+  const ipScoped = await adminPool.query("DELETE FROM public_ip_rate_limit_windows WHERE window_start < $1", [cutoff]);
+  return (tenantScoped.rowCount ?? 0) + (ipScoped.rowCount ?? 0);
 }
 
 // The recurring trigger this file's own header comment above flagged as

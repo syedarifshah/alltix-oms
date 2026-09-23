@@ -12,6 +12,7 @@
     "test:hr-mutations-e2e": "node --import tsx --test test/hr-mutations-e2e.test.ts",
     "test:locations-mutations-e2e": "node --import tsx --test test/locations-mutations-e2e.test.ts",
     "test:new-rate-limited-routes-e2e": "node --import tsx --test test/new-rate-limited-routes-e2e.test.ts",
+    "test:demo-request-rate-limit-e2e": "node --import tsx --test test/demo-request-rate-limit-e2e.test.ts",
     "test:amazon-oauth-state": "node --import tsx --test test/amazon-oauth-state.test.ts",
     "test:tiktok-oauth-state": "node --import tsx --test test/tiktok-oauth-state.test.ts",
     "test:tiktok-oauth-pending": "node --import tsx --test test/tiktok-oauth-pending.test.ts",

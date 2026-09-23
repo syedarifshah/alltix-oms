@@ -10,13 +10,16 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 30;
 
 /**
- * GET /api/cron/rate-limit-window-cleanup -- daily sweep of expired
- * `api_rate_limit_windows` rows (migration 0033), via
- * `cleanupRateLimitWindows` (packages/scheduler/src/index.ts). Migration
- * 0033's own comment named this exact cleanup as deferred, cheap future
- * work "once it's worth writing" -- see that function's own doc comment
- * for why it's worth writing now (CLAUDE.md §16 covers every mutation
- * route in the app, not just the original nine).
+ * GET /api/cron/rate-limit-window-cleanup -- daily sweep of expired rows
+ * from BOTH `api_rate_limit_windows` (migration 0033, tenant-scoped) and
+ * `public_ip_rate_limit_windows` (migration 0036, IP-scoped, for
+ * `leads/demo-request`), via `cleanupRateLimitWindows`
+ * (packages/scheduler/src/index.ts). Migration 0033's own comment named
+ * this exact cleanup as deferred, cheap future work "once it's worth
+ * writing" -- see that function's own doc comment for why it's worth
+ * writing now (CLAUDE.md §16 covers every mutation route in the app, not
+ * just the original nine) and for why the IP-scoped table shares this same
+ * job rather than getting a second one.
  *
  * Same CRON_SECRET Bearer-token auth, `getAdminPool()` cross-tenant-
  * operation justification, and idempotency-by-construction (re-running

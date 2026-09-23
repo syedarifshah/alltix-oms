@@ -2691,15 +2691,10 @@ guard.
   already carry). Verified by `tsc -b`/`next build` and direct code inspection only,
   not a live HTTP trip — an honest, narrower verification than the other 10 route
   cases below get, not a silently-assumed one.
-- **Two routes remain correctly, deliberately unprotected by this tenant-scoped
-  mechanism, not a fifth gap**: `leads/demo-request` is public/unauthenticated — it has
-  no `tenantId` for this table's own primary key, so it needs a structurally different
-  mechanism (most plausibly IP-based) that this pass doesn't build; this is a real,
-  still-open gap worth flagging plainly rather than silently leaving unaddressed and
-  unnamed.
-  The 3 webhook routes (`webhooks/{clerk,shopify,stripe}`) are signature-verified, not
-  session-based, and were never in scope for a tenant-session rate limiter to begin
-  with.
+- **`leads/demo-request` was flagged here as a real, still-open gap — now closed by a
+  fifth pass, see below.** The 3 webhook routes (`webhooks/{clerk,shopify,stripe}`) are
+  signature-verified, not session-based, and were never in scope for a tenant-session
+  rate limiter to begin with — not a gap, deliberately out of scope.
 - **Tested end-to-end, not just build/typecheck-verified, for 9 of the 10**:
   `packages/web/test/new-rate-limited-routes-e2e.test.ts` (port 4176, joining
   `tenant-isolation.e2e.test.ts`/`hr-mutations-e2e.test.ts`/
@@ -2726,6 +2721,68 @@ guard.
   `packages/web/package.json`'s `test:new-rate-limited-routes-e2e` and
   `scripts/run-tests.sh`'s `SAFE_TESTS`, same "every new test file goes in this list or
   it's effectively untested in CI" rule that script's own header comment states.
+
+**Coverage — fifth pass, closing `leads/demo-request`, the one real gap the fourth pass
+above flagged and left open**: `api_rate_limit_windows` (migration 0033) can't cover this
+route at all — an anonymous "Book a Demo" submission has no `tenantId`, the table's own
+primary-key column. Fixed with a structurally separate mechanism, not a workaround
+forced into the tenant-scoped one: migration `0036_public_ip_rate_limit_windows.sql`
+adds a twin table keyed by `(ip_address, route_key, window_start)` instead of
+`(tenant_id, route_key, window_start)`, with RLS still enabled (`USING (true)`,
+`FORCE ROW LEVEL SECURITY`) even though there's no tenant to scope by — same
+"defense-in-depth stays on even for a non-tenant table" precedent
+`demo_requests`' own `public_insert_demo_requests` policy (migration 0017) already set.
+`packages/web/src/lib/rate-limit.ts` gained `checkIpRateLimit`/`getClientIp`/
+`DEFAULT_PUBLIC_RATE_LIMIT_PER_MINUTE` (5/IP/route/minute — deliberately much tighter
+than the tenant-scoped default of 120, since this route is reachable by anyone,
+including a script, not just an already-signed-in tenant's own browser) alongside the
+existing tenant-scoped `checkRateLimit`/`recordRequestAndCheckRateLimit` — no
+`withTenant()` wrapper, since there's no `app.tenant_id` to `SET LOCAL` and the new
+table's own policy doesn't need one, same "direct `app_user` query, no tenant
+context" shape `leads/demo-request`'s own `demo_requests` INSERT already uses.
+
+- **`getClientIp` reads `x-forwarded-for` (first entry — the original client, not the
+  last proxy hop), falling back to `x-real-ip`, then a fixed `"unknown"` placeholder**
+  when neither header exists (local dev with nothing in front of the app). Confirmed
+  directly against the installed Next.js package's own `request.d.ts` before writing
+  this: `NextRequest` has no built-in `.ip` property in this app's pinned 16.3.3, unlike
+  an older Next.js — not assumed from training data. Trusts whatever the outermost
+  proxy reports, which is only safe when that proxy can't be bypassed by the client —
+  true on Vercel (this app's real deployment target, §5), where the edge network sets
+  this header itself and strips whatever a client sent; a self-hosted deployment with
+  no trusted reverse proxy in front would let a client spoof past this entirely. Not
+  defended against, since it isn't this app's actual deployment shape — flagged plainly
+  in `getClientIp`'s own doc comment rather than silently assumed safe everywhere.
+- **The route itself returns a real `429` + `Retry-After` header, not this app's usual
+  redirect-with-`?error=`**: `leads/demo-request` is a JSON `fetch()` API
+  (`BookDemoForm`'s own client component reads `response.ok`/`body.error`), not a
+  browser form POST with a page to redirect back to — a 429 with `Retry-After` is the
+  structurally correct HTTP shape for a JSON endpoint a script might be calling, and the
+  first route in this section to actually use `RateLimitExceededError.retryAfterSeconds`
+  for anything (every redirect-based route discards it, since a redirect target has
+  nowhere to put an HTTP header the browser would act on).
+- **Cleanup — extended the existing job, not a second one**: `cleanupRateLimitWindows`
+  (`packages/scheduler/src/index.ts`) now sweeps both `api_rate_limit_windows` and
+  `public_ip_rate_limit_windows` on the same daily cron
+  (`/api/cron/rate-limit-window-cleanup`), same 24-hour retention, same
+  `adminPool`-bypasses-RLS reasoning as before — one rate-limit-window table shape, one
+  retention story, not a second cron route for a second table.
+- **Tested end-to-end, via real requests rather than a pre-seeded window**: unlike the
+  fourth pass's own 10 cases (which pre-seed a tenant-scoped window to avoid actually
+  firing 120+ requests against a route that would call Stripe or a real marketplace
+  API), this route's real work is just a local DB insert plus a no-op email
+  (`RESEND_API_KEY` is unset in every test environment) and its own limit is only 5 —
+  cheap enough that `packages/web/test/demo-request-rate-limit-e2e.test.ts` (port 4177)
+  fires the actual requests: the first 5 from one simulated IP (`x-forwarded-for` set
+  directly on the test's own `fetch()` calls — `next dev` has no real proxy in front of
+  it locally) all succeed, the 6th is rejected with `429` + a positive `Retry-After`
+  value, and a request from a *different* simulated IP is unaffected — proving the
+  budget is per-IP, not a global trip. `getClientIp`'s own header-parsing logic (the
+  `x-forwarded-for` chain, the `x-real-ip` fallback, the `"unknown"` placeholder) is
+  separately pure-function-tested in `rate-limit.test.ts`, no Next.js/edge-runtime
+  import needed for those cases (it takes a plain `Headers` object, not a whole
+  `NextRequest`). Both wired into `packages/web/package.json`
+  (`test:demo-request-rate-limit-e2e`) and `scripts/run-tests.sh`'s `SAFE_TESTS`.
 
 **Why not enforced centrally in `withTenantAuth`/`requireCurrentUser` itself**: only 4
 of this codebase's ~34 authenticated routes go through `withTenantAuth` (see that

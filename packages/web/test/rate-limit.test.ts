@@ -6,7 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { computeWindowStart, computeRetryAfterSeconds } from "../src/lib/rate-limit.js";
+import { computeWindowStart, computeRetryAfterSeconds, getClientIp } from "../src/lib/rate-limit.js";
 
 const ONE_MINUTE = 60_000;
 
@@ -43,4 +43,44 @@ test("computeRetryAfterSeconds never returns less than 1, even right at window c
   const windowStart = 0;
   assert.equal(computeRetryAfterSeconds(windowStart, ONE_MINUTE, 60_000), 1);
   assert.equal(computeRetryAfterSeconds(windowStart, ONE_MINUTE, 65_000), 1);
+});
+
+// getClientIp -- pure header-parsing coverage for the leads/demo-request
+// IP-scoped limiter's own caller identification (CLAUDE.md §16's "fourth
+// pass" note). Takes a plain Headers object, not a NextRequest, specifically
+// so these cases need no Next.js/edge-runtime import at all.
+
+test("getClientIp reads the first entry of a comma-separated x-forwarded-for chain", () => {
+  const headers = new Headers({ "x-forwarded-for": "203.0.113.7, 70.41.3.18, 150.172.238.178" });
+  assert.equal(getClientIp(headers), "203.0.113.7");
+});
+
+test("getClientIp trims whitespace around the first x-forwarded-for entry", () => {
+  const headers = new Headers({ "x-forwarded-for": "  203.0.113.7  ,70.41.3.18" });
+  assert.equal(getClientIp(headers), "203.0.113.7");
+});
+
+test("getClientIp handles a single-value x-forwarded-for (no proxy chain)", () => {
+  const headers = new Headers({ "x-forwarded-for": "203.0.113.7" });
+  assert.equal(getClientIp(headers), "203.0.113.7");
+});
+
+test("getClientIp falls back to x-real-ip when x-forwarded-for is absent", () => {
+  const headers = new Headers({ "x-real-ip": "203.0.113.9" });
+  assert.equal(getClientIp(headers), "203.0.113.9");
+});
+
+test("getClientIp prefers x-forwarded-for over x-real-ip when both are present", () => {
+  const headers = new Headers({ "x-forwarded-for": "203.0.113.7", "x-real-ip": "203.0.113.9" });
+  assert.equal(getClientIp(headers), "203.0.113.7");
+});
+
+test("getClientIp falls back to a fixed placeholder when neither header is present", () => {
+  const headers = new Headers();
+  assert.equal(getClientIp(headers), "unknown");
+});
+
+test("getClientIp falls back to the placeholder for an empty x-forwarded-for value", () => {
+  const headers = new Headers({ "x-forwarded-for": "" });
+  assert.equal(getClientIp(headers), "unknown");
 });

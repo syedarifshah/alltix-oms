@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { sendEmail } from "@alltix/shared";
 import { getAppPool } from "@/lib/db";
+import { checkIpRateLimit, getClientIp, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -22,8 +23,36 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
  * than withTenant/withClerkUser -- see packages/db/migrations/0017_demo_requests.sql
  * for why that's safe (RLS is still enabled, just with an insert-only
  * policy, no SELECT grant for app_user).
+ *
+ * Rate limited by requester IP, not by tenant -- CLAUDE.md §16's own
+ * "fourth pass" note named this as the one mutation route every other
+ * rate-limiting pass left unprotected, since a signed-out visitor has no
+ * `tenantId` for `api_rate_limit_windows` (migration 0033) to key a window
+ * by at all. `checkIpRateLimit`/`getClientIp` (`@/lib/rate-limit`, migration
+ * 0036_public_ip_rate_limit_windows.sql) close that the same structural way
+ * every other rate-limited route in this app is checked: right after
+ * resolving the caller (here, the caller's IP, the only identity a public
+ * route has) and before any real work -- JSON-parsing the body included,
+ * since a spam script's body is exactly the "real work" this exists to stop
+ * before it reaches a DB write or a real outbound email. Returns a 429 with
+ * a `Retry-After` header, not this app's usual redirect-with-`?error=` --
+ * this is a JSON `fetch()` API (`BookDemoForm`'s own client component), not
+ * a browser form POST, so there's no page to redirect back to, and a 429 +
+ * `Retry-After` is the actually-correct HTTP shape for a JSON API a script
+ * might be calling, unlike every other rate-limited route in this app.
  */
 export async function POST(req: NextRequest): Promise<Response> {
+  const pool = getAppPool();
+
+  const clientIp = getClientIp(req.headers);
+  const rateLimitError = await checkIpRateLimit(pool, clientIp, "leads.demo_request");
+  if (rateLimitError) {
+    return NextResponse.json(
+      { error: RATE_LIMIT_ERROR_MESSAGE },
+      { status: 429, headers: { "Retry-After": String(rateLimitError.retryAfterSeconds) } },
+    );
+  }
+
   let body: DemoRequestBody;
   try {
     body = (await req.json()) as DemoRequestBody;
@@ -46,7 +75,6 @@ export async function POST(req: NextRequest): Promise<Response> {
     return NextResponse.json({ error: "company or message is too long" }, { status: 400 });
   }
 
-  const pool = getAppPool();
   await pool.query(
     "INSERT INTO demo_requests (name, email, company, message) VALUES ($1, $2, $3, $4)",
     [name, email, company || null, message || null],
