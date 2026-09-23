@@ -1,8 +1,10 @@
 // Direct SQL-level cross-tenant proof for employees/time_entries (migration
 // 0028_hr_payroll_employees_and_time_entries.sql, CLAUDE.md §14), mirroring
-// channel-connections-rls.test.ts's own rigor and reasoning -- there's no
-// HTTP API test suite for these routes yet (same gap /locations has), so
-// this is the DB-layer proof that RLS actually isolates them, plus the two
+// channel-connections-rls.test.ts's own rigor and reasoning. The route-level
+// HTTP behavior (auth, form parsing, redirect-with-error shapes) is now
+// covered separately by packages/web/test/hr-mutations-e2e.test.ts -- this
+// file stays focused on what only a direct SQL connection can prove: that
+// RLS itself actually isolates these two tables cross-tenant, plus the two
 // schema-level invariants the HR module design leans on: an employee
 // existing without wage data, and a time_entries CHECK constraint that
 // keeps clock_out from ever preceding clock_in.

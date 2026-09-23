@@ -2406,7 +2406,7 @@ from there.
   gives.
   - **Route-level HTTP suite — built**, closing the "no page-level/route-level test
     suite exists for `/hr`/`/hr/payroll` yet" gap this bullet used to flag (`/locations`
-    has the same gap open still — this pass only closed it for HR):
+    had the same gap — closed too, next paragraph below):
     `packages/web/test/hr-mutations-e2e.test.ts` reuses `tenant-isolation.e2e.test.ts`'s
     exact real-HTTP
     pattern (spawn `next dev`, `ALLTIX_TEST_AUTH_BYPASS=true`, drive it with real
@@ -2427,6 +2427,22 @@ from there.
     `scripts/run-tests.sh`'s `SAFE_TESTS` (needs only Postgres, no external network) —
     the same "add every new test file to the list, or CI silently never runs it" rule
     that script's own header comment already states.
+  - **`/locations`' own equal-and-opposite gap — also closed**: `hr-rls.test.ts`'s own
+    header comment named `/locations` as carrying this exact same "no HTTP-level test
+    suite" gap (its 3 mutation routes — `create`, `[id]/rename`, `[id]/set-postal-code`
+    — had only ever been build/typecheck-verified, never actually exercised as real
+    requests). `packages/web/test/locations-mutations-e2e.test.ts` closes it the same
+    way, on its own port (4175 — 4173/4174 are already `tenant-isolation.e2e.test.ts`/
+    `hr-mutations-e2e.test.ts`'s): an unauthenticated create is rejected; a missing-
+    fields and an invalid-`type` submission are both rejected before touching the
+    database; `create` → `rename` → `set-postal-code` end to end, confirming `rename`
+    never touches `type` (that route's own doc comment on why), a bogus id on either
+    `rename` or `set-postal-code` redirects with `error=location_not_found` rather than
+    silently no-op'ing, and an empty `postalCode` submission clears it back to `NULL`
+    rather than being rejected (`set-postal-code`'s own doc comment on why a blank
+    value is meaningful, not invalid). Same wiring convention: `test:
+    locations-mutations-e2e` in `packages/web/package.json`, `SAFE_TESTS` in
+    `scripts/run-tests.sh`.
 
 ### 14.1 Real payroll processor integration (task #34 — Arif's explicit pick: Check)
 
