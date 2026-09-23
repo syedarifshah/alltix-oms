@@ -5,6 +5,7 @@
     { "path": "packages/db" },
     { "path": "packages/inventory-service" },
     { "path": "packages/billing-service" },
+    { "path": "packages/payroll-service" },
     { "path": "packages/order-service" },
     { "path": "packages/warehouse-service" },
     { "path": "packages/rules-engine" },

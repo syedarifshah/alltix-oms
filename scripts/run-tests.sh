@@ -60,6 +60,7 @@ SAFE_TESTS=(
   "packages/rules-engine/test/send-notification-integration.test.ts"
   "packages/rules-engine/test/webhook-integration.test.ts"
   "packages/billing-service/test/usage-reporter.test.ts"
+  "packages/payroll-service/test/check-client.test.ts"
   "packages/order-service/test/persist-and-allocate.test.ts"
   "packages/order-service/test/allocation-concurrency.test.ts"
   "packages/order-service/test/multi-warehouse-allocation.test.ts"

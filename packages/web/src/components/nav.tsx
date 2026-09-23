@@ -53,6 +53,13 @@ export async function Nav(): Promise<ReactElement> {
       <a href="/reports">Reports</a>
       <a href="/settings/billing">Billing</a>
       <a href="/settings/channels">Settings</a>
+      {/* Real Check payroll-processor integration (CLAUDE.md §14.1, task
+          #34) -- deliberately a separate nav entry from "/hr/payroll" above
+          (task #33's existing gross-wage-calculation view): that one is a
+          read-only report over tracked hours, this one is where money
+          actually moves through Check's own hosted Components. See
+          settings/payroll/page.tsx's own doc comment for the full split. */}
+      <a href="/settings/payroll">Check Payroll</a>
       <a href="/settings/activity">Activity</a>
       <div className="nav-spacer" />
       <ThemeToggle />

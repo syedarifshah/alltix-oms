@@ -2547,11 +2547,95 @@ from there.
 
 ### 14.1 Real payroll processor integration (task #34 — Arif's explicit pick: Check)
 
-**Status: research/design only — NOT built.** No code exists yet; this section is the
-scoping pass §14's own "explicitly out of scope, pending its own dedicated
-research/scoping pass" line always pointed at. Nothing here should be treated as
-implemented until a "Wired into the app" note like every channel connector's own
-(§4.1-§4.7) appears below it.
+**Status: wired but UNVERIFIED.** Schema, service layer, and a `/settings/payroll`
+UI skeleton are now built (migration `0038_payroll_connections.sql`,
+`packages/payroll-service`, `/settings/payroll` + its onboard/run-payroll Component
+embedding pages) — same "wired but unverified" status Walmart/eBay/Temu/TikTok each
+carried before their own first real credentials arrived (§4.2/§4.6/§4.7/§4.8): no
+real Check API key exists anywhere in this codebase or Arif's account yet (Check has
+no self-serve sandbox signup — the "Get in touch" contact form on checkhq.com was
+submitted, with a "we'll contact you within 2 working days" confirmation, but no key
+had arrived as of this build), so nothing below has round-tripped against
+`sandbox.checkhq.com`. Submitting a real key through `/settings/payroll` will
+correctly fail at `connectPayrollProcessor()`'s live verification call until one
+exists — same "verify before persist" discipline every channel's own connect route
+already follows.
+
+**Research this pass, before writing any schema/code** (docs.checkhq.com, fetched
+live via `WebFetch` — this session's raw Bash/curl cannot reach checkhq.com, but
+`WebFetch`/`WebSearch` can, a distinct workaround from the one already noted for
+eBay's blocked API hosts): every field/endpoint in `packages/payroll-service/src/index.ts`
+is marked CONFIRMED (fetched directly from a reference page) or INFERRED (this
+codebase's own best-effort extrapolation from a confirmed sibling endpoint's shape,
+same disclosure discipline TemuConnector's own class doc comment established) —
+worth reading that file's own comments before trusting any one endpoint shape,
+rather than restating the full breakdown here. Headline confirmed facts: auth is
+`Authorization: Bearer <api_key>` (sandbox and live keys issued separately); sandbox
+base URL is `https://sandbox.checkhq.com`; `POST /companies` and `POST /employees`
+create those two resources (exact required/optional fields confirmed); the `onboard`
+object (`status`: `completed`/`needs_attention`/`blocking`) lives directly on the
+company/employee/contractor resource, no separate status endpoint; and
+`POST /companies/{company}/components/run_payroll` is the one Component-link
+endpoint confirmed outright (prerequisites: ≥1 employee/contractor, ≥1 pay schedule,
+company onboard status `completed`) — `company_onboard`/`employee_onboard`'s own
+endpoint paths are INFERRED by symmetry with that confirmed shape, not directly
+fetched. Also newly confirmed and worth flagging: the quickstart's own 9-step flow
+requires a `Workplace` resource (`POST /workplaces`, INFERRED path) between Company
+and Employee creation — `employees.workplaces` is a required array of workplace ids
+this pass did not anticipate before researching, so `linkEmployeeToCheck()` takes a
+caller-supplied `workplaceIds` array rather than resolving one automatically (see
+"Explicitly not decided/built yet" below).
+
+**What's actually built** (mirrors this section's own pre-existing sketch closely —
+see that sketch, kept below for its own reasoning, now annotated with what changed
+in the build):
+- `payroll_connections` (migration 0038): one row per tenant (`UNIQUE(tenant_id)`,
+  unlike `channel_connections`' own four-column uniqueness — Check really is "one
+  processor per tenant," confirmed by building it, not just assumed), holding a
+  pgcrypto-encrypted API key (reuses `encryptChannelSecret`/`decryptChannelSecret`
+  from `packages/db/src/encryption.ts` rather than duplicating them — see that
+  migration's own doc comment for why that's a deliberate reuse, not an oversight)
+  plus a nullable `check_company_id`.
+- `employees.check_employee_id` (migration 0038): nullable, expand-only TEXT column,
+  same precedent `orders.channel_connection_id` (migration 0037) set — a partial
+  unique index (`WHERE check_employee_id IS NOT NULL`) stops the same Check employee
+  from ever being linked to two local rows for one tenant.
+- `packages/payroll-service` — its own package (mirrors `@alltix/billing-service`'s
+  placement far more than any `channel-connectors` adapter: Check is not a sales
+  channel, and `packages/scheduler` never needs it the way it needs every real
+  channel connector for cron-driven sync). `CheckClient` is a thin hand-rolled
+  `fetch` wrapper (no official or credible community Node/TS SDK was found, unlike
+  Temu's own installed `temu_api` Python package) with `connectPayrollProcessor()`,
+  `createCheckCompanyForTenant()`, `linkEmployeeToCheck()` (expand-only, refuses to
+  re-link an already-linked employee), `generateCompanyOnboardLink()`,
+  `generateEmployeeOnboardLink()`, `generateRunPayrollLink()`, and
+  `getCompanyOnboardStatus()`. 9 tests (`test/check-client.test.ts`, wired into
+  `scripts/run-tests.sh`), all against a stubbed `global.fetch` — same "no real
+  vendor network call in the test suite" discipline `packages/shared/test/email.test.ts`
+  established for Resend.
+- `/settings/payroll` (a new page, deliberately separate from `/hr/payroll` — that
+  one stays §14 task #33's own untouched, read-only gross-wage report;
+  `/settings/payroll` is where money actually moves) — Connect Check → Create Check
+  Company → the two "embedding points" the build explicitly asked for:
+  `/settings/payroll/onboard/company` and `/settings/payroll/onboard/employee/[id]`
+  (Check Onboard) and `/settings/payroll/run` (Run Payroll), each a plain
+  server-rendered page that generates a **fresh** Component link on every load
+  (Check's own docs are explicit a reload requires a new link) and embeds it via a
+  raw `<iframe>` — no client-side `component-initialize.js` SDK script, since that
+  script only adds a modal-chrome/event-callback layer this pass's per-page embed
+  doesn't need. Employee linking is a plain form on `/settings/payroll` itself
+  (a text field for a Check Workplace id — see "Explicitly not decided" below for
+  why that's not yet a real dropdown).
+
+**Explicitly not decided/built yet**: which of a tenant's own `locations` rows (if
+any) should become which Check `Workplace` — `CheckClient.createWorkplace()` exists,
+but no service function or UI decides that mapping automatically; a tenant must
+create the Workplace in Check's own Dashboard and paste its id into the "Link to
+Check" form for now. Also unbuilt: real-time Check webhooks (payroll status changes,
+tax filing confirmations) — everything above is Component-embed and on-demand-read
+only, no webhook receiver yet. And, unchanged from before this pass: whether Check's
+real pricing is viable at this platform's current single-self-testing-tenant stage
+(§0) — revisit once Arif has a real quote, which is still pending as of this build.
 
 **Why this needs a real processor, not more of this codebase's own SQL**: §14's
 gross-wage view (hours × rate) deliberately stops short of tax withholding,
@@ -2577,44 +2661,27 @@ feature to ITS OWN tenants, under alltix-oms's own brand. Four compared:
 
 **None of these four publish self-serve pricing** — every one gates cost/revenue-share
 terms behind a sales conversation, confirmed across multiple searches and vendor
-pages. This is a real, load-bearing gap: task #34's actual next step is Arif getting
-a real quote (and likely a sandbox API key) from Check's sales team — something this
-research pass cannot do on its own. Nothing below should be built against a live
-Check API until that account exists, same "UNVERIFIED pending real credentials"
-discipline this codebase already holds Walmart/eBay/Temu to (§4.2/§4.6/§4.7).
+pages. This is a real, load-bearing gap: task #34's actual next step is still Arif
+getting a real quote (and a real sandbox API key) from Check's sales team — something
+this research pass cannot do on its own, and something the build described above
+does not change. What changed this pass is only that the schema/service/UI layer no
+longer has to be built AFTER that quote arrives — same "wired but unverified, ahead
+of real credentials" call already made for Walmart/eBay/Temu/TikTok (§4.2/§4.6/§4.7),
+now extended to this module too.
 
-**Check's confirmed data model** (from `docs.checkhq.com`, not yet exercised against
-a live account): `Company` (the tenant, requires EIN verification), `Employee`/
-`Worker` and `Contractor`, `Pay Schedule`, `Payroll` (a pay run), bank accounts
-(linked via Plaid), and tax documents. Two integration depths: the raw API for full
-programmatic control, or **Check Components** — prebuilt, white-labeled iframes for
-"Onboard" (collects an employee's bank details, tax withholding elections, and tax
-form e-signature in one flow) and "Run Payroll" (submits a pay run with a live
-preview/totals before finalizing).
-
-**Design direction (not yet built)**: use Check Components for v1, not the raw API —
-same reasoning as choosing Check over Gusto's own Flows isn't really "components vs.
-API," it's that **building a custom UI for bank-account linking and tax-withholding-
-election collection would mean re-implementing a highly regulated, liability-heavy
-surface Check has already built and battle-tested**, which is exactly the kind of
-work §5's "buy, don't build" table already says this team shouldn't take on itself.
-Sketch of the flow once a real account exists: a new `/settings/payroll` connects a
-tenant's Check `Company` (their own EIN/bank via the Onboard Component, embedded,
-not collected into this app's own DB — a deliberate privacy/liability boundary, not
-an oversight); each `employees` row gets a nullable `check_employee_id` (an
-expand-only column, added only when this is actually built, not before) once that
-employee completes their own Check Onboard flow; a pay run is triggered from THIS
-app's own already-built gross-wage view (§14, task #33) — `time_entries` stays the
-system of record for hours worked, Check becomes the system of record for money
-movement and tax compliance only, not a second place hours get tracked. A new
-`payroll_connections` table (tenant_id + encrypted Check API key + `check_company_id`
-+ status) would mirror `channel_connections`' own shape (§2.4) but scoped to one
-processor per tenant, not one row per channel/marketplace pair.
-
-**Explicitly not decided/built yet**: the actual schema migration, any UI, any
-`packages/` service/connector code, and — most importantly — whether Check's real
-pricing is viable at this platform's current single-self-testing-tenant stage (§0).
-Revisit once Arif has a real quote.
+**Check's confirmed data model** (from `docs.checkhq.com`): `Company` (the tenant,
+requires EIN verification), `Workplace`, `Employee`/`Worker` and `Contractor`,
+`Pay Schedule`, `Payroll` (a pay run), bank accounts (linked via Plaid), and tax
+documents. Two integration depths: the raw API for full programmatic control, or
+**Check Components** — prebuilt, white-labeled iframes for "Onboard" (collects an
+employee's bank details, tax withholding elections, and tax form e-signature in one
+flow) and "Run Payroll" (submits a pay run with a live preview/totals before
+finalizing) — this codebase uses Components exclusively (see "What's actually built"
+above), same reasoning as choosing Check over Gusto's own Flows in the first place:
+**building a custom UI for bank-account linking and tax-withholding-election
+collection would mean re-implementing a highly regulated, liability-heavy surface
+Check has already built and battle-tested**, exactly the kind of work §5's "buy,
+don't build" table already says this team shouldn't take on itself.
 
 ## 15. Channel Feature Flags (per-tenant rollout gating, §9's own future item)
 

@@ -26,6 +26,7 @@
     "@alltix/db": "0.1.0",
     "@alltix/inventory-service": "0.1.0",
     "@alltix/order-service": "0.1.0",
+    "@alltix/payroll-service": "0.1.0",
     "@alltix/rules-engine": "0.1.0",
     "@alltix/scheduler": "0.1.0",
     "@alltix/shared": "0.1.0",
