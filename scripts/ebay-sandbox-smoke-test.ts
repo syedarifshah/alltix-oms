@@ -177,7 +177,20 @@ async function main(): Promise<void> {
     console.log("createMerchantLocation result:");
     console.log(`  success: ${result.success}`);
     if (result.error) console.log(`  error: ${result.error}`);
-    if (!result.success) {
+    // eBay's createInventoryLocation is a real POST, not idempotent the way
+    // createOrReplaceInventoryItem's PUT is -- re-running this smoke test
+    // with the SAME merchantLocationKey (the normal case: you only need to
+    // create a location once, then reuse it for every later run's own
+    // createListing() call) fails with 25803 "merchantLocationKey already
+    // exists" even though the location is still there and perfectly usable.
+    // Treat that one specific error as benign -- the location this run
+    // needed already exists, which is success for this script's purposes --
+    // rather than crash-stopping before ever reaching createListing() below.
+    // Any OTHER failure (bad address fields, auth, etc.) still throws.
+    const locationAlreadyExists = !result.success && result.error?.includes("25803");
+    if (locationAlreadyExists) {
+      console.log("  (merchantLocationKey already exists -- treating as already set up, continuing.)");
+    } else if (!result.success) {
       throw new Error("createMerchantLocation did not succeed -- see result above.");
     }
   } else {
