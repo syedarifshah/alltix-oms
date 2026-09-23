@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import type { LocationType } from "@alltix/shared";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
@@ -60,14 +60,22 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   try {
-    await withTenant(pool, user.tenantId, (client) =>
-      client.query(`INSERT INTO locations (tenant_id, name, type, postal_code) VALUES ($1, $2, $3, $4)`, [
-        user.tenantId,
-        name,
-        type,
-        postalCode,
-      ]),
-    );
+    await withTenant(pool, user.tenantId, async (client) => {
+      const result = await client.query<{ id: string }>(
+        `INSERT INTO locations (tenant_id, name, type, postal_code) VALUES ($1, $2, $3, $4) RETURNING id`,
+        [user.tenantId, name, type, postalCode],
+      );
+      // Same transaction as the INSERT above -- see recordAuditEvent's own
+      // doc comment for why that matters.
+      await recordAuditEvent(client, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        action: "location.created",
+        entityType: "location",
+        entityId: result.rows[0]!.id,
+        details: { name, type, postalCode },
+      });
+    });
   } catch (err) {
     return redirectWithError(req, "/locations", `location_create_failed:${errorMessage(err)}`);
   }

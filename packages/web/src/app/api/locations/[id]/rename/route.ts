@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
@@ -42,14 +42,28 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   }
 
   try {
-    const result = await withTenant(pool, user.tenantId, (client) =>
-      client.query(`UPDATE locations SET name = $1, updated_at = now() WHERE id = $2 AND tenant_id = $3`, [
-        name,
-        id,
-        user.tenantId,
-      ]),
-    );
-    if (result.rowCount === 0) {
+    const rowCount = await withTenant(pool, user.tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE locations SET name = $1, updated_at = now() WHERE id = $2 AND tenant_id = $3`,
+        [name, id, user.tenantId],
+      );
+      if (result.rowCount) {
+        // Same transaction as the UPDATE above -- see recordAuditEvent's own
+        // doc comment for why that matters. Only recorded when a row was
+        // actually matched, same "no audit row for a mutation that didn't
+        // happen" discipline hr/employees/[id]/update already established.
+        await recordAuditEvent(client, {
+          tenantId: user.tenantId,
+          userId: user.id,
+          action: "location.renamed",
+          entityType: "location",
+          entityId: id,
+          details: { name },
+        });
+      }
+      return result.rowCount;
+    });
+    if (rowCount === 0) {
       return redirectWithError(req, "/locations", "location_not_found");
     }
   } catch (err) {

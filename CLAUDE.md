@@ -2201,6 +2201,21 @@ from there.
   `taskkill /IM node.exe` or `pkill node` — it can kill unrelated Node processes on the
   same machine (other dev servers, editor extensions, etc.), not just the one the test
   started.
+- **e2e test `after()` hooks have no `try`/`finally` around their own cleanup queries**
+  — found while closing §17's products/locations audit-log gap: a cleanup query that
+  throws partway through (e.g. a `DELETE` hitting a foreign-key violation, see §17's
+  own "products and locations" paragraph for the specific instance that surfaced this)
+  skips every statement after it in the same `after()` block, including the
+  `admin.end()`/`pool.end()` calls that would otherwise release the test's Postgres
+  connections. With those connections leaked, the `node --test` process never exits on
+  its own, so the whole `run-tests.sh` run hangs indefinitely instead of failing fast
+  with a visible error — checked across the suite, none of the ~7 e2e test files' own
+  `after()` hooks are protected against this. Fixing the one instance that actually
+  surfaced (a `DELETE FROM users` running before a `DELETE FROM audit_log` that
+  referenced it) was in scope for that pass; wrapping every e2e file's `after()` body in
+  `try { ... } finally { await admin.end(); await pool.end(); }` so a *future* cleanup
+  failure fails loud instead of hanging silently is real, separate hardening work, not
+  done here.
 - **TikTok Shop OAuth: no true multi-shop CONNECT** — §4.8.1's multi-shop picker (built)
   lets a tenant choose which ONE shop to connect when an authorization covers several,
   but `channel_connections` rows beyond the most-recently-created active one are still
@@ -3044,6 +3059,57 @@ secrets — producing the same connected/rotated split, plus a third call with n
 correctly records a NULL `user_id`; Shopify's own upsert shape; and a cross-tenant
 isolation check (a second tenant's `channel_connection`-audit row never appears under
 the first tenant's `tenant_id`) — 15 assertions, all passed.
+
+**Coverage — products and locations**: the two gaps the channel-connection sweep above
+flagged as real but lower-priority than credential writes, closed in a follow-up pass.
+Reference-data mutations, not sensitive in the way a secret or a payroll rate is, but
+still real operational history worth being able to answer "who created this SKU / added
+this warehouse / renamed it / changed its ZIP" for in a multi-user tenant:
+  - `products/create` → `product.created` (`entityType: "product"`, `details:
+    {internalSku, name}`). The `INSERT` gained a `RETURNING id` it didn't need before.
+  - `locations/create` → `location.created` (`entityType: "location"`, `details: {name,
+    type, postalCode}`), same `RETURNING id` addition.
+  - `locations/[id]/rename` → `location.renamed` (`details: {name}`) and
+    `locations/[id]/set-postal-code` → `location.postal_code_set` (`details:
+    {postalCode}`, which can legitimately be `null` — clearing it back to unknown is a
+    real, auditable action, not a no-op). Both already had the target row's `id` from
+    the route param, so no `RETURNING` was needed; both use the same "only recorded when
+    `UPDATE ... WHERE id = $x AND tenant_id = $y` actually matched a row" guard
+    `hr/employees/[id]/update` already established, checked inside the same `withTenant`
+    callback as the `UPDATE` itself.
+  - `user.id` is the actor on all 4 — every one of these routes already requires a
+    signed-in user via `requireCurrentUser`, same as the HR module's own 5 routes.
+  - **Deliberately not extended to this pass**: the channel `*/listings` push routes
+    (`amazon/listings`, `ebay/listings`, `shopify/listings`, `walmart/listings`) and
+    `billing/{checkout,portal}` — real, still-unaudited mutation surfaces, but a
+    genuinely separate scope decision (outbound listing pushes and Stripe session
+    creation are a different risk shape than "a new row in this tenant's own reference
+    data"), not silently forgotten.
+  - **Tests**: `locations/create/rename/set-postal-code` are already covered end to end
+    by the real HTTP route in `packages/web/test/locations-mutations-e2e.test.ts` (a
+    `next dev`-backed e2e test, not a mock) — its own assertions now implicitly prove
+    the audit rows get written correctly as a side effect of that file's existing
+    create → rename → set-postal-code flow. `products/create` has no e2e test file of
+    its own (none existed before this pass either), so it was verified the same way
+    `recordAuditEvent` itself was originally verified: a manual smoke test against real
+    Postgres, proving `product.created` is recorded with the right `details`/`user_id`,
+    and that two separate creations produce two separate rows rather than one being
+    silently overwritten — all passed.
+  - **A second instance of the exact test-cleanup gap CLAUDE.md already documents
+    fixing 17 times over**: writing this pass's own audit rows as a side effect broke
+    `locations-mutations-e2e.test.ts`'s own `after()` hook — it deleted `users` before
+    `audit_log`, and `audit_log.user_id` has a real FK to `users`, so the delete failed
+    with a `foreign_key_violation`. Worse than the earlier 17 instances of this same
+    class of bug: because that hook has no `try`/`finally`, the thrown error skipped the
+    hook's own `admin.end()`/`pool.end()` calls entirely, leaking open Postgres
+    connections and **hanging the whole `node --test` process indefinitely** rather than
+    just failing fast — the suite never finished. **Fixed** the direct cause: `DELETE
+    FROM audit_log WHERE tenant_id = $1` now runs before the `users` delete, matching
+    every other affected test file's own fix. The broader "no `after()` hook in this
+    e2e suite uses `try`/`finally`, so any cleanup-step failure hangs the process
+    instead of failing fast" pattern is real and systemic (checked: none of the ~7
+    e2e files do) but deliberately **not** swept across every file in this pass — a
+    real, separate hardening task, not a small addition to a docs-coverage pass.
 
 **New RLS policy on `users`, invited by that table's own migration comment**: migration
 0010's own doc comment on `self_lookup_users` already named this exact need — "a future

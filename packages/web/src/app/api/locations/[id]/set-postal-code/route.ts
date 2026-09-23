@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
@@ -38,14 +38,26 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const postalCode = String(formData.get("postalCode") ?? "").trim() || null;
 
   try {
-    const result = await withTenant(pool, user.tenantId, (client) =>
-      client.query(`UPDATE locations SET postal_code = $1, updated_at = now() WHERE id = $2 AND tenant_id = $3`, [
-        postalCode,
-        id,
-        user.tenantId,
-      ]),
-    );
-    if (result.rowCount === 0) {
+    const rowCount = await withTenant(pool, user.tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE locations SET postal_code = $1, updated_at = now() WHERE id = $2 AND tenant_id = $3`,
+        [postalCode, id, user.tenantId],
+      );
+      if (result.rowCount) {
+        // Same transaction as the UPDATE above, same "only when a row
+        // actually matched" discipline as ./rename's identical addition.
+        await recordAuditEvent(client, {
+          tenantId: user.tenantId,
+          userId: user.id,
+          action: "location.postal_code_set",
+          entityType: "location",
+          entityId: id,
+          details: { postalCode },
+        });
+      }
+      return result.rowCount;
+    });
+    if (rowCount === 0) {
       return redirectWithError(req, "/locations", "location_not_found");
     }
   } catch (err) {

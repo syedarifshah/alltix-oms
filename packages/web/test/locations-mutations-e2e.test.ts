@@ -127,6 +127,15 @@ after(async () => {
   const { Client } = await import("pg");
   const admin = new Client({ connectionString: process.env.DATABASE_URL });
   await admin.connect();
+  // Every mutation this file exercises (create/rename/set-postal-code) now
+  // writes a real audit_log row as a side effect (see CLAUDE.md §17's own
+  // "Coverage" section on locations) -- audit_log.user_id has a real FK to
+  // users, so this delete must run before the users delete below, or the
+  // users delete fails with a foreign-key violation. Same class of gap
+  // CLAUDE.md §17 already documents fixing in 17 other test files' own
+  // after() hooks the first time their own mutations started writing
+  // audit_log rows -- this file just hadn't needed it until now.
+  await admin.query("DELETE FROM audit_log WHERE tenant_id = $1", [tenant.tenantId]);
   await admin.query("DELETE FROM users WHERE tenant_id = $1", [tenant.tenantId]);
   await admin.query("DELETE FROM tenants WHERE id = $1", [tenant.tenantId]);
   await admin.end();

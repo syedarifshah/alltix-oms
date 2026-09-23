@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
@@ -40,13 +40,22 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   try {
-    await withTenant(pool, user.tenantId, (client) =>
-      client.query(`INSERT INTO products (tenant_id, internal_sku, name) VALUES ($1, $2, $3)`, [
-        user.tenantId,
-        internalSku,
-        name,
-      ]),
-    );
+    await withTenant(pool, user.tenantId, async (client) => {
+      const result = await client.query<{ id: string }>(
+        `INSERT INTO products (tenant_id, internal_sku, name) VALUES ($1, $2, $3) RETURNING id`,
+        [user.tenantId, internalSku, name],
+      );
+      // Same transaction as the INSERT above -- see recordAuditEvent's own
+      // doc comment for why that matters.
+      await recordAuditEvent(client, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        action: "product.created",
+        entityType: "product",
+        entityId: result.rows[0]!.id,
+        details: { internalSku, name },
+      });
+    });
   } catch (err) {
     // Postgres unique_violation on (tenant_id, internal_sku) -- see
     // 0003_products.sql's own comment for why that constraint is scoped
