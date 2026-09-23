@@ -1,0 +1,28 @@
+-- Expand-only, backward-compatible (CLAUDE.md §9): nullable, no backfill
+-- needed, zero behavior change for any existing row.
+--
+-- Closes the read/write half of CLAUDE.md §12's "TikTok Shop OAuth: no true
+-- multi-shop CONNECT" gap: today every multi-connection-capable tenant (in
+-- practice, only TikTok Shop -- see §4.8.1) has its orders silently
+-- attributed to "whichever channel_connections row happens to be most
+-- recently created," because nothing on the order itself records which
+-- shop it actually came from. This column is that record.
+--
+-- Populated only by OrderService.persistPulledOrders()'s new optional
+-- channelConnectionId parameter, which every existing call site (the
+-- Amazon/Shopify/Walmart/eBay/Temu sync jobs, the Shopify webhook handler)
+-- continues to omit -- every order those channels ever insert, past or
+-- future, keeps this NULL, since none of them can have more than one active
+-- channel_connections row per tenant today. Only TikTok's own per-connection
+-- sync loop (packages/scheduler/src/index.ts's syncTikTokConnection) passes
+-- a real value, so WarehouseService.confirmShipment can resolve the correct
+-- shop's credentials for a TikTok order's shipment-confirmation call instead
+-- of always falling back to "the most recently connected shop" (which is
+-- wrong the instant a tenant has more than one).
+--
+-- No ON DELETE behavior chosen deliberately, same as orders.preferred_location_id
+-- (migration 0014) and orders.split_from_order_id (migration 0023): this
+-- codebase never DELETEs a channel_connections row, only flips its status
+-- (§4.4's cross-run failure tracking, §15's channel flags) -- there is
+-- nothing for an ON DELETE clause to ever actually run against.
+ALTER TABLE orders ADD COLUMN channel_connection_id UUID REFERENCES channel_connections (id);

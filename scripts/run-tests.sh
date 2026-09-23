@@ -66,10 +66,12 @@ SAFE_TESTS=(
   "packages/order-service/test/nearest-location-routing.test.ts"
   "packages/order-service/test/early-cancellation.test.ts"
   "packages/order-service/test/batch-partial-failure.test.ts"
+  "packages/order-service/test/channel-connection-id.test.ts"
   "packages/order-service/test/cancel-order.test.ts"
   "packages/order-service/test/lifecycle-transitions.test.ts"
   "packages/scheduler/test/sync-failure-tracking.test.ts"
   "packages/scheduler/test/rate-limit-cooldown.test.ts"
+  "packages/scheduler/test/tiktok-multi-shop.test.ts"
   "packages/scheduler/test/cron-runner-platform-alerts.test.ts"
   "packages/shared/test/email.test.ts"
 )

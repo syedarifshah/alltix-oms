@@ -936,7 +936,25 @@ export class OrderService {
    * arriving sequentially, in either order. That residual window is
    * documented, not solved, same as the gap originally was.
    */
-  async persistPulledOrders(tenantId: string, orders: NormalizedOrder[]): Promise<PersistPulledOrdersResult> {
+  /**
+   * `channelConnectionId` (optional, defaults to null): records which
+   * specific `channel_connections` row this whole batch was pulled from
+   * (migration 0037), for a channel where a tenant can have more than one
+   * active connection at once -- today, only TikTok Shop (CLAUDE.md
+   * §4.8.1/§12's own "no true multi-shop CONNECT" gap). Every existing
+   * caller (the Amazon/Shopify/Walmart/eBay/Temu sync jobs, the Shopify
+   * webhook handler) omits it and keeps getting NULL on every order it
+   * inserts, exactly as before this parameter existed -- none of those
+   * channels can have more than one active connection per tenant, so there
+   * is nothing for this to usefully record there. Applied uniformly to
+   * every order in the batch (one sync run only ever pulls from one
+   * connection), not per-order.
+   */
+  async persistPulledOrders(
+    tenantId: string,
+    orders: NormalizedOrder[],
+    channelConnectionId?: string | null,
+  ): Promise<PersistPulledOrdersResult> {
     const { insertedOrders, earlyCancelledOrderIds, skippedExternalOrderIds, failedOrders } = await withTenant(
       this.pool,
       tenantId,
@@ -964,8 +982,8 @@ export class OrderService {
           try {
             const inserted = await client.query<{ id: string }>(
               `INSERT INTO orders
-                 (tenant_id, channel, external_order_id, status, customer, shipping_address, placed_at, raw_payload)
-               VALUES ($1, $2, $3, 'received', $4, $5, $6, $7)
+                 (tenant_id, channel, external_order_id, status, customer, shipping_address, placed_at, raw_payload, channel_connection_id)
+               VALUES ($1, $2, $3, 'received', $4, $5, $6, $7, $8)
                ON CONFLICT (tenant_id, channel, external_order_id) DO NOTHING
                RETURNING id`,
               [
@@ -976,6 +994,7 @@ export class OrderService {
                 JSON.stringify(order.shippingAddress),
                 order.placedAt,
                 JSON.stringify(order.rawPayload),
+                channelConnectionId ?? null,
               ],
             );
 

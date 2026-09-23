@@ -89,7 +89,18 @@ interface TemuConnectionRow extends FailureTrackingColumns {
  *  external_account_id is the tenant's own shop_cipher (see the connect
  *  route's own comment: unlike every other channel's own reuse of this
  *  column, shop_cipher is a genuine, independent per-shop identifier, so
- *  this is the one channel where the column holds what its name says). */
+ *  this is the one channel where the column holds what its name says).
+ *
+ *  Unlike every other channel's own *ConnectionRow interface above, this
+ *  page queries and renders MORE THAN ONE of these per tenant (see the
+ *  query below) -- closing CLAUDE.md §12's "no true multi-shop CONNECT"
+ *  gap on the UI side: a tenant with several connected shops used to have
+ *  no way to even see that more than the most-recently-connected one
+ *  existed, let alone that it was quietly never being synced (the real
+ *  bug, fixed on the scheduler/credential-loading side -- see
+ *  packages/scheduler/src/index.ts's syncTikTokConnection and
+ *  tiktok-connector.ts's own updated doc comments).
+ */
 interface TikTokConnectionRow extends FailureTrackingColumns {
   external_account_id: string;
   status: string;
@@ -203,7 +214,7 @@ export default async function ChannelsSettingsPage({
     );
   }
 
-  const { connection, shopifyConnection, walmartConnection, ebayConnection, temuConnection, tiktokConnection, enabledChannels } = await withTenant(
+  const { connection, shopifyConnection, walmartConnection, ebayConnection, temuConnection, tiktokConnections, enabledChannels } = await withTenant(
     pool,
     tenantId,
     async (client) => {
@@ -256,13 +267,16 @@ export default async function ChannelsSettingsPage({
           ORDER BY created_at DESC
           LIMIT 1`,
       );
+      // No LIMIT 1 here, deliberately unlike every other channel's own query
+      // above -- see TikTokConnectionRow's own doc comment: a tenant can
+      // have more than one active 'tiktok' row (one per connected shop),
+      // and this page now shows every one of them, not just the newest.
       const tiktokResult = await client.query<TikTokConnectionRow>(
         `SELECT external_account_id, status, created_at, last_order_sync_at,
                 consecutive_failures, last_failure_at, last_failure_message
            FROM channel_connections
           WHERE channel = 'tiktok'
-          ORDER BY created_at DESC
-          LIMIT 1`,
+          ORDER BY created_at DESC`,
       );
       return {
         connection: amazonResult.rows[0] ?? null,
@@ -270,7 +284,7 @@ export default async function ChannelsSettingsPage({
         walmartConnection: walmartResult.rows[0] ?? null,
         ebayConnection: ebayResult.rows[0] ?? null,
         temuConnection: temuResult.rows[0] ?? null,
-        tiktokConnection: tiktokResult.rows[0] ?? null,
+        tiktokConnections: tiktokResult.rows,
         enabledChannels,
       };
     },
@@ -282,7 +296,7 @@ export default async function ChannelsSettingsPage({
   const isWalmartConnected = walmartConnection?.status === "active";
   const isEbayConnected = ebayConnection?.status === "active";
   const isTemuConnected = temuConnection?.status === "active";
-  const isTikTokConnected = tiktokConnection?.status === "active";
+  const isTikTokConnected = tiktokConnections.some((c) => c.status === "active");
   // Feature-flag gate -- see the enabledChannels query above and
   // ChannelNotEnabledNotice below. Only consulted for the "not connected
   // yet" branch of each card: a channel already connected before it was
@@ -606,36 +620,50 @@ export default async function ChannelsSettingsPage({
 
       <h2>TikTok Shop</h2>
       <div className="card">
-        {tiktokConnection ? (
+        {tiktokConnections.length > 0 ? (
           <div className="stack">
-            <div className="row">
-              <span className={isTikTokConnected ? "badge badge-success" : "badge badge-danger"}>
-                {tiktokConnection.status}
-              </span>
-              <span className="muted">shop cipher {tiktokConnection.external_account_id}</span>
-            </div>
-            <div className="muted">Connected since {new Date(tiktokConnection.created_at).toISOString()}</div>
-            <div className="muted">
-              Last order sync:{" "}
-              {tiktokConnection.last_order_sync_at
-                ? new Date(tiktokConnection.last_order_sync_at).toISOString()
-                : "never synced yet"}
-            </div>
+            {/* One block per connected shop -- previously this page (like
+                every real caller before this pass) only ever showed the
+                most-recently-connected shop, which made a second or third
+                shop invisible here even though it existed and, before the
+                scheduler fix, was silently never being synced either. See
+                TikTokConnectionRow's own doc comment. */}
+            {tiktokConnections.map((conn) => (
+              <div
+                key={conn.external_account_id}
+                className="stack"
+                style={{ borderTop: "1px solid var(--border)", paddingTop: 8, marginTop: 8 }}
+              >
+                <div className="row">
+                  <span className={conn.status === "active" ? "badge badge-success" : "badge badge-danger"}>
+                    {conn.status}
+                  </span>
+                  <span className="muted">shop cipher {conn.external_account_id}</span>
+                </div>
+                <div className="muted">Connected since {new Date(conn.created_at).toISOString()}</div>
+                <div className="muted">
+                  Last order sync:{" "}
+                  {conn.last_order_sync_at ? new Date(conn.last_order_sync_at).toISOString() : "never synced yet"}
+                </div>
+                <SyncFailureBanner
+                  status={conn.status}
+                  consecutive_failures={conn.consecutive_failures}
+                  last_failure_at={conn.last_failure_at}
+                  last_failure_message={conn.last_failure_message}
+                />
+              </div>
+            ))}
             <div className="alert alert-info" style={{ marginTop: 8, marginBottom: 0 }}>
-              UNVERIFIED against real TikTok Shop infrastructure, whichever way this was connected -- TikTok&apos;s
-              own documentation could not be read by any method tried during this connector&apos;s or the OAuth
-              flow&apos;s own research pass (see TikTokConnector&apos;s and tiktok-oauth.ts&apos;s own doc comments),
-              and no TikTok credentials of any kind exist anywhere in this codebase yet. Order sync failures are no
-              longer silent, though — see below if this connection has started failing.
+              UNVERIFIED against real TikTok Shop infrastructure, whichever way any of the shop(s) above were
+              connected -- TikTok&apos;s own documentation could not be read by any method tried during this
+              connector&apos;s or the OAuth flow&apos;s own research pass (see TikTokConnector&apos;s and
+              tiktok-oauth.ts&apos;s own doc comments), and no TikTok credentials of any kind exist anywhere in this
+              codebase yet. Order sync failures are no longer silent, though — see above if a shop has started
+              failing. Every shop above now syncs independently -- connecting another shop below adds it alongside
+              the one(s) already here, it does not replace them.
             </div>
-            <SyncFailureBanner
-              status={tiktokConnection.status}
-              consecutive_failures={tiktokConnection.consecutive_failures}
-              last_failure_at={tiktokConnection.last_failure_at}
-              last_failure_message={tiktokConnection.last_failure_message}
-            />
-            <a href="/api/channels/tiktok/connect">Reconnect via TikTok OAuth</a>
-            <TikTokConnectForm buttonLabel="Reconnect TikTok Shop (manual)" />
+            <a href="/api/channels/tiktok/connect">Connect another shop via TikTok OAuth</a>
+            <TikTokConnectForm buttonLabel="Connect/reconnect a TikTok Shop (manual)" />
           </div>
         ) : isTikTokEnabled ? (
           <div className="stack">

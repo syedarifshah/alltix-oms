@@ -141,8 +141,8 @@ export function loadTikTokCredentialsFromEnv(): TikTokCredentials {
 }
 
 /**
- * Reads the most recent active 'tiktok' channel_connections row for a tenant
- * -- via {@link withTenant} so RLS scopes the lookup (CLAUDE.md §2.4). No new
+ * Reads a 'tiktok' channel_connections row for a tenant -- via
+ * {@link withTenant} so RLS scopes the lookup (CLAUDE.md §2.4). No new
  * migration needed: this connector's five-value credential set is the
  * largest of any channel in this codebase (every other channel needs at
  * most four: Amazon's clientId/secret/refreshToken plus a region string),
@@ -160,8 +160,30 @@ export function loadTikTokCredentialsFromEnv(): TikTokCredentials {
  * independent per-shop identifier (shop_cipher) actually exists, so this is
  * external_account_id being used for what its name says for the first time,
  * not a repurposing.
+ *
+ * `connectionId` (optional, defaults to null): closes CLAUDE.md §12's "no
+ * true multi-shop CONNECT" gap -- a tenant can have more than one active
+ * 'tiktok' row (one per connected shop; §4.8.1's own multi-shop picker
+ * already lets a tenant connect several, one at a time), and until now
+ * every real caller of this function silently collapsed that down to
+ * whichever row was created most recently (`ORDER BY created_at DESC LIMIT
+ * 1`, unconditionally). Passing a specific `connectionId` (the scheduler's
+ * per-connection sync loop, or WarehouseService.confirmShipment resolving
+ * an order's own recorded `channel_connection_id`) scopes the lookup to
+ * that exact row instead -- and, deliberately, does NOT fall back to "the
+ * most recent" if that specific row isn't `status = 'active'` (e.g. it's
+ * been flipped to 'error' by the cross-run failure tracking in §4.4): a
+ * silent fallback here would mean confirming a shipment, or reporting sync
+ * progress, against the WRONG shop's credentials, which is worse than
+ * failing loud. Omitting `connectionId` entirely keeps the exact original
+ * "most recently connected active row" behavior -- every pre-existing
+ * caller, and a tenant who has only ever connected one shop, sees no change.
  */
-export async function loadTikTokCredentialsFromChannelConnection(pool: Pool, tenantId: string): Promise<TikTokCredentials> {
+export async function loadTikTokCredentialsFromChannelConnection(
+  pool: Pool,
+  tenantId: string,
+  connectionId?: string | null,
+): Promise<TikTokCredentials> {
   return withTenant(pool, tenantId, async (client) => {
     const result = await client.query<{
       lwa_client_id: string;
@@ -173,13 +195,18 @@ export async function loadTikTokCredentialsFromChannelConnection(pool: Pool, ten
       `SELECT lwa_client_id, encrypted_client_secret, encrypted_access_token, encrypted_refresh_token, external_account_id
          FROM channel_connections
         WHERE channel = 'tiktok' AND status = 'active'
+          AND ($1::uuid IS NULL OR id = $1)
         ORDER BY created_at DESC
         LIMIT 1`,
+      [connectionId ?? null],
     );
 
     const row = result.rows[0];
     if (!row) {
-      throw new Error(`No active 'tiktok' channel_connections row found for tenant ${tenantId}`);
+      throw new Error(
+        `No active 'tiktok' channel_connections row found for tenant ${tenantId}` +
+          (connectionId ? ` (connection ${connectionId})` : ""),
+      );
     }
     if (!row.encrypted_access_token || !row.encrypted_refresh_token) {
       throw new Error(`TikTok channel_connections row for tenant ${tenantId} is missing an access or refresh token`);
@@ -198,8 +225,12 @@ export async function loadTikTokCredentialsFromChannelConnection(pool: Pool, ten
   });
 }
 
-export async function createTikTokConnectorFromChannelConnection(pool: Pool, tenantId: string): Promise<TikTokConnector> {
-  const credentials = await loadTikTokCredentialsFromChannelConnection(pool, tenantId);
+export async function createTikTokConnectorFromChannelConnection(
+  pool: Pool,
+  tenantId: string,
+  connectionId?: string | null,
+): Promise<TikTokConnector> {
+  const credentials = await loadTikTokCredentialsFromChannelConnection(pool, tenantId, connectionId);
   return new TikTokConnector(credentials);
 }
 

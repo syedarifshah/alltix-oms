@@ -236,6 +236,7 @@ orders (
   shipping_address JSONB,
   placed_at TIMESTAMPTZ,
   raw_payload JSONB,         -- untouched original channel payload
+  channel_connection_id UUID REFERENCES channel_connections (id),  -- nullable; see §4.8.1's "true multi-shop CONNECT" paragraph
   UNIQUE (tenant_id, channel, external_order_id)
 )
 
@@ -1705,6 +1706,65 @@ eBay/Temu v1" scope decision.
   multi-shop support needs that loading layer itself to change first (e.g. letting a
   tenant designate one row "primary," or teaching the scheduler to iterate every active
   row per channel) — real, separate, deliberately out of scope for this pass.
+
+- **Update — true multi-shop CONNECT now built, closing the gap named above and in
+  §12** (`loadTikTokCredentialsFromChannelConnection`/
+  `createTikTokConnectorFromChannelConnection` in `tiktok-connector.ts`, migration
+  `0037_orders_channel_connection_id.sql`): both functions gained an optional trailing
+  `connectionId?: string | null` parameter, appending `AND ($N::uuid IS NULL OR id =
+  $N)` to the existing WHERE clause — omitted (the exact call shape every other
+  channel, and this codebase's own prior TikTok code, still uses), the query behaves
+  identically to before (most recently created active row for the tenant); passed, it
+  scopes to exactly that one connection and does NOT fall back to "most recent" if that
+  row is missing/inactive — a specific shop's credentials failing loudly beats silently
+  using a different shop's, especially for a shipment confirmation.
+  - **Scheduler**: `syncTikTokTenant` (renamed `syncTikTokConnection`, now takes a
+    mandatory `connectionId: string`) is driven by a discovery query that's now
+    per-connection, not per-tenant — a tenant with two active TikTok shops gets two
+    independent sync attempts, each returning its own `TenantSyncResult` (gained an
+    optional `connectionId` field). `recordSyncFailure`/`recordSyncSuccess`/
+    `recordRateLimitTrip` each gained the same optional trailing `connectionId`
+    parameter — TikTok's own three call sites pass it now; every other channel's
+    identical-shaped calls are untouched, still applying to "every active row of this
+    channel," which is a no-op distinction for a single-connection channel anyway.
+  - **`orders.channel_connection_id`** (new nullable FK, migration 0037, no
+    `ON DELETE` — `channel_connections` rows are status-flipped, never deleted, same
+    precedent migrations 0014/0023 set for their own nullable FKs): stamped only by
+    TikTok's own per-connection sync path, via `OrderService.persistPulledOrders()`'s
+    new optional third `channelConnectionId` parameter; every other channel's call
+    sites (Amazon/Shopify/Walmart/eBay/Temu's sync jobs, the Shopify webhook handler)
+    omit it and stay NULL, unchanged.
+  - **`WarehouseService.confirmShipment()`**: its order-lookup SELECT now reads
+    `channel_connection_id` back out and passes it into
+    `createTikTokConnectorFromChannelConnection`, so a shipment for an order that came
+    in from shop B gets confirmed against shop B's own credentials, not whichever shop
+    happens to be "most recent" at confirm time.
+  - **`/settings/channels`**: the TikTok card's `tiktokResult` query lost its
+    `LIMIT 1` and now renders one row per connected shop (`.map()`), instead of
+    silently showing only the most recently connected one.
+  - **Deliberately NOT touched**: the OAuth connect/callback/picker routes
+    (`persistTikTokConnection`'s `ON CONFLICT (tenant_id, channel, marketplace,
+    external_account_id)` upsert already correctly supported multiple distinct shop
+    rows per tenant — that side of the gap was already closed, see §4.8.1's own
+    "Multi-shop picker" paragraph above); no other channel gained multi-connection
+    support; `WarehouseService`'s other five channel branches are untouched.
+  - **Tested**: `packages/order-service/test/channel-connection-id.test.ts` (2 tests —
+    `persistPulledOrders` writes/omits the column correctly) and
+    `packages/scheduler/test/tiktok-multi-shop.test.ts` (5 tests — both shops
+    discovered and synced independently with distinct `connectionId`s; one shop
+    flipping to `status='error'` leaves a sibling untouched and stops being
+    discovered while the healthy one still is; `recordSyncSuccess`/
+    `recordRateLimitTrip` scoped to one connection don't touch a sibling's; omitting
+    `connectionId` still applies to every active row, proving the parameter is
+    additive/opt-in). Both added to `scripts/run-tests.sh`'s `SAFE_TESTS`. Verified:
+    `npm run db:migrate` clean, `npm run typecheck --workspaces` clean across all 10
+    workspaces, `bash scripts/run-tests.sh` — all 52 test files pass.
+  - **Still unverified in practice, same as the rest of §4.8/§4.8.1**: no real TikTok
+    Shop credentials exist anywhere in this codebase, so multi-shop discovery/sync/
+    shipment-confirmation routing above has been proven against seeded Postgres rows
+    with deterministic credential-missing failures, not against two real connected
+    TikTok shops.
+
 - **Wired into the app**: `/settings/channels`' TikTok Shop card now has a "Connect via
   TikTok OAuth" link (`GET /api/channels/tiktok/connect`, `withTenantAuth`-wrapped, same
   shape as eBay's own "Connect eBay" link) alongside the existing manual-paste form. The
@@ -2216,14 +2276,6 @@ from there.
   `try { ... } finally { await admin.end(); await pool.end(); }` so a *future* cleanup
   failure fails loud instead of hanging silently is real, separate hardening work, not
   done here.
-- **TikTok Shop OAuth: no true multi-shop CONNECT** — §4.8.1's multi-shop picker (built)
-  lets a tenant choose which ONE shop to connect when an authorization covers several,
-  but `channel_connections` rows beyond the most-recently-created active one are still
-  invisible to every real caller (`loadTikTokCredentialsFromChannelConnection`'s own
-  `ORDER BY created_at DESC LIMIT 1`). Genuine concurrent multi-shop support — syncing
-  two or more TikTok shops for the same tenant at once — needs that loading layer (and
-  probably the scheduler) to change first; not built, deliberately out of scope for the
-  picker pass.
 - **No operator UI for channel flags** — `tenants.enabled_channels` (§15) has no
   multi-tenant admin surface, only a CLI script (`npm run platform:set-channel-flags`).
   Deliberate, not an oversight — see §15's own "No operator UI" paragraph for the

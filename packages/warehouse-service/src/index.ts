@@ -926,8 +926,13 @@ export class WarehouseService {
     actorUserId: string | null = null,
   ): Promise<void> {
     const order = await withTenant(this.pool, tenantId, async (client) => {
-      const result = await client.query<{ channel: string; external_order_id: string; status: string }>(
-        `SELECT channel, external_order_id, status FROM orders WHERE id = $1 AND tenant_id = $2`,
+      const result = await client.query<{
+        channel: string;
+        external_order_id: string;
+        status: string;
+        channel_connection_id: string | null;
+      }>(
+        `SELECT channel, external_order_id, status, channel_connection_id FROM orders WHERE id = $1 AND tenant_id = $2`,
         [orderId, tenantId],
       );
       const row = result.rows[0];
@@ -957,7 +962,15 @@ export class WarehouseService {
       const connector = await createTemuConnectorFromChannelConnection(this.pool, tenantId);
       await connector.confirmShipment(order.external_order_id, tracking);
     } else if (order.channel === "tiktok") {
-      const connector = await createTikTokConnectorFromChannelConnection(this.pool, tenantId);
+      // channel_connection_id (migration 0037) resolves the correct SHOP's
+      // credentials -- CLAUDE.md §12's "no true multi-shop CONNECT" gap
+      // used to mean this always guessed "whichever shop was connected
+      // most recently," which is wrong the instant a tenant has more than
+      // one. NULL here (an order persisted before this migration, or by
+      // some future non-scheduler path that doesn't set it) falls back to
+      // that same old "most recent active connection" behavior --
+      // createTikTokConnectorFromChannelConnection's own doc comment.
+      const connector = await createTikTokConnectorFromChannelConnection(this.pool, tenantId, order.channel_connection_id);
       await connector.confirmShipment(order.external_order_id, tracking);
     } else {
       throw new Error(
