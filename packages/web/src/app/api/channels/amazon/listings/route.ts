@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import { createAmazonConnectorFromChannelConnection } from "@alltix/channel-connectors";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
@@ -101,22 +101,38 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   try {
-    await withTenant(pool, user.tenantId, (client) =>
-      client.query(
-        // 'active' here (unlike Walmart's 'pending') because this call is
-        // synchronous -- a success response means Amazon accepted the offer
-        // submission in the same request, not just queued it for later
-        // processing the way Walmart's feed is. external_id/external_sku
-        // both hold the seller SKU (same "channel only knows its own SKU"
-        // convention pushInventory()'s own doc comment documents) --
-        // raw_payload records the ASIN this offer was attached to, since
-        // that's not stored anywhere else on this row.
+    await withTenant(pool, user.tenantId, async (client) => {
+      // 'active' here (unlike Walmart's 'pending') because this call is
+      // synchronous -- a success response means Amazon accepted the offer
+      // submission in the same request, not just queued it for later
+      // processing the way Walmart's feed is. external_id/external_sku
+      // both hold the seller SKU (same "channel only knows its own SKU"
+      // convention pushInventory()'s own doc comment documents) --
+      // raw_payload records the ASIN this offer was attached to, since
+      // that's not stored anywhere else on this row.
+      const inserted = await client.query<{ id: string }>(
         `INSERT INTO channel_listings
            (tenant_id, product_id, channel, channel_marketplace, external_id, external_sku, listing_status, list_price, raw_payload, last_synced_at)
-         VALUES ($1, $2, 'amazon', '', $3, $3, 'active', $4, $5, now())`,
+         VALUES ($1, $2, 'amazon', '', $3, $3, 'active', $4, $5, now())
+         RETURNING id`,
         [user.tenantId, productId, productRow.internal_sku, price, JSON.stringify({ asin })],
-      ),
-    );
+      );
+      // Same "instrument the outbound listing chokepoint once it exists"
+      // reasoning CLAUDE.md §17's products/locations pass applies -- this
+      // and the Shopify/Walmart/eBay listings routes were the last real
+      // unaudited mutation surfaces that section named. One action name,
+      // `channel_listing.created`, shared across all four (the different
+      // sync/async outcome is already visible on the row itself via
+      // `details.status`) rather than a distinct action per channel.
+      await recordAuditEvent(client, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        action: "channel_listing.created",
+        entityType: "channel_listing",
+        entityId: inserted.rows[0]!.id,
+        details: { channel: "amazon", productId, sellerSku: productRow.internal_sku, asin, status: "active" },
+      });
+    });
   } catch (err) {
     // Amazon already has this offer live even though our own record of it
     // failed to save -- surface that clearly, same reasoning the Shopify/

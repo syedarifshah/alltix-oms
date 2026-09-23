@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import { createEbayConnectorFromChannelConnection } from "@alltix/channel-connectors";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
@@ -102,18 +102,19 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   try {
-    await withTenant(pool, user.tenantId, (client) =>
-      client.query(
-        // 'active' here, same reasoning as Amazon's own insert -- this call
-        // is synchronous, a success response means eBay already published
-        // the listing in the same request, not just queued it. external_id
-        // holds the real eBay listingId (unlike Amazon's, which has none to
-        // offer and reuses the SKU); external_sku holds the seller SKU.
-        // raw_payload records categoryId/imageUrl since neither is stored
-        // anywhere else on this row.
+    await withTenant(pool, user.tenantId, async (client) => {
+      // 'active' here, same reasoning as Amazon's own insert -- this call
+      // is synchronous, a success response means eBay already published
+      // the listing in the same request, not just queued it. external_id
+      // holds the real eBay listingId (unlike Amazon's, which has none to
+      // offer and reuses the SKU); external_sku holds the seller SKU.
+      // raw_payload records categoryId/imageUrl since neither is stored
+      // anywhere else on this row.
+      const inserted = await client.query<{ id: string }>(
         `INSERT INTO channel_listings
            (tenant_id, product_id, channel, channel_marketplace, external_id, external_sku, listing_status, list_price, raw_payload, last_synced_at)
-         VALUES ($1, $2, 'ebay', '', $3, $4, 'active', $5, $6, now())`,
+         VALUES ($1, $2, 'ebay', '', $3, $4, 'active', $5, $6, now())
+         RETURNING id`,
         [
           user.tenantId,
           productId,
@@ -122,8 +123,18 @@ export async function POST(req: NextRequest): Promise<Response> {
           price,
           JSON.stringify({ categoryId, imageUrl }),
         ],
-      ),
-    );
+      );
+      // Same CLAUDE.md §17 "channel_listing.created" instrumentation as the
+      // Amazon/Shopify/Walmart listings routes -- see Amazon's own comment.
+      await recordAuditEvent(client, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        action: "channel_listing.created",
+        entityType: "channel_listing",
+        entityId: inserted.rows[0]!.id,
+        details: { channel: "ebay", productId, sellerSku: productRow.internal_sku, listingId: result.listingId, status: "active" },
+      });
+    });
   } catch (err) {
     // eBay already has this listing live even though our own record of it
     // failed to save -- surface that clearly, same reasoning the Amazon/

@@ -29,6 +29,7 @@ export async function POST(req: NextRequest): Promise<Response> {
       tenantId: user.tenantId,
       successUrl: `${origin}/settings/billing?checkout=success`,
       cancelUrl: `${origin}/settings/billing?checkout=cancelled`,
+      actorUserId: user.id,
     });
     return Response.redirect(url, 303);
   } catch (err) {

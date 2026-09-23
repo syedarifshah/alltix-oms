@@ -3111,6 +3111,65 @@ this warehouse / renamed it / changed its ZIP" for in a multi-user tenant:
     e2e files do) but deliberately **not** swept across every file in this pass — a
     real, separate hardening task, not a small addition to a docs-coverage pass.
 
+**Coverage — channel listing pushes and billing**: closes the exact gap the products/
+locations pass above named and deliberately left open — the four `*/listings` push
+routes and `billing/{checkout,portal}`. A different risk shape from "a new row in this
+tenant's own reference data" (as flagged), but the same instrumentation discipline:
+  - `amazon/listings`, `shopify/listings`, `walmart/listings`, `ebay/listings` → one
+    shared action name, `channel_listing.created`, across all four channels rather than
+    a distinct action per channel — the different sync/async outcome (Amazon/eBay
+    `'active'`, Shopify `'draft'`, Walmart `'pending'`) is already visible on the row via
+    `details.status`, so a per-channel action name would just be the same fact recorded
+    twice. `entityType: "channel_listing"`, `entityId` from a `RETURNING id` each of the
+    four INSERTs gained (none had one before). `details` carries `channel`/`productId`/
+    `sellerSku`/`status` plus whatever channel-specific identifier that call already has
+    (`asin` for Amazon, `gtin`+`feedId` for Walmart, `listingId` for eBay) — never a
+    marketplace credential, since none of these routes ever handle one. Recorded inside
+    the same `withTenant` block as each route's own `channel_listings` INSERT, so a
+    rolled-back insert (the route's own catch block already handles that outcome, see
+    each file's existing "created but not recorded" error path) never leaves a committed
+    audit row behind. **Deliberately not extended**: Walmart's own companion
+    `[id]/check-status` route — it resolves an existing row's status from an external
+    poll, not a person taking a new action, and was never named in the gap this section
+    is closing.
+  - `billing/checkout` and `billing/portal` needed a different shape than a
+    straightforward "audit the INSERT" pattern, since neither route always mutates the
+    DB the way the listings routes always do:
+    `getOrCreateStripeCustomer` (`@alltix/billing-service`) now takes an optional
+    `actorUserId` and records `billing.stripe_customer_created` (`entityType: "tenant"`,
+    `entityId: tenantId`, `details: {stripeCustomerId}`) — but only on the branch where
+    it actually creates one, the tenant's first-ever visit to billing; every later call
+    just returns the existing id and mutates nothing, same "no audit row for a no-op"
+    discipline as everywhere else in this table. `createCheckoutSession` separately
+    records `billing.checkout_started` every time, in its own fresh `withTenant` block
+    after the Stripe call succeeds — starting a checkout is itself the sensitive action
+    being audited, regardless of whether the Stripe customer already existed, so this
+    doesn't piggyback on `getOrCreateStripeCustomer`'s own conditional write.
+    `createPortalSession` similarly records `billing.portal_opened` every time, in its
+    own fresh `withTenant` block after the Stripe call succeeds — this function has no
+    DB mutation of its own at all (a pure read plus a Stripe call), so this audit write
+    is the only write it makes. Both new actor parameters default to `null` (an
+    unauthenticated/no-session caller), mirroring `OrderService.transition()`'s own
+    convention, though the two routes that call these functions always have a real
+    signed-in `user.id` to pass. `details` for both carries only `{stripeCustomerId}` —
+    never anything from the Checkout/Portal session itself (no session id, no URL).
+  - **Deliberately not audited by this pass, still**: Walmart's check-status route (as
+    above), and the Stripe webhook handlers (`handleCheckoutSessionCompleted`,
+    `persistSubscriptionState`, `handleInvoicePaymentFailed`) — those are triggered by
+    Stripe's own webhook delivery, not by the checkout/portal routes this pass
+    instruments, and were never named in the original gap either.
+  - **Tests**: no new dedicated test file, same reasoning as the channel-connection
+    credentials pass above — these routes make a real network call to a marketplace or
+    to Stripe before ever reaching the audit write, and every one of those integrations
+    is separately documented elsewhere in this codebase as unverified against real
+    provider infrastructure in this environment. Verified via `npm run typecheck
+    --workspaces` (clean across all ten workspaces, after rebuilding
+    `@alltix/billing-service`'s own `dist/` so `packages/web` picked up the new
+    exported signatures) and `bash scripts/run-tests.sh` — all 50 test files passed
+    unchanged, since none of these seven routes had a test file exercising them before
+    this pass and none of the codebase's existing tests call
+    `createCheckoutSession`/`createPortalSession`/`getOrCreateStripeCustomer` directly.
+
 **New RLS policy on `users`, invited by that table's own migration comment**: migration
 0010's own doc comment on `self_lookup_users` already named this exact need — "a future
 'list my org's teammates' feature needs an additional policy branch scoped by

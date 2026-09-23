@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import { createShopifyConnectorFromChannelConnection } from "@alltix/channel-connectors";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
@@ -89,19 +89,30 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   try {
-    await withTenant(pool, user.tenantId, (client) =>
-      client.query(
-        // 'draft' (not 'active') is deliberate -- see createListing()'s own
-        // doc comment: this only creates the product on Shopify, it doesn't
-        // publish it to a sales channel yet, so it isn't actually live/
-        // visible until the tenant does that one manual step in their own
-        // Shopify admin.
+    await withTenant(pool, user.tenantId, async (client) => {
+      // 'draft' (not 'active') is deliberate -- see createListing()'s own
+      // doc comment: this only creates the product on Shopify, it doesn't
+      // publish it to a sales channel yet, so it isn't actually live/
+      // visible until the tenant does that one manual step in their own
+      // Shopify admin.
+      const inserted = await client.query<{ id: string }>(
         `INSERT INTO channel_listings
            (tenant_id, product_id, channel, channel_marketplace, external_id, external_sku, listing_status, list_price, last_synced_at)
-         VALUES ($1, $2, 'shopify', '', $3, $4, 'draft', $5, now())`,
+         VALUES ($1, $2, 'shopify', '', $3, $4, 'draft', $5, now())
+         RETURNING id`,
         [user.tenantId, productId, result.inventoryItemGid, productRow.internal_sku, price],
-      ),
-    );
+      );
+      // Same CLAUDE.md §17 "channel_listing.created" instrumentation as the
+      // Amazon/eBay/Walmart listings routes -- see Amazon's own comment.
+      await recordAuditEvent(client, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        action: "channel_listing.created",
+        entityType: "channel_listing",
+        entityId: inserted.rows[0]!.id,
+        details: { channel: "shopify", productId, sellerSku: productRow.internal_sku, status: "draft" },
+      });
+    });
   } catch (err) {
     // The Shopify-side product now exists even though this write failed --
     // surface that clearly rather than a generic error, since a retry from

@@ -1,6 +1,6 @@
 import Stripe from "stripe";
 import type { Pool } from "pg";
-import { withTenant, withStripeCustomer } from "@alltix/db";
+import { withTenant, withStripeCustomer, recordAuditEvent } from "@alltix/db";
 import {
   DomainEvent,
   captureError,
@@ -104,7 +104,11 @@ export interface BillingSummary {
  * when the Customer doesn't already have one, which is the normal pattern
  * for integrations that don't know a customer's email upfront.
  */
-export async function getOrCreateStripeCustomer(pool: Pool, tenantId: string): Promise<string> {
+export async function getOrCreateStripeCustomer(
+  pool: Pool,
+  tenantId: string,
+  actorUserId?: string | null,
+): Promise<string> {
   return withTenant(pool, tenantId, async (client) => {
     const existing = await client.query<{ stripe_customer_id: string | null; name: string }>(
       `SELECT stripe_customer_id, name FROM tenants WHERE id = $1`,
@@ -127,6 +131,22 @@ export async function getOrCreateStripeCustomer(pool: Pool, tenantId: string): P
       customer.id,
       tenantId,
     ]);
+    // CLAUDE.md §17's last-named gap: billing/{checkout,portal} were real,
+    // still-unaudited mutation surfaces. Recorded only on THIS branch --
+    // the first time a tenant ever gets a Stripe customer -- not on every
+    // subsequent call, which just returns the existing id and mutates
+    // nothing; same "no audit row for a no-op" discipline the
+    // channel-connection/HR/products passes already established. Same
+    // transaction as the UPDATE above, so a rolled-back customer creation
+    // (the UPDATE throwing) never leaves a committed audit row behind.
+    await recordAuditEvent(client, {
+      tenantId,
+      userId: actorUserId ?? null,
+      action: "billing.stripe_customer_created",
+      entityType: "tenant",
+      entityId: tenantId,
+      details: { stripeCustomerId: customer.id },
+    });
     return customer.id;
   });
 }
@@ -135,6 +155,10 @@ export interface CreateCheckoutSessionParams {
   tenantId: string;
   successUrl: string;
   cancelUrl: string;
+  /** Same optional-actor convention as OrderService.transition() and
+   *  friends (CLAUDE.md §17) -- null for a caller with no signed-in Clerk
+   *  session. The route this is called from always has one. */
+  actorUserId?: string | null;
 }
 
 /** Pure -- builds the Checkout Session line items for the flat MVP plan
@@ -172,7 +196,7 @@ export function buildCheckoutSessionLineItems(
  *  {@link buildCheckoutSessionLineItems}'s doc comment for why this is
  *  fully backward-compatible when it isn't. */
 export async function createCheckoutSession(pool: Pool, params: CreateCheckoutSessionParams): Promise<{ url: string }> {
-  const customerId = await getOrCreateStripeCustomer(pool, params.tenantId);
+  const customerId = await getOrCreateStripeCustomer(pool, params.tenantId, params.actorUserId);
   const priceId = readRequiredEnv("STRIPE_MVP_PRICE_ID");
   const meteredPriceId = process.env.STRIPE_METERED_ORDERS_PRICE_ID || undefined;
 
@@ -188,6 +212,26 @@ export async function createCheckoutSession(pool: Pool, params: CreateCheckoutSe
   if (!session.url) {
     throw new Error("Stripe did not return a Checkout Session URL");
   }
+
+  // CLAUDE.md §17's last-named gap, continued -- unlike getOrCreateStripeCustomer's
+  // own audit write above (which only fires the FIRST time a tenant ever gets a
+  // Stripe customer), this fires on every real checkout session created, since
+  // starting a checkout is itself the sensitive action being audited here,
+  // regardless of whether the underlying Stripe customer already existed. A fresh
+  // withTenant block, not the same transaction as getOrCreateStripeCustomer's own
+  // (that one may already have committed on an earlier call) -- nothing here needs
+  // to be atomic with the Stripe call itself, only with recording that it happened.
+  await withTenant(pool, params.tenantId, (client) =>
+    recordAuditEvent(client, {
+      tenantId: params.tenantId,
+      userId: params.actorUserId ?? null,
+      action: "billing.checkout_started",
+      entityType: "tenant",
+      entityId: params.tenantId,
+      details: { stripeCustomerId: customerId },
+    }),
+  );
+
   return { url: session.url };
 }
 
@@ -196,7 +240,12 @@ export async function createCheckoutSession(pool: Pool, params: CreateCheckoutSe
  *  reasoning as Checkout. Throws if this tenant has never started a
  *  checkout (no Stripe customer yet) rather than silently creating one --
  *  there's nothing to "manage" yet. */
-export async function createPortalSession(pool: Pool, tenantId: string, returnUrl: string): Promise<{ url: string }> {
+export async function createPortalSession(
+  pool: Pool,
+  tenantId: string,
+  returnUrl: string,
+  actorUserId?: string | null,
+): Promise<{ url: string }> {
   const customerId = await withTenant(pool, tenantId, async (client) => {
     const result = await client.query<{ stripe_customer_id: string | null }>(
       `SELECT stripe_customer_id FROM tenants WHERE id = $1`,
@@ -213,6 +262,23 @@ export async function createPortalSession(pool: Pool, tenantId: string, returnUr
     customer: customerId,
     return_url: returnUrl,
   });
+
+  // Same CLAUDE.md §17 instrumentation as createCheckoutSession's own -- unlike
+  // that function (and getOrCreateStripeCustomer), this method makes no DB
+  // mutation of its own to piggyback the audit write onto (it's a pure read +
+  // Stripe call), so this is the only write this function makes, in its own
+  // fresh withTenant block, after the Stripe call succeeds.
+  await withTenant(pool, tenantId, (client) =>
+    recordAuditEvent(client, {
+      tenantId,
+      userId: actorUserId ?? null,
+      action: "billing.portal_opened",
+      entityType: "tenant",
+      entityId: tenantId,
+      details: { stripeCustomerId: customerId },
+    }),
+  );
+
   return { url: session.url };
 }
 

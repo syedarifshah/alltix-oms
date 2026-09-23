@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { withTenant } from "@alltix/db";
+import { withTenant, recordAuditEvent } from "@alltix/db";
 import { createWalmartConnectorFromChannelConnection, type NormalizedListing } from "@alltix/channel-connectors";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
@@ -115,23 +115,41 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   try {
-    await withTenant(pool, user.tenantId, (client) =>
-      client.query(
-        // 'pending' (not 'draft'/'active') -- unlike Shopify's synchronous
-        // productSet, submitListing() only proves the feed was ACCEPTED for
-        // processing, not that Walmart actually matched/ingested the item.
-        // The companion check-status route resolves this to 'active' or
-        // 'error' once the feed finishes. external_id is set to the same
-        // SKU as external_sku (not a distinct Walmart item id) because
-        // that's genuinely all this flow knows back at submission time --
-        // same "Walmart only knows its own SKU here" reasoning
-        // pushInventory()'s own doc comment already documents.
+    await withTenant(pool, user.tenantId, async (client) => {
+      // 'pending' (not 'draft'/'active') -- unlike Shopify's synchronous
+      // productSet, submitListing() only proves the feed was ACCEPTED for
+      // processing, not that Walmart actually matched/ingested the item.
+      // The companion check-status route resolves this to 'active' or
+      // 'error' once the feed finishes. external_id is set to the same
+      // SKU as external_sku (not a distinct Walmart item id) because
+      // that's genuinely all this flow knows back at submission time --
+      // same "Walmart only knows its own SKU here" reasoning
+      // pushInventory()'s own doc comment already documents.
+      const inserted = await client.query<{ id: string }>(
         `INSERT INTO channel_listings
            (tenant_id, product_id, channel, channel_marketplace, external_id, external_sku, listing_status, list_price, raw_payload, last_synced_at)
-         VALUES ($1, $2, 'walmart', '', $3, $3, 'pending', $4, $5, now())`,
+         VALUES ($1, $2, 'walmart', '', $3, $3, 'pending', $4, $5, now())
+         RETURNING id`,
         [user.tenantId, productId, productRow.internal_sku, price, JSON.stringify({ feedId, submittedAt: new Date().toISOString() })],
-      ),
-    );
+      );
+      // Same CLAUDE.md §17 "channel_listing.created" instrumentation as the
+      // Amazon/eBay/Shopify listings routes -- see Amazon's own comment.
+      // `status: "pending"` here (not "active"/"draft") is the honest
+      // outcome at submission time; the companion check-status route below
+      // is deliberately NOT extended with its own audit event this pass --
+      // it resolves an existing row's status from an external poll rather
+      // than a person taking a new action, and CLAUDE.md §17 only named the
+      // four listings-creation routes and billing/{checkout,portal} as the
+      // real gap.
+      await recordAuditEvent(client, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        action: "channel_listing.created",
+        entityType: "channel_listing",
+        entityId: inserted.rows[0]!.id,
+        details: { channel: "walmart", productId, sellerSku: productRow.internal_sku, gtin, feedId, status: "pending" },
+      });
+    });
   } catch (err) {
     // Walmart already has this feed queued even though our own record of it
     // failed to save -- surface that clearly, same "don't let a retry

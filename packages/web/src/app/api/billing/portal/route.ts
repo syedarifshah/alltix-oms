@@ -24,7 +24,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   const returnUrl = `${req.nextUrl.origin}/settings/billing`;
 
   try {
-    const { url } = await createPortalSession(getAppPool(), user.tenantId, returnUrl);
+    const { url } = await createPortalSession(getAppPool(), user.tenantId, returnUrl, user.id);
     return Response.redirect(url, 303);
   } catch (err) {
     return redirectWithError(req, "/settings/billing", errorMessage(err));
