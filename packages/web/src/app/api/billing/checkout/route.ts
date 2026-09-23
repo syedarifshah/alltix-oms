@@ -3,6 +3,7 @@ import { createCheckoutSession } from "@alltix/billing-service";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -11,9 +12,14 @@ export const dynamic = "force-dynamic";
  *  straight to the returned Checkout URL rather than returning JSON, since
  *  this is a plain HTML form POST from /settings/billing. */
 export async function POST(req: NextRequest): Promise<Response> {
-  const user = await requireCurrentUser(req, getAppPool());
+  const pool = getAppPool();
+  const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/settings/billing", "not signed in");
+  }
+
+  if (await checkRateLimit(pool, user.tenantId, "billing.checkout")) {
+    return redirectWithError(req, "/settings/billing", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   const origin = req.nextUrl.origin;

@@ -4,6 +4,7 @@ import { createShopifyConnectorFromChannelConnection } from "@alltix/channel-con
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -30,6 +31,10 @@ export async function POST(req: NextRequest): Promise<Response> {
   const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/products", "not signed in");
+  }
+
+  if (await checkRateLimit(pool, user.tenantId, "channels.shopify.listings")) {
+    return redirectWithError(req, "/products", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   const formData = await req.formData();

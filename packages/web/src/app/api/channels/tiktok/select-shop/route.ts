@@ -6,6 +6,7 @@ import { resolveTenantId } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
 import { verifyPendingTikTokConnectionToken } from "@/lib/tiktok-oauth-pending";
 import { persistTikTokConnection } from "@/lib/tiktok-connection";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -48,6 +49,10 @@ export async function POST(req: NextRequest): Promise<Response> {
   const tenantIdFromSession = await resolveTenantId(pool, authContext.clerkUserId);
   if (!tenantIdFromSession || tenantIdFromSession !== pending.tenantId) {
     return redirectWithError(req, "/settings/channels", "tiktok_tenant_mismatch");
+  }
+
+  if (await checkRateLimit(pool, tenantIdFromSession, "channels.tiktok.select_shop")) {
+    return redirectWithError(req, "/settings/channels", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   const chosenShop = pending.shops.find((shop) => shop.cipher === cipher);

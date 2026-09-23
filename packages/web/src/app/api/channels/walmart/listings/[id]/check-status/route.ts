@@ -4,6 +4,7 @@ import { createWalmartConnectorFromChannelConnection, FeedStillProcessingError }
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -35,6 +36,10 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/products", "not signed in");
+  }
+
+  if (await checkRateLimit(pool, user.tenantId, "channels.walmart.listings_check_status")) {
+    return redirectWithError(req, "/products", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   const { id } = await ctx.params;

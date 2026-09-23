@@ -2627,7 +2627,8 @@ same tenant/route can't both read a stale count and both slip through. Same "don
 stand up infra a single self-testing tenant hasn't earned yet" call this codebase
 already makes for BullMQ/Redis (§4.4), Kafka (§1), and §15's own channel feature flags.
 
-**Coverage — every mutation route now protected**: the order lifecycle
+**Coverage, first three passes — turned out NOT to be "every mutation route," see the
+fourth-pass correction below**: the order lifecycle
 (`orders/[id]/{cancel,pack,ship,transition,return}`), picklists (`picklists` create,
 `picklists/[id]/assign`, `picklists/[id]/lines/[lineId]/record`), `inventory/transfer`
 — the original nine, the highest-frequency, highest-consequence operational hot path —
@@ -2655,6 +2656,76 @@ two genuinely different flows, so a burst against one doesn't consume the other'
 budget. Every check runs first, before that route's own channel-flags lookup (§15),
 matching the "right after resolving the caller, before any real work" ordering every
 rate-limited route in this app uses.
+
+**Coverage — fourth pass, closing a real gap this section's own "every mutation route
+now protected" claim left open**: that claim, and the "third pass closing the one
+remaining gap" language two paragraphs above, were both wrong — not by design, by an
+unverified claim nobody had re-checked, the exact same "known pre-existing" trap §18
+documents for the RLS bug that migration 0035 fixed. Re-auditing it for real (grepping
+every `POST route.ts` under `packages/web/src/app/api` for `checkRateLimit`/
+`recordRequestAndCheckRateLimit`, then reading each unmatched file to confirm it's a
+real signed-in-tenant mutation route and not a webhook/public route) found 11 that were
+never actually calling it: `billing/checkout`, `billing/portal`,
+`inventory/reorder-threshold`, and 8 marketplace-connector routes —
+`channels/amazon/listings`, `channels/ebay/business-policies`, `channels/ebay/listings`,
+`channels/ebay/location`, `channels/shopify/listings`, `channels/tiktok/select-shop`,
+`channels/walmart/listings`, `channels/walmart/listings/[id]/check-status`. Fixed with
+the identical one-line `checkRateLimit(pool, tenantId, routeKey)` pattern at
+`DEFAULT_RATE_LIMIT_PER_MINUTE`, inserted right after each route's own auth guard,
+before any form parsing/network/DB work — one exception:
+`channels/tiktok/select-shop` (route key `channels.tiktok.select_shop`) doesn't use
+`requireCurrentUser` at all (it's driven by a signed pending-connection token, see
+§4.8.1), so its check had to go after that token and the tenant-mismatch check it
+already does, at the earliest point `tenantIdFromSession` is actually trustworthy — not
+before resolving the caller, the ordering every other route in this section uses, but
+the closest equivalent this route's own different auth shape allows.
+`billing/checkout`/`billing/portal`'s guard runs before either ever reaches their
+existing Stripe-calling logic, same "before any real work" placement as every other
+route here — nothing about this pass touches what those two routes do once past the
+guard.
+- **`channels/tiktok/select-shop` verification is narrower than the rest of this
+  pass**: proving the rate-limit check actually rejects a live request the way the
+  other 9 routes' own end-to-end test does would need a real, signed pending-connection
+  token, which needs `TIKTOK_OAUTH_PENDING_SECRET` — not configured in this
+  environment (same "no live credentials for this connector" status §4.8/§4.8.1
+  already carry). Verified by `tsc -b`/`next build` and direct code inspection only,
+  not a live HTTP trip — an honest, narrower verification than the other 10 route
+  cases below get, not a silently-assumed one.
+- **Two routes remain correctly, deliberately unprotected by this tenant-scoped
+  mechanism, not a fifth gap**: `leads/demo-request` is public/unauthenticated — it has
+  no `tenantId` for this table's own primary key, so it needs a structurally different
+  mechanism (most plausibly IP-based) that this pass doesn't build; this is a real,
+  still-open gap worth flagging plainly rather than silently leaving unaddressed and
+  unnamed.
+  The 3 webhook routes (`webhooks/{clerk,shopify,stripe}`) are signature-verified, not
+  session-based, and were never in scope for a tenant-session rate limiter to begin
+  with.
+- **Tested end-to-end, not just build/typecheck-verified, for 9 of the 10**:
+  `packages/web/test/new-rate-limited-routes-e2e.test.ts` (port 4176, joining
+  `tenant-isolation.e2e.test.ts`/`hr-mutations-e2e.test.ts`/
+  `locations-mutations-e2e.test.ts`'s own real-`next-dev`-server pattern) proves the
+  actual route-level wiring, not just that the underlying
+  `recordRequestAndCheckRateLimit` primitive works (`rate-limit.test.ts` already covers
+  that generically) — by pre-seeding `api_rate_limit_windows` to exactly
+  `DEFAULT_RATE_LIMIT_PER_MINUTE` for a given (tenant, route) immediately before firing
+  one real request at it, rather than actually firing 120+ requests against a route
+  that would otherwise call Stripe or a real marketplace API. A real, reproducible bug
+  in the test's own first draft was found and fixed writing this: seeding every route's
+  window once, up front, in a shared `before()` — fine in isolation, but in the full
+  suite (behind 48 other test files' worth of load) a slow `next dev` cold start pushed
+  several requests past a one-minute window boundary, silently reseeding a fresh,
+  un-tripped window instead of matching the pre-seeded one (8 of 9 route cases failed
+  with real route errors, not the rate-limit message, in exactly that shape). Fixed by
+  seeding each route's window immediately before firing that route's own request
+  instead of once for all of them far ahead of time — see the test file's own
+  `seedRateLimitWindow()` doc comment. `inventory/reorder-threshold` isn't one of this
+  file's 9 cases (it already has its own dedicated coverage in
+  `reorder-threshold.test.ts`); its route also doubles as this file's own tenth test,
+  proving an unrelated, never-pre-seeded route is NOT incorrectly rate limited (the
+  mechanism is per-route, not a blanket per-tenant trip). Wired into
+  `packages/web/package.json`'s `test:new-rate-limited-routes-e2e` and
+  `scripts/run-tests.sh`'s `SAFE_TESTS`, same "every new test file goes in this list or
+  it's effectively untested in CI" rule that script's own header comment states.
 
 **Why not enforced centrally in `withTenantAuth`/`requireCurrentUser` itself**: only 4
 of this codebase's ~34 authenticated routes go through `withTenantAuth` (see that

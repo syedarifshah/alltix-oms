@@ -4,6 +4,7 @@ import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError } from "@/lib/route-helpers";
 import { parseReorderThresholdDays } from "@/lib/reorder-threshold";
+import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -25,9 +26,14 @@ export const dynamic = "force-dynamic";
  * dead code.
  */
 export async function POST(req: NextRequest): Promise<Response> {
-  const user = await requireCurrentUser(req, getAppPool());
+  const pool = getAppPool();
+  const user = await requireCurrentUser(req, pool);
   if (!user) {
     return redirectWithError(req, "/inventory", "not signed in");
+  }
+
+  if (await checkRateLimit(pool, user.tenantId, "inventory.reorder_threshold")) {
+    return redirectWithError(req, "/inventory", RATE_LIMIT_ERROR_MESSAGE);
   }
 
   const formData = await req.formData();

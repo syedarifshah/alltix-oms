@@ -31,6 +31,7 @@ SAFE_TESTS=(
   "packages/web/test/tenant-isolation.e2e.test.ts"
   "packages/web/test/hr-mutations-e2e.test.ts"
   "packages/web/test/locations-mutations-e2e.test.ts"
+  "packages/web/test/new-rate-limited-routes-e2e.test.ts"
   "packages/warehouse-service/test/generate-and-pick.test.ts"
   "packages/warehouse-service/test/assign-picklist-concurrency.test.ts"
   "packages/warehouse-service/test/short-pick-backorder-split.test.ts"
