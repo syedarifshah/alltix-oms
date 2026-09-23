@@ -9,6 +9,7 @@
     "start": "dotenv -e ../../.env -- next start",
     "typecheck": "tsc --noEmit -p .",
     "test:e2e": "node --import tsx --test test/tenant-isolation.e2e.test.ts",
+    "test:hr-mutations-e2e": "node --import tsx --test test/hr-mutations-e2e.test.ts",
     "test:amazon-oauth-state": "node --import tsx --test test/amazon-oauth-state.test.ts",
     "test:tiktok-oauth-state": "node --import tsx --test test/tiktok-oauth-state.test.ts",
     "test:tiktok-oauth-pending": "node --import tsx --test test/tiktok-oauth-pending.test.ts",

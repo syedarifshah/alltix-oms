@@ -2399,12 +2399,34 @@ from there.
   both new tables (SELECT/UPDATE/INSERT cross-tenant, mirroring
   `channel-connections-rls.test.ts`'s own rigor), plus the two schema invariants the
   design leans on: `hourly_rate` nullable (an employee can exist for time tracking
-  alone) and the `clock_out > clock_in` CHECK constraint. No page-level/route-level
-  test suite exists for `/hr`/`/hr/payroll` yet — same gap `/locations` already has
-  (there's no HTTP API test harness for a plain form-POST page in this codebase at
-  all currently); verified instead via `tsc -b`, `next build`, and a manual
-  `psql` smoke test of the payroll aggregate query's SQL (FILTER clauses, the
-  `extract(epoch ...)` hours computation) against real rows.
+  alone) and the `clock_out > clock_in` CHECK constraint. `/hr/payroll`'s own payroll
+  aggregate query (FILTER clauses, the `extract(epoch ...)` hours computation) is
+  verified via a manual `psql` smoke test against real rows, not a test file — same
+  read-only-Server-Component reasoning `/settings/activity`'s own verification note
+  gives.
+  - **Route-level HTTP suite — built**, closing the "no page-level/route-level test
+    suite exists for `/hr`/`/hr/payroll` yet" gap this bullet used to flag (`/locations`
+    has the same gap open still — this pass only closed it for HR):
+    `packages/web/test/hr-mutations-e2e.test.ts` reuses `tenant-isolation.e2e.test.ts`'s
+    exact real-HTTP
+    pattern (spawn `next dev`, `ALLTIX_TEST_AUTH_BYPASS=true`, drive it with real
+    `fetch` calls) on its own port (4174, not 4173 — two `next dev` instances can run
+    concurrently under `node --test`'s default per-file parallelism, and sharing a
+    port would make one fail to start) against all 5 mutation routes: an
+    unauthenticated request is rejected before anything is created; `employees/create`
+    → `employees/[id]/update` end to end, including a bogus id being rejected with
+    `error=employee_not_found` and — cross-checked directly against `audit_log` —
+    recording NO row for that rejected attempt while the two real mutations each get
+    exactly the audit row §17 documents; and the full time-entry chain (clock-in → a
+    rejected second clock-in → clock-out → a rejected second clock-out → a manual
+    entry), also cross-checked against `audit_log`'s three expected rows in order.
+    This is what actually proves the "only record when a row matched"
+    guard from §17's HR coverage paragraph holds through the real request path, not
+    just in a hand-constructed DB-layer call. Wired into both
+    `packages/web/package.json`'s own `test:hr-mutations-e2e` script and
+    `scripts/run-tests.sh`'s `SAFE_TESTS` (needs only Postgres, no external network) —
+    the same "add every new test file to the list, or CI silently never runs it" rule
+    that script's own header comment already states.
 
 ### 14.1 Real payroll processor integration (task #34 — Arif's explicit pick: Check)
 
