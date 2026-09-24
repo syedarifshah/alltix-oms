@@ -52,6 +52,7 @@ SAFE_TESTS=(
   "packages/carrier-connectors/test/royal-mail-connector.test.ts"
   "packages/carrier-connectors/test/evri-connector.test.ts"
   "packages/carrier-connectors/test/fedex-connector.test.ts"
+  "packages/carrier-connectors/test/parcelforce-connector.test.ts"
   "packages/carrier-connectors/test/surcharges.test.ts"
   "packages/db/test/channel-connections-rls.test.ts"
   "packages/db/test/hr-rls.test.ts"

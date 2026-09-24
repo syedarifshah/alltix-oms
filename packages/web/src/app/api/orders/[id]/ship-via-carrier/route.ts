@@ -5,6 +5,7 @@ import {
   createRoyalMailConnectorFromCarrierConnection,
   createEvriConnectorFromCarrierConnection,
   createFedExConnectorFromCarrierConnection,
+  createParcelforceConnectorFromCarrierConnection,
 } from "@alltix/carrier-connectors";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
@@ -15,10 +16,11 @@ import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 export const dynamic = "force-dynamic";
 
 /** The set of carriers this route can actually dispatch a real
- *  createShipment() call to -- kept in one place so adding a fourth real
- *  carrier connector later means adding one entry here, not hunting through
- *  this route's own body (FedEx, §19.3, is the second carrier added this
- *  way after Evri, confirming the pattern generalizes). Display name is
+ *  createShipment() call to -- kept in one place so adding a real carrier
+ *  connector later means adding one entry here, not hunting through this
+ *  route's own body (Parcelforce, §19.4, is the third carrier added this
+ *  way after Evri and FedEx, confirming the pattern generalizes a third
+ *  time). Display name is
  *  what flows into WarehouseService.confirmShipment()'s own
  *  TrackingInfo.carrier (the channel-facing carrier name), same value every
  *  other confirmShipment() caller in this codebase already free-texts into
@@ -30,6 +32,7 @@ const CARRIER_CONNECTORS: Record<
   royal_mail: { displayName: "Royal Mail", createConnector: createRoyalMailConnectorFromCarrierConnection },
   evri: { displayName: "Evri", createConnector: createEvriConnectorFromCarrierConnection },
   fedex: { displayName: "FedEx", createConnector: createFedExConnectorFromCarrierConnection },
+  parcelforce: { displayName: "Parcelforce", createConnector: createParcelforceConnectorFromCarrierConnection },
 };
 
 /**

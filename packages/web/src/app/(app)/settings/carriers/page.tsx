@@ -35,15 +35,15 @@ interface CarrierSettingsPageProps {
 /**
  * Settings UI for the Carrier Integration layer (CLAUDE.md §19) -- the
  * shipping-side counterpart to /settings/channels' marketplace connections.
- * Royal Mail (carrier #1, §19.1), Evri (carrier #2, §19.2), and FedEx
- * (carrier #3, §19.3, built once Arif explicitly picked it as "the next
- * carrier" a second time) are the only three with a real connector as of
- * this pass -- the remaining 5 (UPS/DHL/Parcelforce/DPD -- Hermes itself was
- * folded into "Evri" per that connector's own research: Hermes UK rebranded
- * to Evri in 2022, one carrier not two) aren't listed here yet, same "don't
- * render a Connect option for something that doesn't exist" discipline
- * /settings/channels' own ChannelNotEnabledNotice applies to a flagged-off
- * channel.
+ * Royal Mail (carrier #1, §19.1), Evri (carrier #2, §19.2), FedEx (carrier
+ * #3, §19.3), and Parcelforce (carrier #4, §19.4, built once Arif explicitly
+ * picked it -- overriding the UPS recommendation -- as "the next carrier" a
+ * third time) are the only four with a real connector as of this pass --
+ * the remaining 4 (UPS/DHL/DPD -- Hermes itself was folded into "Evri" per
+ * that connector's own research: Hermes UK rebranded to Evri in 2022, one
+ * carrier not two) aren't listed here yet, same "don't render a Connect
+ * option for something that doesn't exist" discipline /settings/channels'
+ * own ChannelNotEnabledNotice applies to a flagged-off channel.
  */
 export default async function CarrierSettingsPage({
   searchParams,
@@ -61,37 +61,44 @@ export default async function CarrierSettingsPage({
 
   const { connected, error } = await searchParams;
 
-  const { royalMailConnection, evriConnection, fedexConnection } = await withTenant(pool, tenantId, async (client) => {
-    const result = await client.query<CarrierConnectionRow>(
-      `SELECT id, carrier, external_account_id, status, consecutive_failures, last_failure_at, last_failure_message, created_at
+  const { royalMailConnection, evriConnection, fedexConnection, parcelforceConnection } = await withTenant(
+    pool,
+    tenantId,
+    async (client) => {
+      const result = await client.query<CarrierConnectionRow>(
+        `SELECT id, carrier, external_account_id, status, consecutive_failures, last_failure_at, last_failure_message, created_at
          FROM carrier_connections
-        WHERE carrier IN ('royal_mail', 'evri', 'fedex')
+        WHERE carrier IN ('royal_mail', 'evri', 'fedex', 'parcelforce')
         ORDER BY created_at DESC`,
-    );
-    return {
-      royalMailConnection: result.rows.find((r) => r.carrier === "royal_mail") ?? null,
-      evriConnection: result.rows.find((r) => r.carrier === "evri") ?? null,
-      fedexConnection: result.rows.find((r) => r.carrier === "fedex") ?? null,
-    };
-  });
+      );
+      return {
+        royalMailConnection: result.rows.find((r) => r.carrier === "royal_mail") ?? null,
+        evriConnection: result.rows.find((r) => r.carrier === "evri") ?? null,
+        fedexConnection: result.rows.find((r) => r.carrier === "fedex") ?? null,
+        parcelforceConnection: result.rows.find((r) => r.carrier === "parcelforce") ?? null,
+      };
+    },
+  );
 
   const isRoyalMailConnected = royalMailConnection?.status === "active";
   const isEvriConnected = evriConnection?.status === "active";
   const isFedExConnected = fedexConnection?.status === "active";
+  const isParcelforceConnected = parcelforceConnection?.status === "active";
 
   return (
     <main className="page">
       <h1>Carriers</h1>
       <p className="subtitle">
         Real carrier label generation and tracking, separate from the marketplace connections on{" "}
-        <a href="/settings/channels">Channels</a>. Royal Mail, Evri, and FedEx are the only three carriers built so
-        far — see the pack/ship workflow on <a href="/picklists">Picklists</a> for where a connected carrier is
-        actually used to generate a real shipping label.
+        <a href="/settings/channels">Channels</a>. Royal Mail, Evri, FedEx, and Parcelforce are the only four
+        carriers built so far — see the pack/ship workflow on <a href="/picklists">Picklists</a> for where a
+        connected carrier is actually used to generate a real shipping label.
       </p>
 
       {connected === "royal_mail" && <div className="alert alert-success">Royal Mail connected.</div>}
       {connected === "evri" && <div className="alert alert-success">Evri connected.</div>}
       {connected === "fedex" && <div className="alert alert-success">FedEx connected.</div>}
+      {connected === "parcelforce" && <div className="alert alert-success">Parcelforce connected.</div>}
       {error?.startsWith("royal_mail_missing_fields") && (
         <div className="alert alert-danger">The Click &amp; Drop API key is required.</div>
       )}
@@ -129,6 +136,19 @@ export default async function CarrierSettingsPage({
       {error?.startsWith("fedex_save_failed") && (
         <div className="alert alert-danger">
           Couldn&apos;t save this connection ({error.slice("fedex_save_failed:".length)}).
+        </div>
+      )}
+      {error?.startsWith("parcelforce_missing_fields") && (
+        <div className="alert alert-danger">The expressLink username, password, and contract number are all required.</div>
+      )}
+      {error?.startsWith("parcelforce_verify_failed") && (
+        <div className="alert alert-danger">
+          Parcelforce rejected that credential set ({error.slice("parcelforce_verify_failed:".length)}).
+        </div>
+      )}
+      {error?.startsWith("parcelforce_save_failed") && (
+        <div className="alert alert-danger">
+          Couldn&apos;t save this connection ({error.slice("parcelforce_save_failed:".length)}).
         </div>
       )}
       {error === "not signed in" && <div className="alert alert-danger">Not signed in.</div>}
@@ -227,6 +247,39 @@ export default async function CarrierSettingsPage({
           <FedExConnectForm buttonLabel="Connect FedEx" />
         )}
       </div>
+
+      <h2 style={{ marginTop: 24 }}>Parcelforce</h2>
+      <div className="card">
+        <div className="alert alert-info" style={{ marginBottom: 12 }}>
+          UNVERIFIED against real Parcelforce infrastructure — integrates via Parcelforce&apos;s own expressLink SOAP
+          API (the first non-REST carrier here), a <strong>closed, contract-gated API</strong> like Evri&apos;s own
+          Sapient gateway, not a self-serve one like Royal Mail&apos;s or FedEx&apos;s — real test credentials can
+          only be obtained by contacting Parcelforce&apos;s own Customer Solutions Team directly. No real
+          username/password/contract number has round-tripped against it yet. Also worth knowing: unlike Royal Mail,
+          Parcelforce <strong>does</strong> expose a confirmed cancel-shipment operation, but — like Royal Mail and
+          Evri — no live rate-shopping endpoint was found, so rate estimates return empty.
+        </div>
+        {parcelforceConnection ? (
+          <div className="stack">
+            <div className="row">
+              <span className={isParcelforceConnected ? "badge badge-success" : "badge badge-danger"}>
+                {parcelforceConnection.status}
+              </span>
+            </div>
+            <div className="muted">Connected since {new Date(parcelforceConnection.created_at).toISOString()}</div>
+            {parcelforceConnection.status === "error" && (
+              <div className="alert alert-danger" style={{ marginTop: 8, marginBottom: 0 }}>
+                {parcelforceConnection.consecutive_failures} consecutive failure(s)
+                {parcelforceConnection.last_failure_message && `: ${parcelforceConnection.last_failure_message}`}.
+                Reconnect below once the underlying issue is fixed.
+              </div>
+            )}
+            <ParcelforceConnectForm buttonLabel="Reconnect Parcelforce" />
+          </div>
+        ) : (
+          <ParcelforceConnectForm buttonLabel="Connect Parcelforce" />
+        )}
+      </div>
     </main>
   );
 }
@@ -281,6 +334,26 @@ function EvriConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElement
       <label>
         Sapient client secret
         <input type="password" name="clientSecret" placeholder="Issued by Intersoft Sapient" required />
+      </label>
+      <button type="submit">{buttonLabel}</button>
+    </form>
+  );
+}
+
+function ParcelforceConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElement {
+  return (
+    <form action="/api/carriers/parcelforce/connect" method="POST" className="stack" style={{ marginTop: 8 }}>
+      <label>
+        expressLink username
+        <input type="text" name="username" placeholder="Issued by Parcelforce Customer Solutions" required />
+      </label>
+      <label>
+        expressLink password
+        <input type="password" name="password" placeholder="Issued by Parcelforce Customer Solutions" required />
+      </label>
+      <label>
+        Contract number
+        <input type="text" name="contractNumber" placeholder="Your Parcelforce contract number" required />
       </label>
       <button type="submit">{buttonLabel}</button>
     </form>

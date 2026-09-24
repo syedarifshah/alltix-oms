@@ -170,13 +170,14 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
     // isXEnabled checks already apply, just for a carrier connection
     // instead of a channel feature flag. One query covering every carrier
     // this codebase has a real connector for (Royal Mail §19.1, Evri §19.2,
-    // FedEx §19.3), not one query per carrier -- confirmed this pass that a
-    // fourth carrier just adds a row this GROUP BY already handles, exactly
-    // as intended when this was first generalized for Evri.
+    // FedEx §19.3, Parcelforce §19.4), not one query per carrier --
+    // confirmed a THIRD time this pass that a new carrier just adds a row
+    // this GROUP BY already handles, exactly as intended when this was
+    // first generalized for Evri.
     const connections = await client.query<{ carrier: string; count: string }>(
       `SELECT carrier, count(*)::text AS count
          FROM carrier_connections
-        WHERE carrier IN ('royal_mail', 'evri', 'fedex') AND status = 'active'
+        WHERE carrier IN ('royal_mail', 'evri', 'fedex', 'parcelforce') AND status = 'active'
         GROUP BY carrier`,
     );
     const connectedCarrierSet = new Set(connections.rows.filter((r) => Number(r.count) > 0).map((r) => r.carrier));
@@ -190,6 +191,7 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
         royal_mail: connectedCarrierSet.has("royal_mail"),
         evri: connectedCarrierSet.has("evri"),
         fedex: connectedCarrierSet.has("fedex"),
+        parcelforce: connectedCarrierSet.has("parcelforce"),
       },
     };
   });
@@ -352,7 +354,7 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
                 <input type="text" name="trackingNumber" placeholder="Tracking number" required />
                 <button type="submit">Confirm shipment (manual tracking number)</button>
               </form>
-              {connectedCarriers.royal_mail || connectedCarriers.evri || connectedCarriers.fedex ? (
+              {connectedCarriers.royal_mail || connectedCarriers.evri || connectedCarriers.fedex || connectedCarriers.parcelforce ? (
                 <details style={{ marginTop: 8 }}>
                   <summary>Ship via connected carrier (generate a real label)</summary>
                   <form action={`/api/orders/${o.id}/ship-via-carrier`} method="POST" className="stack" style={{ marginTop: 8 }}>
@@ -363,15 +365,24 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
                           offer an action with nothing behind it" discipline
                           the outer conditional above already applies, now at
                           the per-option level since a tenant could have just
-                          one (or two) of the three connected. */}
+                          one (or a few) of the four connected. */}
                       <select
                         name="carrier"
-                        defaultValue={connectedCarriers.royal_mail ? "royal_mail" : connectedCarriers.evri ? "evri" : "fedex"}
+                        defaultValue={
+                          connectedCarriers.royal_mail
+                            ? "royal_mail"
+                            : connectedCarriers.evri
+                              ? "evri"
+                              : connectedCarriers.fedex
+                                ? "fedex"
+                                : "parcelforce"
+                        }
                         required
                       >
                         {connectedCarriers.royal_mail && <option value="royal_mail">Royal Mail</option>}
                         {connectedCarriers.evri && <option value="evri">Evri</option>}
                         {connectedCarriers.fedex && <option value="fedex">FedEx</option>}
+                        {connectedCarriers.parcelforce && <option value="parcelforce">Parcelforce</option>}
                       </select>
                     </label>
                     <label>
@@ -407,22 +418,22 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
                       <input
                         type="text"
                         name="serviceCode"
-                        placeholder="e.g. TPLL (Royal Mail), a Sapient service code (Evri), or a FedEx service type"
+                        placeholder="e.g. TPLL (Royal Mail), a Sapient service code (Evri), a FedEx service type, or Express24 (Parcelforce)"
                       />
                     </label>
                     <button type="submit">Generate label &amp; confirm shipment</button>
                     <p className="muted" style={{ margin: 0 }}>
                       UNVERIFIED against real carrier infrastructure — see <a href="/settings/carriers">Carriers</a>.
-                      Royal Mail, Evri (via its Sapient gateway integration), and FedEx all still require the amount
-                      actually charged to be entered by hand: Royal Mail and Evri expose no live rate-shopping
-                      endpoint at all, and FedEx's own live rate endpoint (§19.3) isn't called from this form yet.
+                      All four carriers still require the amount actually charged to be entered by hand: Royal Mail,
+                      Evri, and Parcelforce expose no live rate-shopping endpoint at all, and FedEx's own live rate
+                      endpoint (§19.3) isn't called from this form yet.
                     </p>
                   </form>
                 </details>
               ) : (
                 <p className="muted" style={{ marginTop: 6, marginBottom: 0 }}>
-                  Connect Royal Mail, Evri, or FedEx on <a href="/settings/carriers">Carriers</a> to generate a real
-                  label instead of typing in a tracking number by hand.
+                  Connect Royal Mail, Evri, FedEx, or Parcelforce on <a href="/settings/carriers">Carriers</a> to
+                  generate a real label instead of typing in a tracking number by hand.
                 </p>
               )}
               {o.channel === "amazon" && (

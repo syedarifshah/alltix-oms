@@ -43,10 +43,13 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
   pass) is now built too — Arif's own explicit pick when asked which carrier to
   build next, once Royal Mail was complete and merged — see §19.2. FedEx (carrier
   #3) is now built too — recommended and Arif's own explicit pick when asked which
-  carrier to build next once Evri was complete and merged — see §19.3. The
-  remaining 5 (UPS, DHL, Parcelforce, DPD, and whatever "Hermes" would have been had
-  it turned out to be a separate carrier) remain unbuilt, an explicit next-phase
-  decision per this section's own "don't expand scope without an explicit decision"
+  carrier to build next once Evri was complete and merged — see §19.3. Parcelforce
+  (carrier #4) is now built too — Arif's own explicit pick, overriding the UPS
+  recommendation this time, when asked which carrier to build next once FedEx was
+  complete and merged — see §19.4. The remaining 4 (UPS, DHL, DPD, and whatever
+  "Hermes" would have been had it turned out to be a separate carrier) remain
+  unbuilt, an explicit next-phase decision per this section's own "don't expand
+  scope without an explicit decision"
   rule, not an oversight.
 
 Do not expand this scope without an explicit decision — every module below assumes it.
@@ -3483,7 +3486,7 @@ guarantee (§6, §11 item 6). A future new tenant-scoped table's migration shoul
 guarded-cast form directly from this section or from 0018/0035, not from an older
 migration that might itself predate 0018.
 
-## 19. Carrier Integration Layer (§0's new locked decision — Royal Mail carrier #1, Evri carrier #2, FedEx carrier #3)
+## 19. Carrier Integration Layer (§0's new locked decision — Royal Mail carrier #1, Evri carrier #2, FedEx carrier #3, Parcelforce carrier #4)
 
 **Why a new layer, not an extension of §4's Channel Connector Layer**: a channel
 (Amazon/Shopify/Walmart/eBay/Temu/TikTok) is where an order comes FROM; a carrier is
@@ -3948,12 +3951,224 @@ pages both compile), and `bash scripts/run-tests.sh` — all 57 test files pass.
 
 **Deliberately not built this pass**, same "don't expand scope without an explicit
 decision" rule as §19.1's and §19.2's own closing paragraphs: the remaining 5
-carriers (UPS, DHL, Parcelforce, DPD — Hermes folded into Evri, per §19.2's own
-research); wiring `getRateEstimate()`'s real live rate call into `/picklists` (see
-above); real Sapient webhook receiving (still open from §19.2); a real per-tenant
-carrier feature-flag system mirroring §15's channel flags; and retry/circuit-
-breaker wiring mirroring §4.4 (still no scheduler job exists for any carrier in
-this layer, same reasoning §19.1's own closing paragraph already gives).
+carriers at the time (UPS, DHL, Parcelforce, DPD — Hermes folded into Evri, per
+§19.2's own research); wiring `getRateEstimate()`'s real live rate call into
+`/picklists` (see above); real Sapient webhook receiving (still open from §19.2); a
+real per-tenant carrier feature-flag system mirroring §15's channel flags; and
+retry/circuit-breaker wiring mirroring §4.4 (still no scheduler job exists for any
+carrier in this layer, same reasoning §19.1's own closing paragraph already gives).
+(Parcelforce of that list is no longer unbuilt — see §19.4, immediately below.)
+
+### 19.4 Parcelforce — carrier #4, built via Parcelforce's own expressLink SOAP API
+
+**Why Parcelforce, and why it's a genuinely different research problem from the
+first three carriers**: once FedEx (§19.3) was complete, merged, and pushed to
+`origin/main`, Arif gave the same explicit instruction as before — "move on to the
+next carrier." Asked (AskUserQuestion) which of the remaining 4 to build next — UPS
+recommended, on the same "fully public self-serve sandbox" reasoning that made
+FedEx the recommendation last time — Arif explicitly picked **Parcelforce**,
+overriding the recommendation this time, the same way Evri's own pick (§19.2)
+overrode a recommendation once before. Parcelforce turned out to compound two
+difficulties Royal Mail/Evri/FedEx each only carried separately: (1) it is a
+**SOAP/XML API**, `expressLink` — the first non-REST/JSON protocol anywhere in this
+codebase's entire carrier/channel layer, and (2) like Evri, it is a **closed,
+contract-gated API** — confirmed via Parcelforce's own developer.royalmail.net
+listing (Parcelforce is part of the Royal Mail Group and shares that same developer
+portal Royal Mail's own connector was researched from, §19.1) and a real developer's
+own Google Groups post: no self-serve signup exists, an account is only granted
+after contacting Parcelforce's Customer Solutions Team directly. A real UAT/test
+environment does exist once an account is granted — this isn't Evri's total absence
+of any test environment, just a gated path to reach one.
+
+**Research trail — every field/endpoint marked CONFIRMED or INFERRED, same
+discipline §19.1's/§19.2's/§19.3's own research trails follow** (the full breakdown
+lives in `packages/carrier-connectors/src/parcelforce-connector.ts`'s own class doc
+comment, not fully restated here):
+
+- **Discovery and operation list** — CONFIRMED via developer.royalmail.net's own
+  listing of Parcelforce's expressLink SOAP API alongside Royal Mail's own REST
+  APIs, and independently via a Chilkat WSDL-derived code-generation tool
+  (tools.chilkat.io/soap_wsdl_generate_code), which yielded a CONFIRMED 10-operation
+  list, a CONFIRMED namespace
+  (`http://www.parcelforce.net/ws/ship/v14`), and a CONFIRMED endpoint URL. A
+  second, more-authoritative Parcelforce-domain test endpoint
+  (`https://expresslink-test.parcelforce.net/ws/`) was separately CONFIRMED via a
+  real developer's own Google Groups post, which also independently confirms the
+  closed-access model above — used as this connector's `PARCELFORCE_BASE_URL` in
+  preference to the Chilkat-tool-derived one, since a real developer's own working
+  endpoint outranks a code-generation tool's inferred default.
+- **Auth shape** — CONFIRMED as a static `Authentication{UserName,Password}` SOAP
+  node embedded in every request body (not a separate token exchange the way every
+  REST-based carrier/channel connector in this codebase authenticates), cross-
+  confirmed independently via codelessplatforms.com's own Parcelforce integration
+  writeup. `authenticate()` therefore makes no network call at all — same
+  `username`-as-`accessToken` placeholder shape this interface's own doc comment
+  already allows for a carrier with no real token concept, a genuinely different
+  choice from every other carrier connector in this layer (all three of which make
+  a real request/response OAuth or client_credentials exchange).
+- **Contract Number / Department ID / service codes** — CONFIRMED via ShipEngine's
+  own documented Parcelforce integration guides: `ContractNumber` and
+  `DepartmentId` are both real, required credential/request fields (not INFERRED —
+  a real third-party integration platform's own docs name them explicitly), and
+  `DepartmentId` defaults to `"1"` in this connector per that same source (a
+  Parcelforce contract's first/default department). Real service codes
+  (`Express24` used as this connector's own default) are likewise CONFIRMED via
+  ShipEngine's own service-code list, not guessed.
+- **Manifest-required finding** — CONFIRMED, also via ShipEngine's own docs: a
+  Parcelforce shipment must be manifested before collection, a real operational
+  requirement this connector does not itself implement (see "Deliberately not
+  built this pass," below) — flagged rather than silently omitted, the same
+  "real limitation, not silently assumed away" discipline Royal Mail's own
+  no-rate-endpoint finding already established (§19.1).
+- **A "new API" red flag, investigated and resolved rather than left as an
+  unstated risk**: ShipEngine's own docs mention a "new" Parcelforce API with a
+  migration deadline that had already passed as of this research pass's own
+  current date — a real reason to worry this connector might be targeting a
+  deprecated generation. Investigated by comparing required credential fields
+  across ShipEngine's own "Legacy" integration guide and its current one: both
+  name the same Contract Number/Department ID fields, which would not be true if
+  the underlying Parcelforce API itself had genuinely changed shape. **Concluded**
+  this was ShipEngine's own PLATFORM migration (an internal ShipEngine integration
+  rewrite), not evidence of a new Parcelforce-side expressLink generation —
+  documented as this connector's own reasoning, not silently assumed, the same
+  "show the work, not just the conclusion" standard this file already holds every
+  other carrier/channel research trail to.
+- **`CancelShipment`** — CONFIRMED as a real, named operation in the Chilkat-tool-
+  derived 10-operation list, giving Parcelforce a genuinely confirmed
+  `voidShipment()` — unlike Evri (§19.2, deliberately not implemented, no
+  confirmed endpoint found) and FedEx (§19.3, deliberately not implemented, same
+  reason), Parcelforce is the SECOND carrier in this layer (after Royal Mail) with
+  a real, confirmed cancel operation.
+- **`createShipment`'s own request body — this connector's single least-confirmed
+  piece, same "flag it, don't hide it" precedent every other carrier/channel
+  connector's own least-confirmed field already sets** (Temu's `skuStockTargetList`,
+  Evri's request body, §4.7/§19.2): the Chilkat WSDL-code-generation tool's own `op`
+  query parameter, which should switch its rendered output to a specific operation's
+  own field detail, did not honor that parameter across two separate attempts (with
+  `mr=t` and `mr=f`) — the tool kept defaulting back to rendering `returnShipment`'s
+  own fields regardless of what `op=createShipment` asked for, a genuine tool
+  limitation (most likely requiring JS execution this fetch-based research pass
+  can't do), not something a third retry would have fixed. `createShipment()`'s own
+  `Consignment` SOAP body (`ContractNumber`, `DepartmentId`, `Reference`,
+  `ServiceCode`, `TotalWeight` in kg, `RecipientContact`, `RecipientAddress`, a
+  `Parcels` array) is therefore INFERRED — modeled on the confirmed
+  `returnShipment` shape the tool did successfully render, plus the confirmed
+  Contract Number/Department ID/service-code fields from ShipEngine's own docs —
+  not independently confirmed field-by-field the way FedEx's own Ship API request
+  body was (§19.3).
+- **`Find` / tracking — this connector's other major unconfirmed piece**: no
+  confirmed tracking-by-number operation or event-field shape was found anywhere
+  this research pass (unlike Royal Mail's own confirmed Tracking API v2 event
+  shape, §19.1) — `trackShipment()` calls `Find` (present in the confirmed
+  10-operation list) with a `<ns:ShipmentNumber>` field, on the same "the only
+  operation name that plausibly fits" reasoning Evri's own `trackShipment()`
+  chose `POST /v4/trackings` despite its own confirmed architectural mismatch
+  (§19.2) — `events` is always returned as `[]`, since no confirmed event field
+  names exist to parse. `verifyConnection()` likewise calls `Find` with an empty
+  body, documented in the connector's own class doc comment as this design's
+  single least-confirmed piece of all — the closest analog to a cheap
+  authenticated read-only call (the same role Royal Mail's `GET /carriers` and
+  FedEx's forced token refresh each play, §19.1/§19.3), but with no confirmation
+  an empty `Find` request is actually accepted rather than rejected outright.
+- **Hand-rolled, dependency-free SOAP/XML handling — a deliberate design choice,
+  not an oversight**: no XML parsing library exists anywhere in this codebase
+  (grepped before building this, the same discipline every other "add a
+  dependency or hand-roll it" decision in this file follows) — rather than
+  introducing one for a single connector, `parcelforce-connector.ts` implements
+  minimal `xmlEscape()`/`xmlTag()`/`xmlTagAny()` regex-based helpers, explicitly
+  documented as non-general-purpose (no handling for repeated tags, self-closing
+  tags, or CDATA) — the same "thin hand-rolled client, no SDK" precedent
+  `CheckClient`'s own doc comment already established for a missing REST SDK
+  (§14.1), now applied to XML instead of JSON.
+
+**Built** (`packages/carrier-connectors/src/parcelforce-connector.ts`):
+`ParcelforceConnector` implementing `CarrierConnector` — `authenticate()` (no
+network call, returns the stored username as a placeholder `accessToken`, throws if
+username/password/contractNumber is missing), `verifyConnection()` (calls `Find`
+with an empty body, see the caveat above), `createShipment()` (builds and POSTs a
+`Consignment` SOAP body, parses the response defensively via `xmlTagAny()` across
+several candidate identifier/tracking-number field names, throws if neither is
+found, preserves the raw response XML text as `raw` rather than a parsed object —
+the only connector in this codebase whose `raw` field is a string, not JSON, since
+there is no XML-to-object parser here to produce one), `voidShipment()` (`
+CancelShipment` with a `<ns:ShipmentNumber>` field), `trackShipment()` (`Find`,
+always `events: []`), `getRateEstimate()` (always `[]`, same "no confirmed
+rate-shopping capability" status as Evri's own connector, §19.2 — Parcelforce joins
+Royal Mail and Evri as carriers with no live network rate call, leaving FedEx the
+only exception, §19.3). `ParcelforceCredentials` is `{username, password,
+contractNumber}` — the SECOND carrier in this layer (after FedEx's `accountNumber`)
+where `carrier_connections.external_account_id` holds a genuinely independent
+account identifier (the contract number) rather than a repurposed or absent value.
+No new migration needed: `'parcelforce'` was already an allowed
+`carrier_connections.carrier` CHECK value from migration 0039.
+
+**Wired into the app**, generalizing the existing three-carrier pattern to four
+rather than duplicating it — confirming, for a third time, that the design decided
+when Evri was added (§19.2's own "one shared route, not a near-duplicate per
+carrier" plan) really does generalize:
+
+- `/settings/carriers` gained a fourth card, "Parcelforce" (username, password,
+  contract number — a three-field form, mirroring FedEx's own three-field shape
+  but with genuinely different field meanings), backed by a new `POST
+  /api/carriers/parcelforce/connect` route — same "verify before persist"
+  discipline as every other carrier connect route in this layer, calling
+  `ParcelforceConnector.verifyConnection()` before persisting, and recording
+  `carrier_connection.connected`/`credentials_rotated` in the audit log (§17) —
+  `contractNumber` is safe to log in `details` (the same identifier a Parcelforce
+  invoice or manifest already carries), unlike `username`/`password`, which never
+  are. The page's own carrier-connections query now covers `'royal_mail'`,
+  `'evri'`, `'fedex'`, and `'parcelforce'` in one `WHERE carrier IN (...)` clause —
+  a fourth carrier is, again, just an added value in an existing list, the same
+  confirmation FedEx's own addition already gave this design (§19.3).
+- `/picklists`' "Ship via connected carrier" form's `<select name="carrier">` now
+  lists Parcelforce as a fourth option, gated the identical way every other
+  carrier's own option already is (only rendered when the tenant has an active
+  `parcelforce` `carrier_connections` row). `POST
+  /api/orders/[id]/ship-via-carrier`'s `CARRIER_CONNECTORS` dispatch map gained
+  exactly one more line — `parcelforce: { displayName: "Parcelforce",
+  createConnector: createParcelforceConnectorFromCarrierConnection }` — covering
+  the label-generation call, the `shipments` row's own `carrier` column, and the
+  display name passed into `WarehouseService.confirmShipment()`'s
+  `TrackingInfo.carrier` field, the same one-already-tested confirmation path
+  every carrier in this layer shares, now proven to generalize a third time.
+
+**UNVERIFIED IN PRACTICE, same status every other carrier in this layer carried
+before its own first live pass — with one real difference worth being explicit
+about**: unlike Royal Mail's and FedEx's own self-serve credential issuance,
+Parcelforce's expressLink is a closed, contract-gated API (see the research trail
+above) — no real credentials exist anywhere in this codebase or Arif's account yet,
+and getting even TEST credentials requires first contacting Parcelforce's own
+Customer Solutions Team directly, a real difference from simply not having gotten
+around to signing up. Pure request/response mapping, the XML-building/parsing
+helpers, and the shipment/void/tracking logic are unit-tested against a stubbed
+`fetch` (`packages/carrier-connectors/test/parcelforce-connector.test.ts`, 15
+tests, using a new `xmlResponse()` helper instead of `jsonResponse` since this is
+the first XML-response connector in this codebase), wired into
+`scripts/run-tests.sh`'s `SAFE_TESTS`. Verified: `npm run db:migrate` clean (no
+pending migration, as expected — `'parcelforce'` was already an allowed CHECK
+value), `npm run typecheck --workspaces` clean across all eleven workspaces (after
+rebuilding `@alltix/carrier-connectors`'s own `dist/` output, which `packages/web`
+consumes rather than source — adding the new connector to `src/index.ts` needed
+`npx tsc -b packages/shared packages/db packages/channel-connectors
+packages/carrier-connectors` re-run before `packages/web`'s own typecheck could see
+it), `next build` clean (the new connect route and the updated
+`/settings/carriers`/`/picklists` pages both compile), and `bash scripts/run-tests.sh`
+— all 58 test files pass (one transient failure in
+`locations-mutations-e2e.test.ts` during a full-suite run, re-verified as
+resource contention under the full suite's parallel `next dev` load via an
+isolated re-run (3/3) and a clean full-suite re-run (58/58) afterward, not a
+regression — same known contention pattern CLAUDE.md §16 already documents for
+`new-rate-limited-routes-e2e.test.ts`).
+
+**Deliberately not built this pass**, same "don't expand scope without an explicit
+decision" rule as §19.1's/§19.2's/§19.3's own closing paragraphs: the remaining 3
+carriers (UPS, DHL, DPD); real Parcelforce manifest generation, confirmed required
+before collection (see the research trail above) but not itself implemented; real
+Sapient webhook receiving (still open from §19.2); wiring FedEx's own real live
+rate call into `/picklists` (still open from §19.3); a real per-tenant carrier
+feature-flag system mirroring §15's channel flags; and retry/circuit-breaker wiring
+mirroring §4.4 (still no scheduler job exists for any carrier in this layer, same
+reasoning §19.1's own closing paragraph already gives).
 
 ---
 
