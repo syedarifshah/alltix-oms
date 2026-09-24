@@ -1,6 +1,10 @@
 import type { NextRequest } from "next/server";
 import { withTenant } from "@alltix/db";
-import { createRoyalMailConnectorFromCarrierConnection } from "@alltix/carrier-connectors";
+import type { CarrierConnector } from "@alltix/carrier-connectors";
+import {
+  createRoyalMailConnectorFromCarrierConnection,
+  createEvriConnectorFromCarrierConnection,
+} from "@alltix/carrier-connectors";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { getWarehouseService } from "@/lib/services";
@@ -9,24 +13,43 @@ import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
+/** The set of carriers this route can actually dispatch a real
+ *  createShipment() call to -- kept in one place so adding a third real
+ *  carrier connector later means adding one entry here, not hunting through
+ *  this route's own body. Display name is what flows into
+ *  WarehouseService.confirmShipment()'s own TrackingInfo.carrier (the
+ *  channel-facing carrier name), same value every other confirmShipment()
+ *  caller in this codebase already free-texts into that field. */
+const CARRIER_CONNECTORS: Record<
+  string,
+  { displayName: string; createConnector: (pool: ReturnType<typeof getAppPool>, tenantId: string) => Promise<CarrierConnector> }
+> = {
+  royal_mail: { displayName: "Royal Mail", createConnector: createRoyalMailConnectorFromCarrierConnection },
+  evri: { displayName: "Evri", createConnector: createEvriConnectorFromCarrierConnection },
+};
+
 /**
- * POST /api/orders/[id]/ship-via-carrier -- the new step task #59 adds
- * ahead of the existing /api/orders/[id]/ship route: actually generates a
- * real Royal Mail shipping label (RoyalMailConnector.createShipment()) for
- * a 'packed' order, records it in `shipments` (migration 0039), and then
- * -- only once Royal Mail has returned a real tracking number -- calls the
+ * POST /api/orders/[id]/ship-via-carrier -- the step task #59 (Royal Mail)
+ * added ahead of the existing /api/orders/[id]/ship route, GENERALIZED by
+ * task #64 (Evri) to select between whichever real carrier connectors this
+ * codebase has -- one shared route dispatching on a `carrier` form field,
+ * not a second near-duplicate route per carrier, per CLAUDE.md §19's own
+ * "generalize, don't wholesale-duplicate" plan for this piece. Actually
+ * generates a real shipping label (`CarrierConnector.createShipment()`) for
+ * a 'packed' order, records it in `shipments` (migration 0039), and then --
+ * only once the carrier has returned a real tracking number -- calls the
  * EXACT SAME WarehouseService.confirmShipment() the manual free-text
- * /picklists form already calls, so a Royal Mail-generated shipment and a
+ * /picklists form already calls, so a carrier-generated shipment and a
  * manually-typed one both flow through one, already-tested confirmation
  * path (channel notified, sale events recorded, packed -> shipped) rather
- * than two parallel ones.
+ * than two (or three) parallel ones.
  *
  * Deliberately a SEPARATE route from /ship, not a parameter on it: this
  * one makes a real, mutating call to an external carrier (a label costs
- * real money once Royal Mail's account is live) before ever touching this
+ * real money once a carrier account is live) before ever touching this
  * app's own order state, while /ship assumes a label/tracking number
- * already exists from wherever the tenant got it (a Royal Mail-generated
- * one via this route, or one from a carrier this codebase hasn't built a
+ * already exists from wherever the tenant got it (a connector-generated one
+ * via this route, or one from a carrier this codebase hasn't built a
  * connector for yet, typed in by hand). /picklists renders both options.
  *
  * v1 scope, deliberately narrow, same "tenant-supplied form field over
@@ -40,12 +63,17 @@ export const dynamic = "force-dynamic";
  * products/order_lines column in this schema carries a weight at all yet
  * (grepped before writing this) -- building a real per-channel address
  * parser plus a weight data model is a separate, substantial piece of
- * work, not a small addition to this pass.
+ * work, not a small addition to this pass. `serviceCode` is free text,
+ * shared across both carriers -- validated by neither carrier's own API
+ * client-side, same "an invalid value surfaces as a real API error"
+ * precedent every other free-text carrier/marketplace code field in this
+ * codebase already establishes.
  *
- * UNVERIFIED IN PRACTICE, same status RoyalMailConnector itself carries:
- * no real Royal Mail credentials exist anywhere in this codebase or Arif's
- * account yet -- this route's logic is complete and typechecked, but
- * nobody has generated a real label through it.
+ * UNVERIFIED IN PRACTICE for both carriers, same status each connector
+ * itself carries: no real Royal Mail or Sapient/Evri credentials exist
+ * anywhere in this codebase or Arif's account yet -- this route's logic is
+ * complete and typechecked, but nobody has generated a real label through
+ * it for either carrier.
  */
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }): Promise<Response> {
   const pool = getAppPool();
@@ -60,6 +88,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   const { id } = await ctx.params;
   const formData = await req.formData();
+  const carrier = String(formData.get("carrier") ?? "").trim();
+  const carrierConfig = CARRIER_CONNECTORS[carrier];
+  if (!carrierConfig) {
+    return redirectWithError(req, "/picklists", `Unknown or unsupported carrier '${carrier}'.`);
+  }
   const recipientName = String(formData.get("recipientName") ?? "").trim();
   const addressLine1 = String(formData.get("addressLine1") ?? "").trim();
   const city = String(formData.get("city") ?? "").trim();
@@ -111,7 +144,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     const subtotal = order.lines.reduce((sum, line) => sum + Number(line.unit_price) * line.quantity, 0);
     const total = subtotal + Number(shippingCostChargedGbp || "0");
 
-    const connector = await createRoyalMailConnectorFromCarrierConnection(pool, user.tenantId);
+    const connector = await carrierConfig.createConnector(pool, user.tenantId);
     const shipment = await connector.createShipment({
       orderId: order.id,
       orderReference: order.external_order_id.slice(0, 40),
@@ -139,10 +172,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       await client.query(
         `INSERT INTO shipments
            (tenant_id, order_id, carrier, service_code, carrier_order_id, tracking_number, label_base64, weight_grams, cost, status, raw_payload)
-         VALUES ($1, $2, 'royal_mail', $3, $4, $5, $6, $7, $8, $9, $10)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [
           user.tenantId,
           order.id,
+          carrier,
           serviceCode || null,
           shipment.carrierOrderId,
           shipment.trackingNumber,
@@ -157,22 +191,24 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
     if (!shipment.trackingNumber) {
       // A real, documented split outcome (see RoyalMailConnector.createShipment()'s
-      // own doc comment): the order was created on Royal Mail's side but no
-      // tracking number came back, so there's nothing real to hand the
-      // channel yet. The order stays 'packed' -- same "don't transition on
-      // a degraded outcome" discipline WarehouseService.confirmShipment()
-      // already applies when the channel call itself fails.
+      // own doc comment, and EvriConnector.createShipment()'s own INFERRED
+      // response-shape handling): the order was created on the carrier's
+      // side but no tracking number came back, so there's nothing real to
+      // hand the channel yet. The order stays 'packed' -- same "don't
+      // transition on a degraded outcome" discipline
+      // WarehouseService.confirmShipment() already applies when the channel
+      // call itself fails.
       return redirectWithError(
         req,
         "/picklists",
-        `Royal Mail created order ${shipment.carrierOrderId} but returned no tracking number -- check the shipment and retry.`,
+        `${carrierConfig.displayName} created order ${shipment.carrierOrderId} but returned no tracking number -- check the shipment and retry.`,
       );
     }
 
     await getWarehouseService().confirmShipment(
       user.tenantId,
       order.id,
-      { carrier: "Royal Mail", trackingNumber: shipment.trackingNumber, shippedAt: new Date().toISOString() },
+      { carrier: carrierConfig.displayName, trackingNumber: shipment.trackingNumber, shippedAt: new Date().toISOString() },
       user.id,
     );
   } catch (err) {

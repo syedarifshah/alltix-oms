@@ -126,7 +126,7 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
     );
   }
 
-  const { allocatedOrders, picklists, pickingOrders, packedOrders, isRoyalMailConnected } = await withTenant(pool, tenantId, async (client) => {
+  const { allocatedOrders, picklists, pickingOrders, packedOrders, connectedCarriers } = await withTenant(pool, tenantId, async (client) => {
     const allocated = await client.query<AllocatedOrderRow>(
       `SELECT id, external_order_id, channel, placed_at FROM orders WHERE status = 'allocated' ORDER BY placed_at NULLS LAST, id`,
     );
@@ -163,22 +163,32 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
       `SELECT id, external_order_id, channel FROM orders WHERE status = 'packed' ORDER BY placed_at NULLS LAST, id`,
     );
 
-    // Gates whether the "Ship via Royal Mail" form (task #59, real label
-    // generation -- see /api/orders/[id]/ship-via-carrier's own doc
-    // comment) renders at all -- same "don't offer an action with nothing
-    // behind it" discipline /settings/channels' own isXEnabled checks
-    // already apply, just for a carrier connection instead of a channel
-    // feature flag.
-    const royalMail = await client.query<{ count: string }>(
-      `SELECT count(*)::text AS count FROM carrier_connections WHERE carrier = 'royal_mail' AND status = 'active'`,
+    // Gates whether the generalized "Ship via Carrier" form (task #59, real
+    // label generation -- see /api/orders/[id]/ship-via-carrier's own doc
+    // comment) renders, and which carrier(s) it offers -- same "don't offer
+    // an action with nothing behind it" discipline /settings/channels' own
+    // isXEnabled checks already apply, just for a carrier connection
+    // instead of a channel feature flag. One query covering both carriers
+    // this codebase has a real connector for (Royal Mail, §19.1; Evri,
+    // §19.2), not two separate queries -- a third carrier just adds a row
+    // this GROUP BY already handles.
+    const connections = await client.query<{ carrier: string; count: string }>(
+      `SELECT carrier, count(*)::text AS count
+         FROM carrier_connections
+        WHERE carrier IN ('royal_mail', 'evri') AND status = 'active'
+        GROUP BY carrier`,
     );
+    const connectedCarrierSet = new Set(connections.rows.filter((r) => Number(r.count) > 0).map((r) => r.carrier));
 
     return {
       allocatedOrders: allocated.rows,
       picklists: groupPicklists(picklistRows.rows),
       pickingOrders: picking.rows,
       packedOrders: packed.rows,
-      isRoyalMailConnected: Number(royalMail.rows[0]!.count) > 0,
+      connectedCarriers: {
+        royal_mail: connectedCarrierSet.has("royal_mail"),
+        evri: connectedCarrierSet.has("evri"),
+      },
     };
   });
 
@@ -340,10 +350,23 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
                 <input type="text" name="trackingNumber" placeholder="Tracking number" required />
                 <button type="submit">Confirm shipment (manual tracking number)</button>
               </form>
-              {isRoyalMailConnected ? (
+              {connectedCarriers.royal_mail || connectedCarriers.evri ? (
                 <details style={{ marginTop: 8 }}>
-                  <summary>Ship via Royal Mail (generate a real label)</summary>
+                  <summary>Ship via connected carrier (generate a real label)</summary>
                   <form action={`/api/orders/${o.id}/ship-via-carrier`} method="POST" className="stack" style={{ marginTop: 8 }}>
+                    <label>
+                      Carrier
+                      {/* Only ever lists carriers this tenant actually has an
+                          active carrier_connections row for -- same "don't
+                          offer an action with nothing behind it" discipline
+                          the outer conditional above already applies, now at
+                          the per-option level since a tenant could have just
+                          one of the two connected. */}
+                      <select name="carrier" defaultValue={connectedCarriers.royal_mail ? "royal_mail" : "evri"} required>
+                        {connectedCarriers.royal_mail && <option value="royal_mail">Royal Mail</option>}
+                        {connectedCarriers.evri && <option value="evri">Evri</option>}
+                      </select>
+                    </label>
                     <label>
                       Recipient name
                       <input type="text" name="recipientName" required />
@@ -374,19 +397,20 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
                     </label>
                     <label>
                       Service code (optional)
-                      <input type="text" name="serviceCode" placeholder="e.g. TPLL" />
+                      <input type="text" name="serviceCode" placeholder="e.g. TPLL (Royal Mail) or a Sapient service code (Evri)" />
                     </label>
-                    <button type="submit">Generate Royal Mail label &amp; confirm shipment</button>
+                    <button type="submit">Generate label &amp; confirm shipment</button>
                     <p className="muted" style={{ margin: 0 }}>
-                      UNVERIFIED against real Royal Mail infrastructure — see <a href="/settings/carriers">Carriers</a>.
-                      No live rate-shopping exists for Royal Mail; enter the amount actually charged.
+                      UNVERIFIED against real carrier infrastructure — see <a href="/settings/carriers">Carriers</a>.
+                      Neither Royal Mail nor Evri (via its Sapient gateway integration) expose a live rate-shopping
+                      endpoint; enter the amount actually charged.
                     </p>
                   </form>
                 </details>
               ) : (
                 <p className="muted" style={{ marginTop: 6, marginBottom: 0 }}>
-                  Connect Royal Mail on <a href="/settings/carriers">Carriers</a> to generate a real label instead of
-                  typing in a tracking number by hand.
+                  Connect Royal Mail or Evri on <a href="/settings/carriers">Carriers</a> to generate a real label
+                  instead of typing in a tracking number by hand.
                 </p>
               )}
               {o.channel === "amazon" && (

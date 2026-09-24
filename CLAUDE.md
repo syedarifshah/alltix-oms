@@ -38,9 +38,14 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
   each carried), phased **carrier-first — Royal Mail built completely (labels,
   tracking, rates, surcharges) before any of the other 7 are touched**, same
   "prove the pattern on one first" order §4.6/§4.7/§4.8 already used for eBay/Temu/
-  TikTok. Royal Mail is built — see §19. The other 7 remain unbuilt, an explicit
-  next-phase decision per this section's own "don't expand scope without an
-  explicit decision" rule, not an oversight.
+  TikTok. Royal Mail is built — see §19.1. Evri (formerly Hermes -- Hermes UK
+  rebranded to Evri in 2022, one carrier not two, confirmed during its own research
+  pass) is now built too — Arif's own explicit pick when asked which carrier to
+  build next, once Royal Mail was complete and merged — see §19.2. The remaining 6
+  (FedEx, UPS, DHL, Parcelforce, DPD, and whatever "Hermes" would have been had it
+  turned out to be a separate carrier) remain unbuilt, an explicit next-phase
+  decision per this section's own "don't expand scope without an explicit decision"
+  rule, not an oversight.
 
 Do not expand this scope without an explicit decision — every module below assumes it.
 
@@ -3476,7 +3481,7 @@ guarantee (§6, §11 item 6). A future new tenant-scoped table's migration shoul
 guarded-cast form directly from this section or from 0018/0035, not from an older
 migration that might itself predate 0018.
 
-## 19. Carrier Integration Layer (§0's new locked decision — Royal Mail, carrier #1)
+## 19. Carrier Integration Layer (§0's new locked decision — Royal Mail carrier #1, Evri carrier #2)
 
 **Why a new layer, not an extension of §4's Channel Connector Layer**: a channel
 (Amazon/Shopify/Walmart/eBay/Temu/TikTok) is where an order comes FROM; a carrier is
@@ -3512,8 +3517,8 @@ different sources**:
     Account returns specifically, not general outbound rate shopping. This is a
     genuine limitation of Royal Mail's own API, not a gap in this connector —
     `CarrierConnector.getRateEstimate()` for Royal Mail is therefore, correctly, a
-    static-price-table + confirmed-surcharge-data lookup (§19.2 below), never a live
-    network call.
+    static-price-table + confirmed-surcharge-data lookup (the `surcharges.ts` bullet
+    below), never a live network call.
 - **Tracking API v2 (REST)** — CONFIRMED base shape and endpoint paths
   (`GET /{mailPieceId}/events`, `GET /summary`, `GET /{mailPieceId}/signature`,
   25 calls/12hrs on the onboarding plan) directly from Royal Mail's own official
@@ -3629,18 +3634,158 @@ clean across all eleven workspaces (the new `@alltix/carrier-connectors` package
 included), `next build` clean (every new route/page compiles), and
 `bash scripts/run-tests.sh` — all 55 test files pass.
 
+### 19.2 Evri (formerly Hermes) — carrier #2, built via the Sapient/Intersoft CORE API gateway
+
+**Why Evri, and why via a third-party gateway**: once Royal Mail (§19.1) was
+complete, merged, and pushed to `origin/main`, Arif gave the explicit instruction
+"move on to the next carrier." Asked (AskUserQuestion) which of the remaining 7 to
+build next — after being told Evri and Hermes are the same company (Hermes UK
+rebranded to Evri in 2022, confirmed this pass, so this is genuinely carrier #2 of
+7 remaining, not 8) and that FedEx/UPS have fully public self-serve sandboxes, a
+stronger documentation foundation than Royal Mail's own partially-gated docs — Arif
+explicitly picked **Evri**, overriding that recommendation. Research immediately hit
+a structurally different problem than Royal Mail's: **Evri itself publishes no
+self-serve public API of any kind** — confirmed via paul-walsh.co.uk and multiple
+other independent sources, no `developer.evri.com` or equivalent exists; direct
+integration requires an Account Manager relationship with a real minimum-volume
+threshold, the same "no readable official docs at all" problem Temu's and TikTok's
+own connectors hit (§4.7/§4.8), not Royal Mail's "readable but partially gated"
+problem. Solved the same way those two were solved: build against a credible THIRD
+PARTY instead of a nonexistent direct API. Here, that's the **Sapient/Intersoft CORE
+API** (`docs.intersoftsapient.net`) — a real, credible, widely-used multi-carrier
+shipping gateway whose own docs (unlike Evri's/Temu's/TikTok's JS-SPA doc sites)
+render for an unauthenticated fetch and confirm support for Evri, Royal Mail, FedEx,
+UPS, DHL, DPD, InPost, An Post, and others. **This connector integrates via Sapient,
+not a direct Evri API — documented as such everywhere, in code and in
+`/settings/carriers`' own UI, never presented as if it talks to Evri directly.**
+
+**Research trail — every field/endpoint marked CONFIRMED or INFERRED, same
+discipline §19.1's own research trail follows** (full detail in
+`packages/carrier-connectors/src/evri-connector.ts`'s own class doc comment, not
+fully restated here):
+
+- **Base URL** — CONFIRMED: `https://api.intersoftsapient.net`, identical on both
+  the `/v4/shipments/evri` and `/v4/trackings` reference pages
+  (docs.intersoftsapient.net/reference).
+- **Auth** — CONFIRMED as OAuth2 `clientCredentials`, token URL
+  `https://authentication.intersoftsapient.net/connect/token`
+  (docs.intersoftsapient.net/reference/oath2's own literal security-scheme block).
+  Response field names `access_token`/`expires_in`/`token_type` separately CONFIRMED
+  (docs.intersoftsapient.net/docs/bearer-token-generation-1). **INFERRED**: the exact
+  request shape (HTTP Basic `client_id:client_secret` + `grant_type=client_credentials`
+  form body) — no literal example was found for Sapient specifically; modeled on this
+  exact codebase's own confirmed `WalmartConnector.authenticate()` convention (§4.2),
+  the closest confirmed sibling, not a guess from nothing.
+- **`POST /v4/shipments/evri`** — CONFIRMED path and CONFIRMED top-level request
+  shape (`ShipmentInformation`, `Shipper`, `Destination`, `Packages` — 1-99, each with
+  an optional `Items` array for dutiable shipments, max 15 items — plus optional
+  `CarrierSpecifics`/`Customs`/`ReturnToSender`). **CONFIRMED and directly
+  load-bearing**: a separate guide (docs.intersoftsapient.net/docs/
+  shipment-creation-and-manifesting) describes three shipment actions —
+  `Create`/`Allocate` (both need a separate Print Shipment call for the label) and
+  `Process` ("A label is returned in the Create Shipment response") — this connector
+  always requests `Process`, so `createShipment()` stays one request/response round
+  trip, matching `CarrierConnector`'s own contract, rather than silently becoming a
+  two-call sequence. **INFERRED**: the exact nested field names inside each object
+  (no literal rendered JSON example was returned by any fetch this pass) — modeled on
+  Royal Mail's own confirmed conventions for lack of a better source, **the single
+  least-confirmed request body in this connector**, same "flag it, don't hide it"
+  precedent Temu's `skuStockTargetList`/TikTok's `pushInventory` bodies set (§4.7/§4.8).
+  Response shape is likewise INFERRED and read defensively (several candidate field
+  names tried in order), with the raw response always preserved.
+- **No live rate-shopping endpoint found for Sapient either** — same genuine
+  carrier-API-level gap Royal Mail's own research confirmed (§19.1). The one adjacent
+  feature found ("Hurricane Commerce... Quoted landed cost") is a customs duty/tax
+  estimate, not a shipping-rate quote. **Unlike Royal Mail, no confirmed Evri
+  surcharge or base-price data exists** — `EvriConnector.getRateEstimate()`
+  deliberately returns an empty list rather than fabricating a number with no source
+  at all, a real, honest difference from Royal Mail's own illustrative-table
+  fallback, not an oversight.
+- **`POST /v4/trackings`** — CONFIRMED path, but a genuine, confirmed
+  ARCHITECTURAL MISMATCH with `trackShipment`'s own contract: Sapient's docs say
+  this endpoint is "designed for registering tracking numbers from OTHER systems,"
+  should NOT be used for a shipment created within the same Sapient account, and is
+  chargeable — and a separate page (docs.intersoftsapient.net/docs/
+  tracking-events-and-milestones) CONFIRMS Sapient's real tracking-delivery
+  mechanism is a configured WEBHOOK, not a polling GET-by-tracking-number endpoint
+  (none was found anywhere in this research pass, searched directly). Implemented
+  against `POST /v4/trackings` anyway — it's the only request/response endpoint
+  found that returns tracking data, and `trackShipment` isn't optional on this
+  interface — but flagged explicitly as this connector's least-trustworthy method,
+  not a confirmed-correct usage. A real integration pass should build real webhook
+  receiving (mirroring Shopify's own `/api/webhooks/shopify`, §4.5) before relying
+  on this against real shipments.
+- **`voidShipment` deliberately NOT implemented** — a "Recall shipment" concept
+  exists in Sapient's own docs (docs.intersoftsapient.net/docs/recall-shipment) but
+  no literal endpoint path was found for it this pass; optional on the interface
+  precisely for a carrier whose cancel shape isn't confirmed, same reasoning the
+  interface's own doc comment already states.
+
+**Built** (`packages/carrier-connectors/src/evri-connector.ts`): `EvriConnector`
+implementing `CarrierConnector` — `authenticate()` (real OAuth2 client_credentials
+exchange, in-memory cached/refreshed near expiry, same pattern as
+`WalmartConnector`/`AmazonConnector`), `verifyConnection()` (forces a fresh token
+exchange — no cheaper authenticated read-only endpoint was found for Sapient the way
+Royal Mail's `GET /carriers` serves that role), `createShipment()` (`POST
+/v4/shipments/evri`, `Process` action), `trackShipment()` (`POST /v4/trackings`, see
+the architectural-mismatch caveat above), `getRateEstimate()` (always `[]`). No
+`voidShipment`. No new migration needed: `'evri'` was already an allowed
+`carrier_connections.carrier` CHECK value from migration 0039, and Sapient's
+client_id/client_secret pair fits the same `encrypted_client_id`/
+`encrypted_client_secret` columns Royal Mail's own Tracking-API-credential half
+already established a reuse precedent for.
+
+**Wired into the app**, generalizing rather than duplicating Royal Mail's own
+wiring, per this section's own "one shared route, not a near-duplicate per carrier"
+plan:
+
+- `/settings/carriers` gained a second card, "Evri" (Sapient client ID + client
+  secret form), backed by a new `POST /api/carriers/evri/connect` route — same
+  "verify before persist" discipline as Royal Mail's own connect route, calling
+  `EvriConnector.verifyConnection()` (a real token exchange) before persisting, and
+  recording `carrier_connection.connected`/`credentials_rotated` in the audit log
+  (§17), never logging the secret itself. The page's own query now covers both
+  `'royal_mail'` and `'evri')` in one `WHERE carrier IN (...)` instead of two
+  separate queries.
+- `/picklists`' "Ready to ship" card: the Royal-Mail-only "Ship via Royal Mail" form
+  is now a single generalized "Ship via connected carrier" form with a `<select
+  name="carrier">` that only ever lists carriers the tenant actually has an active
+  `carrier_connections` row for (Royal Mail, Evri, or both) — not two parallel forms.
+  `POST /api/orders/[id]/ship-via-carrier` (the same route Royal Mail's own pass
+  built) now dispatches on that `carrier` field via a small `CARRIER_CONNECTORS` map
+  (`{ royal_mail: RoyalMailConnector's factory, evri: EvriConnector's factory }`),
+  covering the label-generation call, the `shipments` row's own `carrier` column
+  (previously hardcoded `'royal_mail'`), and the display name passed into
+  `WarehouseService.confirmShipment()`'s `TrackingInfo.carrier` field ("Royal Mail"
+  vs. "Evri") — the exact same confirmation path either way, per this route's own
+  original "one already-tested path, not two parallel ones" design.
+
+**UNVERIFIED IN PRACTICE, more so than Royal Mail's own connector**: no real
+Sapient client_id/client_secret exists anywhere in this codebase or Arif's account
+yet, and unlike Royal Mail's Click & Drop API key (a confirmed, direct-carrier
+credential), this connector's own request/response body shapes are themselves
+substantially INFERRED, not just its credential-exchange flow — see this section's
+own research-trail bullets above for exactly which pieces. Pure request/response
+mapping, the token-caching logic, and the `Process`-action/label/tracking-number
+extraction are unit-tested against a stubbed `fetch`
+(`packages/carrier-connectors/test/evri-connector.test.ts`, 11 tests), wired into
+`scripts/run-tests.sh`'s `SAFE_TESTS`. Verified: `npm run db:migrate` clean (no
+pending migration, as expected), `npm run typecheck --workspaces` clean across all
+eleven workspaces, `next build` clean (both new routes and the updated
+`/settings/carriers`/`/picklists` pages compile), and `bash scripts/run-tests.sh` —
+all 56 test files pass.
+
 **Deliberately not built this pass** (§0's own "don't expand scope without an
-explicit decision" rule, same as every other channel's own documented narrowing):
-the other 7 carriers (FedEx, UPS, DHL, Parcelforce, DPD, Evri, Hermes) — Arif's own
-"carrier-first, Royal Mail complete" phasing decision means none of them are touched
-until Royal Mail's own build is verified against real infrastructure; a real
-per-tenant carrier feature-flag system mirroring §15's channel flags; retry/
-circuit-breaker wiring mirroring §4.4 (no scheduler job exists for carriers the way
-one does for channel order-sync — a carrier connection is only ever used
-synchronously from the pack/ship flow today, so `carrier_connections`' own
-failure-tracking columns exist on the row but nothing writes to them yet); and
-replacing `estimateRoyalMailRates()`'s illustrative base-rate table with Royal
-Mail's actual published price list.
+explicit decision" rule, same as every other channel's/carrier's own documented
+narrowing): the remaining 6 carriers (FedEx, UPS, DHL, Parcelforce, DPD — Hermes is
+not a separate carrier, folded into Evri per this section's own research) — none of
+them are touched until this pass's own build is verified against real
+infrastructure; real Sapient webhook receiving (the honest fix for
+`trackShipment()`'s own architectural mismatch, above); a real per-tenant carrier
+feature-flag system mirroring §15's channel flags; retry/circuit-breaker wiring
+mirroring §4.4 (same "no scheduler job exists for carriers yet" reasoning §19.1's
+own closing paragraph already gives); and any confirmed Evri/Sapient surcharge or
+base-price data to replace `getRateEstimate()`'s current empty-list return.
 
 ---
 
