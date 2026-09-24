@@ -46,11 +46,13 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
   carrier to build next once Evri was complete and merged — see §19.3. Parcelforce
   (carrier #4) is now built too — Arif's own explicit pick, overriding the UPS
   recommendation this time, when asked which carrier to build next once FedEx was
-  complete and merged — see §19.4. The remaining 4 (UPS, DHL, DPD, and whatever
-  "Hermes" would have been had it turned out to be a separate carrier) remain
-  unbuilt, an explicit next-phase decision per this section's own "don't expand
-  scope without an explicit decision"
-  rule, not an oversight.
+  complete and merged — see §19.4. UPS (carrier #5) is now built too — the
+  recommended option and Arif's own explicit pick, going WITH the recommendation
+  this time rather than overriding it, when asked which carrier to build next once
+  Parcelforce was complete and merged — see §19.5. The remaining 2 (DHL, DPD, and
+  whatever "Hermes" would have been had it turned out to be a separate carrier)
+  remain unbuilt, an explicit next-phase decision per this section's own "don't
+  expand scope without an explicit decision" rule, not an oversight.
 
 Do not expand this scope without an explicit decision — every module below assumes it.
 
@@ -3486,7 +3488,7 @@ guarantee (§6, §11 item 6). A future new tenant-scoped table's migration shoul
 guarded-cast form directly from this section or from 0018/0035, not from an older
 migration that might itself predate 0018.
 
-## 19. Carrier Integration Layer (§0's new locked decision — Royal Mail carrier #1, Evri carrier #2, FedEx carrier #3, Parcelforce carrier #4)
+## 19. Carrier Integration Layer (§0's new locked decision — Royal Mail carrier #1, Evri carrier #2, FedEx carrier #3, Parcelforce carrier #4, UPS carrier #5)
 
 **Why a new layer, not an extension of §4's Channel Connector Layer**: a channel
 (Amazon/Shopify/Walmart/eBay/Temu/TikTok) is where an order comes FROM; a carrier is
@@ -4162,13 +4164,184 @@ regression — same known contention pattern CLAUDE.md §16 already documents fo
 
 **Deliberately not built this pass**, same "don't expand scope without an explicit
 decision" rule as §19.1's/§19.2's/§19.3's own closing paragraphs: the remaining 3
-carriers (UPS, DHL, DPD); real Parcelforce manifest generation, confirmed required
-before collection (see the research trail above) but not itself implemented; real
-Sapient webhook receiving (still open from §19.2); wiring FedEx's own real live
+carriers at the time (UPS, DHL, DPD); real Parcelforce manifest generation, confirmed
+required before collection (see the research trail above) but not itself implemented;
+real Sapient webhook receiving (still open from §19.2); wiring FedEx's own real live
 rate call into `/picklists` (still open from §19.3); a real per-tenant carrier
 feature-flag system mirroring §15's channel flags; and retry/circuit-breaker wiring
 mirroring §4.4 (still no scheduler job exists for any carrier in this layer, same
-reasoning §19.1's own closing paragraph already gives).
+reasoning §19.1's own closing paragraph already gives). (UPS of that list is no
+longer unbuilt — see §19.5, immediately below.)
+
+### 19.5 UPS — carrier #5, built via UPS's own public OpenAPI spec repository
+
+**Why UPS, and why it's the best-sourced connector in this layer so far**: once
+Parcelforce (§19.4) was complete, merged, and pushed to `origin/main`, Arif gave the
+same explicit instruction as before — "move on to the next carrier." Asked
+(AskUserQuestion) which of the remaining 3 to build next — UPS recommended, same
+"fully public, self-serve sandbox" reasoning FedEx's own recommendation used
+(§19.3) — Arif went WITH the recommendation this time, rather than overriding it
+the way Evri's (§19.2) and Parcelforce's (§19.4) own picks each did once. UPS turned
+out to be a genuine step up in sourcing quality even from FedEx: UPS publishes its
+own OpenAPI/Swagger specs directly in a public GitHub repository
+(github.com/UPS-API/api-documentation) — a real machine-readable spec this research
+pass could fetch and read directly for several endpoints, not a rendered doc page
+(FedEx, §19.3) or a session-gated/third-party-gateway page (Royal Mail §19.1, Evri
+§19.2).
+
+**Research trail — every field/endpoint marked CONFIRMED or INFERRED, same
+discipline §19.1's/§19.2's/§19.3's/§19.4's own research trails follow** (the full
+breakdown lives in `packages/carrier-connectors/src/ups-connector.ts`'s own class
+doc comment, not fully restated here):
+
+- **Auth** — CONFIRMED end to end directly from UPS's own official OpenAPI spec
+  (github.com/UPS-API/api-documentation/blob/main/OAuthClientCredentials.yaml,
+  fetched live this pass): `POST /security/v1/oauth/token`, base URL
+  `https://onlinetools.ups.com` (production) / `https://wwwcie.ups.com` (UPS's own
+  "Customer Integration Environment," their sandbox), HTTP Basic auth (client ID as
+  username, client secret as password — a genuine, confirmed difference from every
+  other client_credentials connector in this layer, all of which put the client
+  id/secret in the form body instead, e.g. FedEx's/Walmart's own confirmed shape),
+  form-urlencoded body `grant_type=client_credentials`, JSON response
+  `{token_type, access_token, expires_in, issued_at, client_id, scope,
+  refresh_count, status}` — every field name read directly off the official spec's
+  own schema, not paraphrased or inferred from a third party. This is this
+  codebase's most-confirmed carrier auth flow yet, ahead even of FedEx's own
+  literal-rendered-example auth (§19.3), since this one came from the actual
+  machine-readable spec rather than a docs page's own rendering of it.
+- **`POST /api/shipments/{version}/ship`** — the exact literal path/version segment
+  is INFERRED: UPS's own `Shipping.yaml` spec file (14,330 lines, 581 KB) is too
+  large for this research pass's own fetch tooling to render field-by-field —
+  confirmed to exist, but not readable the way the much smaller OAuth spec was.
+  CROSS-CONFIRMED instead from two independent, non-official sources that agree on
+  the same shape: the `ups-nodejs-sdk` npm package (documenting `confirm()`/
+  `accept()` request objects named `Shipper`/`ShipTo`/`Packages`, and response
+  fields `ShipmentIdentificationNumber`/`TrackingNumber`) and a detailed
+  third-party integration writeup (atoship.com, which renders a literal endpoint
+  `POST /api/shipments/v2409/ship`, base URLs matching the OAuth spec's own
+  sandbox/production split, and full nested field names for `Shipper`/`ShipTo`/
+  `ShipFrom`/`Package`/`Service`/`PaymentInformation`, plus response fields
+  `ShipmentIdentificationNumber`, `PackageResults[].TrackingNumber`,
+  `PackageResults[].ShippingLabel.GraphicImage` — a base64-encoded label,
+  genuinely more confirmed than FedEx's own either-`url`-or-`encodedLabel`
+  uncertainty, §19.3). Real UPS account numbers (`ShipperNumber`) are required on
+  the `Shipper` object — the THIRD carrier in this layer (after FedEx §19.3 and
+  Parcelforce §19.4) where `carrier_connections.external_account_id` holds a
+  genuinely independent account identifier.
+- **`DELETE /api/shipments/v1/void/cancel/{shipmentIdentificationNumber}`** —
+  CONFIRMED via a real, literal request path quoted in a genuine bug report filed
+  directly against UPS's own official GitHub repo
+  (github.com/UPS-API/api-documentation/issues/63 — a real developer's own working
+  integration hitting this exact endpoint, `?trackingnumber={value}` as a query
+  parameter), the same "a real developer's own reported usage outranks an
+  inferred shape" precedent Parcelforce's own confirmed test endpoint already
+  established (§19.4's own Google-Groups-post source). This makes UPS the THIRD
+  carrier in this layer (after Royal Mail and Parcelforce) with a real, confirmed
+  `voidShipment()` — Evri and FedEx both deliberately left it unimplemented for
+  lack of exactly this kind of confirmation (§19.2, §19.3).
+- **`GET /api/track/v1/details/{inquiryNumber}`** — CONFIRMED path, method, base
+  URL, and both required headers (`transId`, `transactionSrc`) directly from UPS's
+  own official `Tracking.yaml` spec, which this pass's fetch tooling COULD render
+  in full (unlike the oversized `Shipping.yaml`). Response shape CONFIRMED the
+  same way: `trackResponse.shipment[].package[].activity[]`, each entry carrying
+  `status`/`location`/`date`/`time` (plus GMT variants and a `logicalScan`
+  boolean), and package-level `currentStatus`/`statusCode`/`statusDescription`
+  fields — this codebase's most-confirmed tracking response shape of any carrier
+  connector built so far, ahead even of Royal Mail's own (§19.1, INFERRED from a
+  community library) and FedEx's own (§19.3, only partially confirmed via a
+  dotted-path example).
+- **`POST /api/rating/{version}/{requestoption}`** — CONFIRMED path shape, method,
+  and base URLs directly from UPS's own official `Rating.yaml` spec
+  (`requestoption` one of `Rate`/`Shop`/`RateTimeInTransit`/`ShopTimeInTransit` —
+  this connector always uses `Shop`, matching `RateEstimate[]`'s own plural return
+  shape better than a single `Rate` lookup). Response field names CONFIRMED the
+  same way: `RatedShipment` (array), each with `Service` and
+  `TotalCharges.MonetaryValue`. **A genuine, confirmed SECOND exception to the "no
+  carrier researched so far has a live rate-quote endpoint" pattern §19.1/§19.2
+  both establish** — UPS, like FedEx (§19.3), DOES expose a real live
+  rate-shopping endpoint; `UpsConnector.getRateEstimate()` is the SECOND carrier
+  connector in this layer to make a real network call for a rate estimate.
+  Request body shape is INFERRED (the Rating spec's own request schema wasn't
+  rendered this pass, only its response) — modeled on the same `Shipper`/
+  `ShipTo`/`ShipFrom`/`Package` object shapes the Shipping API itself confirms.
+
+**Built** (`packages/carrier-connectors/src/ups-connector.ts`): `UpsConnector`
+implementing `CarrierConnector` — `authenticate()` (real HTTP-Basic
+client_credentials exchange against `https://onlinetools.ups.com/security/v1/oauth/token`,
+in-memory cached/refreshed near the documented expiry, same pattern as every other
+client_credentials connector here), `verifyConnection()` (forces a fresh token
+exchange — no cheaper authenticated read-only endpoint was found for UPS this pass
+either, same reasoning `EvriConnector`'s/`FedExConnector`'s own
+`verifyConnection()` already give), `createShipment()` (`POST
+/api/shipments/v2409/ship`), `voidShipment()` (`DELETE
+/api/shipments/v1/void/cancel/{id}` — the THIRD real, confirmed void in this
+layer), `trackShipment()` (`GET /api/track/v1/details/{inquiryNumber}` — this
+layer's most-confirmed tracking response shape), `getRateEstimate()` (`POST
+/api/rating/v2409/Shop` — a real live call, the SECOND in this layer after FedEx).
+`UpsCredentials` is `{clientId, clientSecret, accountNumber}` — the same
+three-field shape as `FedExCredentials`, for the same underlying reason (both
+carriers require a real account number on every Ship/Rate request). No new
+migration needed: `'ups'` was already an allowed `carrier_connections.carrier`
+CHECK value from migration 0039.
+
+**Wired into the app**, generalizing the existing four-carrier pattern to five
+rather than duplicating it — confirming, for a fourth time, that the design
+decided when Evri was added (§19.2's own "one shared route, not a near-duplicate
+per carrier" plan) really does generalize:
+
+- `/settings/carriers` gained a fifth card, "UPS" (Client ID + Client Secret +
+  account number — the same three-field shape as FedEx's own form), backed by a
+  new `POST /api/carriers/ups/connect` route — same "verify before persist"
+  discipline as every other carrier connect route in this layer, calling
+  `UpsConnector.verifyConnection()` before persisting, and recording
+  `carrier_connection.connected`/`credentials_rotated` in the audit log (§17) —
+  `accountNumber` is safe to log in `details` (the same identifier a UPS invoice
+  or label already carries), unlike `clientId`/`clientSecret`, which never are.
+  The page's own carrier-connections query now covers `'royal_mail'`, `'evri'`,
+  `'fedex'`, `'parcelforce'`, and `'ups'` in one `WHERE carrier IN (...)` clause —
+  a fifth carrier is, again, just an added value in an existing list, the same
+  confirmation every prior carrier addition already gave this design.
+- `/picklists`' "Ship via connected carrier" form's `<select name="carrier">` now
+  lists UPS as a fifth option, gated the identical way every other carrier's own
+  option already is (only rendered when the tenant has an active `ups`
+  `carrier_connections` row). `POST /api/orders/[id]/ship-via-carrier`'s
+  `CARRIER_CONNECTORS` dispatch map gained exactly one more line — `ups: {
+  displayName: "UPS", createConnector: createUpsConnectorFromCarrierConnection }`
+  — covering the label-generation call, the `shipments` row's own `carrier`
+  column, and the display name passed into `WarehouseService.confirmShipment()`'s
+  `TrackingInfo.carrier` field, the same one-already-tested confirmation path
+  every carrier in this layer shares, now proven to generalize a fourth time.
+- **Deliberately NOT wired this pass**: `UpsConnector.getRateEstimate()`'s own
+  real live rate-shopping call is not invoked anywhere in the app yet — same
+  "genuinely separate, additive piece of UI work" scope note FedEx's own
+  unwired live rate call already carries (§19.3), now true of a second carrier
+  too.
+
+**UNVERIFIED IN PRACTICE, same status every other carrier in this layer carried
+before its own first live pass**: no real UPS Client ID/Secret or UPS account
+number exists anywhere in this codebase or Arif's account yet — despite this
+connector's own research trail being the best-sourced of the five carriers built
+so far (a real public OpenAPI spec repo, not a session-gated page or a
+third-party gateway's docs), nothing below has round-tripped against real UPS
+infrastructure, sandbox or production. Pure request/response mapping, the
+Basic-auth token-caching logic, and the shipment/void/tracking/rate response
+parsing are unit-tested against a stubbed `fetch`
+(`packages/carrier-connectors/test/ups-connector.test.ts`, 12 tests), wired into
+`scripts/run-tests.sh`'s `SAFE_TESTS`. Verified: `npm run db:migrate` clean (no
+pending migration, as expected — `'ups'` was already an allowed CHECK value),
+`npm run typecheck --workspaces` clean across all eleven workspaces, `next build`
+clean (the new connect route and the updated `/settings/carriers`/`/picklists`
+pages both compile), and `bash scripts/run-tests.sh` — all 59 test files pass.
+
+**Deliberately not built this pass**, same "don't expand scope without an explicit
+decision" rule as §19.1's/§19.2's/§19.3's/§19.4's own closing paragraphs: the
+remaining 2 carriers (DHL, DPD); real Parcelforce manifest generation (still open
+from §19.4); real Sapient webhook receiving (still open from §19.2); wiring
+FedEx's AND UPS's own real live rate calls into `/picklists` (both now open, see
+above); a real per-tenant carrier feature-flag system mirroring §15's channel
+flags; and retry/circuit-breaker wiring mirroring §4.4 (still no scheduler job
+exists for any carrier in this layer, same reasoning §19.1's own closing
+paragraph already gives).
 
 ---
 

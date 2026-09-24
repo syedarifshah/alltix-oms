@@ -36,14 +36,16 @@ interface CarrierSettingsPageProps {
  * Settings UI for the Carrier Integration layer (CLAUDE.md §19) -- the
  * shipping-side counterpart to /settings/channels' marketplace connections.
  * Royal Mail (carrier #1, §19.1), Evri (carrier #2, §19.2), FedEx (carrier
- * #3, §19.3), and Parcelforce (carrier #4, §19.4, built once Arif explicitly
+ * #3, §19.3), Parcelforce (carrier #4, §19.4, built once Arif explicitly
  * picked it -- overriding the UPS recommendation -- as "the next carrier" a
- * third time) are the only four with a real connector as of this pass --
- * the remaining 4 (UPS/DHL/DPD -- Hermes itself was folded into "Evri" per
- * that connector's own research: Hermes UK rebranded to Evri in 2022, one
- * carrier not two) aren't listed here yet, same "don't render a Connect
- * option for something that doesn't exist" discipline /settings/channels'
- * own ChannelNotEnabledNotice applies to a flagged-off channel.
+ * third time), and UPS (carrier #5, §19.5, built once Arif went WITH the
+ * recommendation this time) are the only five with a real connector as of
+ * this pass -- the remaining 2 (DHL/DPD -- Hermes itself was folded into
+ * "Evri" per that connector's own research: Hermes UK rebranded to Evri in
+ * 2022, one carrier not two) aren't listed here yet, same "don't render a
+ * Connect option for something that doesn't exist" discipline
+ * /settings/channels' own ChannelNotEnabledNotice applies to a flagged-off
+ * channel.
  */
 export default async function CarrierSettingsPage({
   searchParams,
@@ -61,14 +63,14 @@ export default async function CarrierSettingsPage({
 
   const { connected, error } = await searchParams;
 
-  const { royalMailConnection, evriConnection, fedexConnection, parcelforceConnection } = await withTenant(
+  const { royalMailConnection, evriConnection, fedexConnection, parcelforceConnection, upsConnection } = await withTenant(
     pool,
     tenantId,
     async (client) => {
       const result = await client.query<CarrierConnectionRow>(
         `SELECT id, carrier, external_account_id, status, consecutive_failures, last_failure_at, last_failure_message, created_at
          FROM carrier_connections
-        WHERE carrier IN ('royal_mail', 'evri', 'fedex', 'parcelforce')
+        WHERE carrier IN ('royal_mail', 'evri', 'fedex', 'parcelforce', 'ups')
         ORDER BY created_at DESC`,
       );
       return {
@@ -76,6 +78,7 @@ export default async function CarrierSettingsPage({
         evriConnection: result.rows.find((r) => r.carrier === "evri") ?? null,
         fedexConnection: result.rows.find((r) => r.carrier === "fedex") ?? null,
         parcelforceConnection: result.rows.find((r) => r.carrier === "parcelforce") ?? null,
+        upsConnection: result.rows.find((r) => r.carrier === "ups") ?? null,
       };
     },
   );
@@ -84,13 +87,14 @@ export default async function CarrierSettingsPage({
   const isEvriConnected = evriConnection?.status === "active";
   const isFedExConnected = fedexConnection?.status === "active";
   const isParcelforceConnected = parcelforceConnection?.status === "active";
+  const isUpsConnected = upsConnection?.status === "active";
 
   return (
     <main className="page">
       <h1>Carriers</h1>
       <p className="subtitle">
         Real carrier label generation and tracking, separate from the marketplace connections on{" "}
-        <a href="/settings/channels">Channels</a>. Royal Mail, Evri, FedEx, and Parcelforce are the only four
+        <a href="/settings/channels">Channels</a>. Royal Mail, Evri, FedEx, Parcelforce, and UPS are the only five
         carriers built so far — see the pack/ship workflow on <a href="/picklists">Picklists</a> for where a
         connected carrier is actually used to generate a real shipping label.
       </p>
@@ -99,6 +103,7 @@ export default async function CarrierSettingsPage({
       {connected === "evri" && <div className="alert alert-success">Evri connected.</div>}
       {connected === "fedex" && <div className="alert alert-success">FedEx connected.</div>}
       {connected === "parcelforce" && <div className="alert alert-success">Parcelforce connected.</div>}
+      {connected === "ups" && <div className="alert alert-success">UPS connected.</div>}
       {error?.startsWith("royal_mail_missing_fields") && (
         <div className="alert alert-danger">The Click &amp; Drop API key is required.</div>
       )}
@@ -149,6 +154,19 @@ export default async function CarrierSettingsPage({
       {error?.startsWith("parcelforce_save_failed") && (
         <div className="alert alert-danger">
           Couldn&apos;t save this connection ({error.slice("parcelforce_save_failed:".length)}).
+        </div>
+      )}
+      {error?.startsWith("ups_missing_fields") && (
+        <div className="alert alert-danger">The UPS client ID, client secret, and account number are all required.</div>
+      )}
+      {error?.startsWith("ups_verify_failed") && (
+        <div className="alert alert-danger">
+          UPS rejected that credential set ({error.slice("ups_verify_failed:".length)}).
+        </div>
+      )}
+      {error?.startsWith("ups_save_failed") && (
+        <div className="alert alert-danger">
+          Couldn&apos;t save this connection ({error.slice("ups_save_failed:".length)}).
         </div>
       )}
       {error === "not signed in" && <div className="alert alert-danger">Not signed in.</div>}
@@ -280,6 +298,35 @@ export default async function CarrierSettingsPage({
           <ParcelforceConnectForm buttonLabel="Connect Parcelforce" />
         )}
       </div>
+
+      <h2 style={{ marginTop: 24 }}>UPS</h2>
+      <div className="card">
+        <div className="alert alert-info" style={{ marginBottom: 12 }}>
+          UNVERIFIED against real UPS infrastructure — built against UPS&apos;s own public OpenAPI spec repository
+          (github.com/UPS-API/api-documentation), this codebase&apos;s best-sourced carrier connector so far, but no
+          real Client ID/Secret or account number has round-tripped against it yet. Also worth knowing: like FedEx,
+          UPS <strong>does</strong> expose a live rate-shopping endpoint, and — like Royal Mail and Parcelforce —
+          UPS has a confirmed cancel-shipment (void) operation too.
+        </div>
+        {upsConnection ? (
+          <div className="stack">
+            <div className="row">
+              <span className={isUpsConnected ? "badge badge-success" : "badge badge-danger"}>{upsConnection.status}</span>
+            </div>
+            <div className="muted">Connected since {new Date(upsConnection.created_at).toISOString()}</div>
+            {upsConnection.status === "error" && (
+              <div className="alert alert-danger" style={{ marginTop: 8, marginBottom: 0 }}>
+                {upsConnection.consecutive_failures} consecutive failure(s)
+                {upsConnection.last_failure_message && `: ${upsConnection.last_failure_message}`}.
+                Reconnect below once the underlying issue is fixed.
+              </div>
+            )}
+            <UpsConnectForm buttonLabel="Reconnect UPS" />
+          </div>
+        ) : (
+          <UpsConnectForm buttonLabel="Connect UPS" />
+        )}
+      </div>
     </main>
   );
 }
@@ -354,6 +401,26 @@ function ParcelforceConnectForm({ buttonLabel }: { buttonLabel: string }): React
       <label>
         Contract number
         <input type="text" name="contractNumber" placeholder="Your Parcelforce contract number" required />
+      </label>
+      <button type="submit">{buttonLabel}</button>
+    </form>
+  );
+}
+
+function UpsConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElement {
+  return (
+    <form action="/api/carriers/ups/connect" method="POST" className="stack" style={{ marginTop: 8 }}>
+      <label>
+        UPS Client ID
+        <input type="text" name="clientId" placeholder="From the UPS Developer Portal" required />
+      </label>
+      <label>
+        UPS Client Secret
+        <input type="password" name="clientSecret" placeholder="From the UPS Developer Portal" required />
+      </label>
+      <label>
+        UPS account number
+        <input type="text" name="accountNumber" placeholder="Required on every Shipping/Rating request" required />
       </label>
       <button type="submit">{buttonLabel}</button>
     </form>
