@@ -51,11 +51,13 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
   this time rather than overriding it, when asked which carrier to build next once
   Parcelforce was complete and merged — see §19.5. DHL (carrier #6) is now built
   too — Arif's own explicit pick ("DHL"), given directly rather than via an
-  AskUserQuestion round, once UPS was complete and merged — see §19.6. The
-  remaining 1 (DPD, and whatever "Hermes" would have been had it turned out to be
-  a separate carrier) remains unbuilt, an explicit next-phase decision per this
-  section's own "don't expand scope without an explicit decision" rule, not an
-  oversight.
+  AskUserQuestion round, once UPS was complete and merged — see §19.6. DPD
+  (carrier #7) is now built too, and Hermes was never a separate carrier to begin
+  with (folded into Evri per that connector's own research, §19.2) — Arif's own
+  explicit "Yes, build DPD now (Recommended)" confirmation via AskUserQuestion,
+  once DHL was complete and merged — see §19.7. This closes out the full
+  originally-requested 7-carrier lineup; no carrier from that original list
+  remains unbuilt.
 
 Do not expand this scope without an explicit decision — every module below assumes it.
 
@@ -3491,7 +3493,7 @@ guarantee (§6, §11 item 6). A future new tenant-scoped table's migration shoul
 guarded-cast form directly from this section or from 0018/0035, not from an older
 migration that might itself predate 0018.
 
-## 19. Carrier Integration Layer (§0's new locked decision — Royal Mail carrier #1, Evri carrier #2, FedEx carrier #3, Parcelforce carrier #4, UPS carrier #5, DHL carrier #6)
+## 19. Carrier Integration Layer (§0's new locked decision — Royal Mail carrier #1, Evri carrier #2, FedEx carrier #3, Parcelforce carrier #4, UPS carrier #5, DHL carrier #6, DPD carrier #7)
 
 **Why a new layer, not an extension of §4's Channel Connector Layer**: a channel
 (Amazon/Shopify/Walmart/eBay/Temu/TikTok) is where an order comes FROM; a carrier is
@@ -4506,13 +4508,169 @@ scripts/run-tests.sh` — all 60 test files pass.
 
 **Deliberately not built this pass**, same "don't expand scope without an explicit
 decision" rule as §19.1's/§19.2's/§19.3's/§19.4's/§19.5's own closing paragraphs:
-the remaining 1 carrier (DPD); real Parcelforce manifest generation (still open
-from §19.4); real Sapient webhook receiving (still open from §19.2); wiring
-FedEx's, UPS's, AND DHL's own real live rate calls into `/picklists` (all three now
-open, see above); a real per-tenant carrier feature-flag system mirroring §15's
-channel flags; and retry/circuit-breaker wiring mirroring §4.4 (still no scheduler
-job exists for any carrier in this layer, same reasoning §19.1's own closing
-paragraph already gives).
+the remaining 1 carrier (DPD, built next — see §19.7 immediately below); real
+Parcelforce manifest generation (still open from §19.4); real Sapient webhook
+receiving (still open from §19.2); wiring FedEx's, UPS's, AND DHL's own real live
+rate calls into `/picklists` (all three now open, see above); a real per-tenant
+carrier feature-flag system mirroring §15's channel flags; and retry/
+circuit-breaker wiring mirroring §4.4 (still no scheduler job exists for any
+carrier in this layer, same reasoning §19.1's own closing paragraph already
+gives).
+
+### 19.7 DPD — carrier #7, built via the Sapient/Intersoft CORE API gateway (the same gateway as Evri)
+
+**Why DPD, and why via Sapient rather than DPD UK's own direct API**: once DHL
+(§19.6) was complete, merged, and pushed to `origin/main`, DPD was the last of the
+original 7 carriers (Hermes having already been folded into Evri per §19.2's own
+research) — Arif was asked via AskUserQuestion whether to build it now, and
+explicitly confirmed **"Yes, build DPD now (Recommended)."** Research immediately
+hit rate limits from `WebFetch`'s session cap mid-pass (resumed cleanly after the
+reset, via Arif's own explicit "continue DPD's research" instruction) but otherwise
+surfaced a genuinely different shape of problem from every carrier since Evri:
+**DPD UK's own direct API is CONFIRMED TO EXIST** — unlike Evri's total absence of
+any public API — but has no publicly-readable technical reference, closer to
+Parcelforce's own closed-onboarding situation (§19.4) than to Evri's "doesn't
+exist at all," except DPD UK, unlike Parcelforce, has no confirmed sandbox/UAT
+environment either.
+
+**Research trail — every field/endpoint marked CONFIRMED or INFERRED, same
+discipline every prior carrier's own research trail follows** (the full breakdown
+lives in `packages/carrier-connectors/src/dpd-connector.ts`'s own class doc
+comment, not fully restated here):
+
+- **DPD UK's own direct API — confirmed real, confirmed unreadable**: base host
+  `api.dpd.co.uk`, a real confirmed literal login endpoint
+  `https://api.dpd.co.uk/user/?action=login`, and a `{username, password,
+  account_number}` credential model — CONFIRMED independently by THREE separate
+  integration platforms (ShipEngine, Octolize, EasyPost), delivered "via GeoPost
+  Enterprise Service Gateway (ESG) application" (GeoPost being DPDgroup's parent
+  brand, confirmed via AfterShip). No self-serve test/sandbox credentials exist —
+  production-only, though unscanned labels aren't charged — and onboarding is real
+  and closed: Octolize's own docs describe signing a contract with DPD, then
+  submitting a test shipment JSON plus a physical printed label to DPD's Smethwick
+  office for a staff audit before permanent API access. No field-level technical
+  documentation for any of this is publicly rendered anywhere. (DPD's own official
+  Baltic API PDF was found and correctly recognized as targeting the WRONG national
+  entity — Lithuania/Latvia/Estonia, `esiunta.dpd.lt` and siblings — and excluded,
+  same "recognize and avoid a wrong regional/legacy API generation" discipline
+  DHL's own research already established, §19.6.)
+- **Two aggregator pages, investigated and correctly excluded**: AfterShip's own
+  "DPD UK API" page and Cargoson's own "DPD Local UK API Documentation" page both
+  turned out to describe THEIR OWN wrapper/middleware APIs
+  (`api.aftership.com/postmen/v3`, `cargoson.com/api/v1`), not DPD UK's real API
+  directly — recognized and not used as a source for DPD UK's own field names,
+  same discipline that correctly excluded Temu's own idatariver.com scraping-API
+  mixup (§4.7).
+- **The strategic decision**: rather than build against an API with zero readable
+  field-level documentation, this connector builds against the SAME Sapient/
+  Intersoft CORE API gateway EvriConnector already uses (§19.2) — confirmed via a
+  live fetch of Sapient's own reference pages that DPD UK is a real, separately
+  supported carrier on that gateway: `POST /v4/shipments/dpduk` (alongside
+  `/v4/shipments/dpdie` for Ireland and `/v4/shipments/dpdnl` for Netherlands).
+  This makes DPD the SECOND carrier built against this exact gateway, not merely
+  "confirmed for Sapient in general" — the auth flow, base URLs, and known
+  limitations are REUSED from `EvriConnector`'s own confirmed shape, not
+  re-derived from scratch.
+- **CONFIRMED**: base URL (`https://api.intersoftsapient.net`) and auth
+  (`https://authentication.intersoftsapient.net/connect/token`, OAuth2
+  `client_credentials`) — identical to Evri's own, reused directly. CONFIRMED the
+  `/v4/shipments/dpduk` path itself and the top-level request shape (the same
+  `ShipmentInformation`/`Shipper`/`Destination`/`Packages`/`CarrierSpecifics`/
+  `Customs`/`ReturnToSender` object family Evri's own connector already
+  established). **INFERRED**: the DPD-specific contents of `CarrierSpecifics` —
+  Sapient's own docs mention only the word "enhancements" for this object, with no
+  literal example found this pass, so it's deliberately left empty rather than
+  guessed, this connector's single least-confirmed piece (same "flag it, don't
+  hide it" precedent every other carrier/channel connector's own least-confirmed
+  field already sets).
+- **No live rate-shopping endpoint found for Sapient**, same confirmed gap Evri's
+  own connector already established (§19.2) — `getRateEstimate()` returns `[]`.
+  **No confirmed DPD/Sapient surcharge or base-price data exists either** (unlike
+  Royal Mail's own confirmed surcharge table, §19.1), so unlike Royal Mail's
+  illustrative fallback, there is nothing to estimate from at all.
+- **`voidShipment` deliberately NOT implemented** — a cancel/recall shipment
+  concept is confirmed to exist on Sapient (two live-fetched docs pages,
+  `docs/view-cancelled-shipments` and `docs/recall-shipment`), but no literal
+  REST endpoint path was found for it, same gap and same reasoning Evri's own
+  connector already carries.
+- **`/v4/trackings` reused as-is from `EvriConnector`**, carrying the identical
+  confirmed architectural mismatch already documented there: this endpoint is
+  designed for registering tracking numbers from OTHER systems, not for polling a
+  shipment created within the same Sapient account — real tracking delivery is a
+  configured webhook, not built this pass (still open from §19.2).
+
+**Built** (`packages/carrier-connectors/src/dpd-connector.ts`): `DpdConnector`
+implementing `CarrierConnector` — `authenticate()` (real OAuth2 client_credentials
+exchange, in-memory cached/refreshed near expiry, identical pattern to
+`EvriConnector`'s own), `verifyConnection()` (forces a fresh token exchange, same
+"no cheaper authenticated read-only endpoint was found" reasoning as Evri's own),
+`createShipment()` (`POST /v4/shipments/dpduk`, `Process` action), `trackShipment()`
+(`POST /v4/trackings`, see the architectural-mismatch caveat above),
+`getRateEstimate()` (always `[]`). No `voidShipment`. `DpdCredentials` is
+`{clientId, clientSecret}` — the same two-field shape as `EvriCredentials`, for the
+same underlying reason (nothing real to put in `external_account_id`, same
+"nothing real to reuse" reasoning Royal Mail's/Evri's own connect routes already
+document). No new migration needed: `'dpd'` was already an allowed
+`carrier_connections.carrier` CHECK value from migration 0039.
+
+**Wired into the app**, generalizing the existing six-carrier pattern to seven
+rather than duplicating it — confirming, for a sixth time, that the design decided
+when Evri was added (§19.2's own "one shared route, not a near-duplicate per
+carrier" plan) really does generalize:
+
+- `/settings/carriers` gained a seventh card, "DPD" (Sapient client ID + client
+  secret — the same two-field shape as Evri's own form), backed by a new `POST
+  /api/carriers/dpd/connect` route — same "verify before persist" discipline as
+  every other carrier connect route in this layer, calling
+  `DpdConnector.verifyConnection()` before persisting, and recording
+  `carrier_connection.connected`/`credentials_rotated` in the audit log (§17),
+  never logging the secret itself. The page's own carrier-connections query now
+  covers `'royal_mail'`, `'evri'`, `'fedex'`, `'parcelforce'`, `'ups'`, `'dhl'`,
+  and `'dpd'` in one `WHERE carrier IN (...)` clause — a seventh carrier is, again,
+  just an added value in an existing list.
+- `/picklists`' "Ship via connected carrier" form's `<select name="carrier">` now
+  lists DPD as a seventh option, gated the identical way every other carrier's own
+  option already is. `POST /api/orders/[id]/ship-via-carrier`'s
+  `CARRIER_CONNECTORS` dispatch map gained exactly one more line — `dpd: {
+  displayName: "DPD", createConnector: createDpdConnectorFromCarrierConnection }`
+  — covering the label-generation call, the `shipments` row's own `carrier`
+  column, and the display name passed into `WarehouseService.confirmShipment()`'s
+  `TrackingInfo.carrier` field, the same one-already-tested confirmation path
+  every carrier in this layer shares, now proven to generalize a sixth time.
+- **Deliberately NOT wired this pass**: nothing new here beyond what every other
+  carrier without a live rate endpoint already carries — DPD, like Royal Mail,
+  Evri, and Parcelforce, has no live rate call to wire in the first place.
+
+**UNVERIFIED IN PRACTICE, same status every other carrier in this layer carried
+before its own first live pass**: no real Sapient client_id/client_secret exists
+anywhere in this codebase or Arif's account yet, and — same as Evri's own
+connector — this connector's own request/response body shapes are themselves
+substantially INFERRED, not just its credential-exchange flow, since DPD UK's own
+real direct API (the only source that could have confirmed them independently) has
+no readable technical reference at all. Pure request/response mapping, the
+token-caching logic, and the `Process`-action/label/tracking-number extraction are
+unit-tested against a stubbed `fetch`
+(`packages/carrier-connectors/test/dpd-connector.test.ts`, 11 tests), wired into
+`scripts/run-tests.sh`'s `SAFE_TESTS`. Verified: `npm run db:migrate` clean (no
+pending migration, as expected — `'dpd'` was already an allowed CHECK value),
+`npm run typecheck --workspaces` clean across all eleven workspaces, `next build`
+clean (the new connect route and the updated `/settings/carriers`/`/picklists`
+pages both compile), and `bash scripts/run-tests.sh` — all 61 test files pass.
+
+**Deliberately not built this pass** — and, for the first time in this section,
+there is no next carrier to name: DPD closes out the full originally-requested
+7-carrier lineup (Royal Mail, Evri, FedEx, Parcelforce, UPS, DHL, DPD — Hermes
+folded into Evri, §19.2). What remains open, unchanged from §19.6's own closing
+paragraph and every carrier's before it: real Parcelforce manifest generation
+(§19.4); real Sapient webhook receiving, which would also be the honest fix for
+BOTH Evri's and DPD's own shared `trackShipment()` architectural mismatch (§19.2);
+wiring FedEx's, UPS's, AND DHL's own real live rate calls into `/picklists`
+(§19.3/§19.5/§19.6); a real per-tenant carrier feature-flag system mirroring
+§15's channel flags; and retry/circuit-breaker wiring mirroring §4.4 (still no
+scheduler job exists for any carrier in this layer). Any further carrier beyond
+this original 7 (a real Hermes-as-distinct-carrier scenario aside, since that
+turned out not to exist) is a new, explicit scope decision per §0's own "don't
+expand scope without an explicit decision" rule, not an oversight.
 
 ---
 

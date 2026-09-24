@@ -39,13 +39,13 @@ interface CarrierSettingsPageProps {
  * #3, §19.3), Parcelforce (carrier #4, §19.4, built once Arif explicitly
  * picked it -- overriding the UPS recommendation -- as "the next carrier" a
  * third time), UPS (carrier #5, §19.5, built once Arif went WITH the
- * recommendation this time), and DHL (carrier #6, §19.6, Arif's own explicit
- * pick again) are the only six with a real connector as of this pass -- the
- * remaining 1 (DPD -- Hermes itself was folded into "Evri" per that
- * connector's own research: Hermes UK rebranded to Evri in 2022, one carrier
- * not two) isn't listed here yet, same "don't render a Connect option for
- * something that doesn't exist" discipline /settings/channels' own
- * ChannelNotEnabledNotice applies to a flagged-off channel.
+ * recommendation this time), DHL (carrier #6, §19.6, Arif's own explicit
+ * pick again), and DPD (carrier #7, §19.7, Arif's own explicit
+ * "Yes, build DPD now" confirmation, the last of the original 7 carriers)
+ * are all seven with a real connector as of this pass -- Hermes itself was
+ * folded into "Evri" per that connector's own research (Hermes UK rebranded
+ * to Evri in 2022, one carrier not two), so this closes out the full
+ * originally-requested lineup.
  */
 export default async function CarrierSettingsPage({
   searchParams,
@@ -63,23 +63,31 @@ export default async function CarrierSettingsPage({
 
   const { connected, error } = await searchParams;
 
-  const { royalMailConnection, evriConnection, fedexConnection, parcelforceConnection, upsConnection, dhlConnection } =
-    await withTenant(pool, tenantId, async (client) => {
-      const result = await client.query<CarrierConnectionRow>(
-        `SELECT id, carrier, external_account_id, status, consecutive_failures, last_failure_at, last_failure_message, created_at
+  const {
+    royalMailConnection,
+    evriConnection,
+    fedexConnection,
+    parcelforceConnection,
+    upsConnection,
+    dhlConnection,
+    dpdConnection,
+  } = await withTenant(pool, tenantId, async (client) => {
+    const result = await client.query<CarrierConnectionRow>(
+      `SELECT id, carrier, external_account_id, status, consecutive_failures, last_failure_at, last_failure_message, created_at
          FROM carrier_connections
-        WHERE carrier IN ('royal_mail', 'evri', 'fedex', 'parcelforce', 'ups', 'dhl')
+        WHERE carrier IN ('royal_mail', 'evri', 'fedex', 'parcelforce', 'ups', 'dhl', 'dpd')
         ORDER BY created_at DESC`,
-      );
-      return {
-        royalMailConnection: result.rows.find((r) => r.carrier === "royal_mail") ?? null,
-        evriConnection: result.rows.find((r) => r.carrier === "evri") ?? null,
-        fedexConnection: result.rows.find((r) => r.carrier === "fedex") ?? null,
-        parcelforceConnection: result.rows.find((r) => r.carrier === "parcelforce") ?? null,
-        upsConnection: result.rows.find((r) => r.carrier === "ups") ?? null,
-        dhlConnection: result.rows.find((r) => r.carrier === "dhl") ?? null,
-      };
-    });
+    );
+    return {
+      royalMailConnection: result.rows.find((r) => r.carrier === "royal_mail") ?? null,
+      evriConnection: result.rows.find((r) => r.carrier === "evri") ?? null,
+      fedexConnection: result.rows.find((r) => r.carrier === "fedex") ?? null,
+      parcelforceConnection: result.rows.find((r) => r.carrier === "parcelforce") ?? null,
+      upsConnection: result.rows.find((r) => r.carrier === "ups") ?? null,
+      dhlConnection: result.rows.find((r) => r.carrier === "dhl") ?? null,
+      dpdConnection: result.rows.find((r) => r.carrier === "dpd") ?? null,
+    };
+  });
 
   const isRoyalMailConnected = royalMailConnection?.status === "active";
   const isEvriConnected = evriConnection?.status === "active";
@@ -87,15 +95,17 @@ export default async function CarrierSettingsPage({
   const isParcelforceConnected = parcelforceConnection?.status === "active";
   const isUpsConnected = upsConnection?.status === "active";
   const isDhlConnected = dhlConnection?.status === "active";
+  const isDpdConnected = dpdConnection?.status === "active";
 
   return (
     <main className="page">
       <h1>Carriers</h1>
       <p className="subtitle">
         Real carrier label generation and tracking, separate from the marketplace connections on{" "}
-        <a href="/settings/channels">Channels</a>. Royal Mail, Evri, FedEx, Parcelforce, UPS, and DHL are the only six
-        carriers built so far — see the pack/ship workflow on <a href="/picklists">Picklists</a> for where a
-        connected carrier is actually used to generate a real shipping label.
+        <a href="/settings/channels">Channels</a>. Royal Mail, Evri, FedEx, Parcelforce, UPS, DHL, and DPD are all
+        seven of the originally-requested carriers, now built — see the pack/ship workflow on{" "}
+        <a href="/picklists">Picklists</a> for where a connected carrier is actually used to generate a real shipping
+        label.
       </p>
 
       {connected === "royal_mail" && <div className="alert alert-success">Royal Mail connected.</div>}
@@ -104,6 +114,7 @@ export default async function CarrierSettingsPage({
       {connected === "parcelforce" && <div className="alert alert-success">Parcelforce connected.</div>}
       {connected === "ups" && <div className="alert alert-success">UPS connected.</div>}
       {connected === "dhl" && <div className="alert alert-success">DHL connected.</div>}
+      {connected === "dpd" && <div className="alert alert-success">DPD connected.</div>}
       {error?.startsWith("royal_mail_missing_fields") && (
         <div className="alert alert-danger">The Click &amp; Drop API key is required.</div>
       )}
@@ -180,6 +191,19 @@ export default async function CarrierSettingsPage({
       {error?.startsWith("dhl_save_failed") && (
         <div className="alert alert-danger">
           Couldn&apos;t save this connection ({error.slice("dhl_save_failed:".length)}).
+        </div>
+      )}
+      {error?.startsWith("dpd_missing_fields") && (
+        <div className="alert alert-danger">The Sapient client ID and client secret are both required.</div>
+      )}
+      {error?.startsWith("dpd_verify_failed") && (
+        <div className="alert alert-danger">
+          Sapient rejected that client ID/secret pair ({error.slice("dpd_verify_failed:".length)}).
+        </div>
+      )}
+      {error?.startsWith("dpd_save_failed") && (
+        <div className="alert alert-danger">
+          Couldn&apos;t save this connection ({error.slice("dpd_save_failed:".length)}).
         </div>
       )}
       {error === "not signed in" && <div className="alert alert-danger">Not signed in.</div>}
@@ -372,6 +396,38 @@ export default async function CarrierSettingsPage({
           <DhlConnectForm buttonLabel="Connect DHL" />
         )}
       </div>
+
+      <h2 style={{ marginTop: 24 }}>DPD</h2>
+      <div className="card">
+        <div className="alert alert-info" style={{ marginBottom: 12 }}>
+          UNVERIFIED against real Sapient/DPD infrastructure — DPD UK&apos;s own direct API is confirmed to exist
+          (a real, closed, contract-gated onboarding via a signed DPD contract and a physical label audit), but has
+          no publicly-readable technical reference, so — like Evri — this integrates via the{" "}
+          <strong>same Sapient/Intersoft CORE API gateway</strong> instead, not DPD UK&apos;s own direct API. No real
+          client ID/secret has round-tripped against it yet. Also worth knowing: no live rate-shopping endpoint was
+          found for Sapient either — rate estimates return empty (same as Evri, no confirmed DPD surcharge or
+          base-price data exists to estimate from), and — like Evri — no confirmed cancel-shipment endpoint was
+          found, so void is not implemented.
+        </div>
+        {dpdConnection ? (
+          <div className="stack">
+            <div className="row">
+              <span className={isDpdConnected ? "badge badge-success" : "badge badge-danger"}>{dpdConnection.status}</span>
+            </div>
+            <div className="muted">Connected since {new Date(dpdConnection.created_at).toISOString()}</div>
+            {dpdConnection.status === "error" && (
+              <div className="alert alert-danger" style={{ marginTop: 8, marginBottom: 0 }}>
+                {dpdConnection.consecutive_failures} consecutive failure(s)
+                {dpdConnection.last_failure_message && `: ${dpdConnection.last_failure_message}`}.
+                Reconnect below once the underlying issue is fixed.
+              </div>
+            )}
+            <DpdConnectForm buttonLabel="Reconnect DPD" />
+          </div>
+        ) : (
+          <DpdConnectForm buttonLabel="Connect DPD" />
+        )}
+      </div>
     </main>
   );
 }
@@ -490,6 +546,22 @@ function DhlConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElement 
       <label>
         Unified Tracking API key (optional)
         <input type="password" name="trackingApiKey" placeholder="Leave blank to skip live tracking" />
+      </label>
+      <button type="submit">{buttonLabel}</button>
+    </form>
+  );
+}
+
+function DpdConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElement {
+  return (
+    <form action="/api/carriers/dpd/connect" method="POST" className="stack" style={{ marginTop: 8 }}>
+      <label>
+        Sapient client ID
+        <input type="text" name="clientId" placeholder="Issued by Intersoft Sapient" required />
+      </label>
+      <label>
+        Sapient client secret
+        <input type="password" name="clientSecret" placeholder="Issued by Intersoft Sapient" required />
       </label>
       <button type="submit">{buttonLabel}</button>
     </form>
