@@ -10,6 +10,7 @@
     { "path": "packages/warehouse-service" },
     { "path": "packages/rules-engine" },
     { "path": "packages/channel-connectors" },
+    { "path": "packages/carrier-connectors" },
     { "path": "packages/scheduler" }
   ]
 }

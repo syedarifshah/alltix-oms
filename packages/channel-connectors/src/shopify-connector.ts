@@ -904,7 +904,7 @@ export class ShopifyConnector {
    *
    * No `since`/incremental pagination the way pullOrders() has: a
    * catalog's size doesn't grow unboundedly the way an order history does
-   * (CLAUDE.md §0's target of 50-5,000 orders/month is a very different
+   * (CLAUDE.md §0's target of 500-50,000 orders/month is a very different
    * scale than a seller's typical product count), so a full re-pull every
    * run is simple and correct rather than a premature optimization -- a
    * consuming job re-upserting a SKU it already knows about is a cheap,

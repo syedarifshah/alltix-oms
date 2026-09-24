@@ -60,7 +60,7 @@ interface ReportsPageProps {
  *  same "no client JS anywhere in this app" convention every other page's
  *  filter/action already follows (see /inventory's TransferStockForm doc
  *  comment). 30 is the default: short enough to be current, long enough
- *  that a low-volume tenant (CLAUDE.md §0: 50-5,000 orders/month) has
+ *  that a low-volume tenant (CLAUDE.md §0: 500-50,000 orders/month) has
  *  something to look at. */
 const PERIOD_CHOICES = [7, 30, 90, 365] as const;
 const DEFAULT_PERIOD_DAYS = 30;

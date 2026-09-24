@@ -27,6 +27,20 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
   provider — see §14.1), but NOT built yet: blocked on Arif getting a real quote/
   sandbox API key from Check's sales team (no vendor in this space publishes
   self-serve pricing). See §14/§14.1.
+- **Carrier/Shipment Integration — Arif's explicit pick, "add FedEx, UPS, DHL, Royal
+  Mail, Parcelforce, DPD, Evri, Hermes... we need to add these in Alltix OMS for
+  Order shipment"**: a new integration layer, distinct from the Channel Connector
+  Layer above (a carrier is who a packed order gets handed to, not where it came
+  from). Scope locked via a 5-question AskUserQuestion round: full scope eventually
+  across all 8 carriers (structured carrier picklist, full label/tracking/live-rate
+  API integration, peak-season surcharge monitoring), no existing credentials for
+  any of the 8, built "wired but unverified" (same status Walmart/eBay/Temu/TikTok
+  each carried), phased **carrier-first — Royal Mail built completely (labels,
+  tracking, rates, surcharges) before any of the other 7 are touched**, same
+  "prove the pattern on one first" order §4.6/§4.7/§4.8 already used for eBay/Temu/
+  TikTok. Royal Mail is built — see §19. The other 7 remain unbuilt, an explicit
+  next-phase decision per this section's own "don't expand scope without an
+  explicit decision" rule, not an oversight.
 
 Do not expand this scope without an explicit decision — every module below assumes it.
 
@@ -3461,6 +3475,172 @@ anything touching RLS/tenant isolation, this platform's single most safety-criti
 guarantee (§6, §11 item 6). A future new tenant-scoped table's migration should crib the
 guarded-cast form directly from this section or from 0018/0035, not from an older
 migration that might itself predate 0018.
+
+## 19. Carrier Integration Layer (§0's new locked decision — Royal Mail, carrier #1)
+
+**Why a new layer, not an extension of §4's Channel Connector Layer**: a channel
+(Amazon/Shopify/Walmart/eBay/Temu/TikTok) is where an order comes FROM; a carrier is
+who an already-packed order gets HANDED TO. Structurally different relationship, so
+this is a new package (`packages/carrier-connectors`), a new `CarrierConnector`
+interface (`connector.ts`, deliberately mirroring `ChannelConnector`'s own shape —
+"don't trust this interface until carrier #2 is built against it," same caution §4.3
+gives its own interface), and new tables (`carrier_connections`, `shipments`,
+`carrier_surcharges` — migration `0039_carrier_connectors.sql`), not a bolt-on to
+`channel_connections`.
+
+### 19.1 Royal Mail — carrier #1, built completely (labels, tracking, rates, surcharges)
+
+**Research trail — two genuinely different Royal Mail APIs, confirmed from two
+different sources**:
+
+- **Click & Drop API** (order creation, label generation, manifesting) — CONFIRMED
+  end to end from Royal Mail's own official Swagger/OpenAPI 2.0 spec, fetched live
+  this pass: `https://api.parcel.royalmail.com/doc/v1/click-and-drop-api-v1.yaml`.
+  Base URL `https://api.parcel.royalmail.com/api/v1`, Bearer token in `Authorization`
+  (issued via Click & Drop's own UI, Settings > Integrations — not an OAuth
+  exchange). Rate limit 2 calls/sec, up to 2,000 orders/request, only ONE Click &
+  Drop integration allowed per account (so `carrier_connections`'
+  `UNIQUE(tenant_id, carrier)` is a correct constraint for this carrier specifically,
+  not just a convenient one).
+  - **A real, confirmed finding that narrows this feature's own "live rate shopping"
+    scope, surfaced during research rather than assumed away**: this API has **no
+    rate-shopping/quote endpoint at all** — confirmed absent from both the official
+    swagger's own path list and the official API product listing
+    (developer.royalmail.net/api, which lists Delivery Office Finder / Local Collect
+    / Tracking as separate products, no pricing product anywhere). `/returns/services`
+    (the one endpoint that could be mistaken for this) is scoped to Online Business
+    Account returns specifically, not general outbound rate shopping. This is a
+    genuine limitation of Royal Mail's own API, not a gap in this connector —
+    `CarrierConnector.getRateEstimate()` for Royal Mail is therefore, correctly, a
+    static-price-table + confirmed-surcharge-data lookup (§19.2 below), never a live
+    network call.
+- **Tracking API v2 (REST)** — CONFIRMED base shape and endpoint paths
+  (`GET /{mailPieceId}/events`, `GET /summary`, `GET /{mailPieceId}/signature`,
+  25 calls/12hrs on the onboarding plan) directly from Royal Mail's own official
+  product page (developer.royalmail.net/product/175625, fetched live). Base URL
+  (`https://api.royalmail.net/mailpieces/v2`) and response field names
+  (`statusCategory`/`statusDescription`, an `events` array, `mailPieceId`/
+  `uniqueItemId`) are INFERRED from a real, actively-maintained community PHP
+  library targeting this exact API generation
+  (github.com/elliotjreed/royal-mail-tracking) — official pages require a logged-in
+  session to render request/response bodies. Credential model (client_id +
+  client_secret via an IBM API Connect developer portal) cross-confirmed from the
+  official /start onboarding page. **Genuinely unconfirmed**: the exact OAuth
+  token-exchange endpoint and header name — INFERRED as a Bearer exchange, flagged
+  plainly in `RoyalMailConnector`'s own class doc comment as the piece most likely to
+  need correcting against a real sandbox account. A separate, OLDER SOAP-based
+  tracking API also exists (`https://api.royalmail.net/tracking`, confirmed via a
+  second independent library, github.com/BloomAndWild/royal_mail_api) — deliberately
+  NOT the one targeted; that generation is legacy.
+
+**Built** (`packages/carrier-connectors`):
+
+- `CarrierConnector` interface (`connector.ts`): `authenticate`, `createShipment`,
+  `voidShipment` (optional — not every future carrier's API will support this the
+  same way), `trackShipment`, `getRateEstimate`. `CreateShipmentRequest`/
+  `CreateShipmentResult`/`TrackingResult`/`RateEstimate` types carry the confirmed
+  Royal Mail field shapes but are generic enough for a second, structurally
+  different carrier — unproven until that carrier is actually built, same honesty
+  this interface's own doc comment states about itself.
+- `RoyalMailConnector` (`royal-mail-connector.ts`): `createShipment()` (POST
+  `/orders`, confirmed request/response shape) handles a real, documented split
+  outcome — Royal Mail can report the order created while `labelErrors` is
+  non-empty (label generation failed independently) — as a genuine partial success
+  (`labelBase64: null`, no throw), not an error, since the order and its real
+  `orderIdentifier`/tracking number still exist. `voidShipment()` (DELETE
+  `/orders/{id}`). `trackShipment()` (GET `/{mailPieceId}/events`). `getRateEstimate()`
+  never calls the network (see the no-rate-endpoint finding above) — delegates to
+  `surcharges.ts`.
+- `surcharges.ts`: `getApplicableSurcharges()`/`isInPeakSurchargeWindow()` are real,
+  DB-backed reads of `carrier_surcharges` (below) — safe for actual monitoring/
+  alerting. `estimateRoyalMailRates()` combines that same confirmed surcharge data
+  with a small, explicitly-flagged-as-**illustrative-not-confirmed** base postage
+  price table (this research pass confirmed surcharge *deltas* from
+  royalmail.com/business/mail/surcharges, never fetched Royal Mail's actual current
+  base retail price list) — the surcharge portion of a rate estimate is real, the
+  base-rate portion is a placeholder until that table is replaced with Royal Mail's
+  real published prices.
+- **`carrier_connections`** (migration 0039): one row per (tenant, carrier) — like
+  `payroll_connections` (§14.1), not `channel_connections`' four-column uniqueness,
+  since a carrier has no per-marketplace-region concept. Written with the guarded
+  `NULLIF(...)` tenant_id cast from the start (§18's own closing instruction, not
+  reproducing that bug class on a brand-new table).
+- **`shipments`**: one row per real carrier-generated shipment — the CARRIER side
+  record (Royal Mail's own `orderIdentifier`/`trackingNumber`/label), upstream of
+  and distinct from `WarehouseService.confirmShipment()`'s existing `TrackingInfo`
+  (which tells the order's CHANNEL it shipped). Not `UNIQUE(tenant_id, order_id)` —
+  a void-and-recreate needs a second row, same "the ledger should show why" principle
+  §3 already applies to order cancellation.
+- **`carrier_surcharges`**: the first table in this schema with no `tenant_id` at
+  all — genuinely global reference data, RLS still enabled with `USING (true)` (same
+  defense-in-depth-even-for-non-tenant-data precedent `demo_requests` sets). Seeded
+  with Royal Mail's real, dated, currently-published figures: UK Peak Surcharge and
+  International Peak Surcharge both running **2 Nov 2026 – 10 Jan 2027**
+  (£0.10–£0.30/item UK, £0.10–£0.25/item international), standing Fuel/Energy
+  Surcharge (16% UK / 12% international) and Green Surcharge (£0.05/item) — no
+  announced end date for the two standing ones as of this research pass. This table
+  has no live sync back to royalmail.com (no such API exists) — re-confirm before
+  relying on these figures past the stated window.
+
+**Wired into the app**:
+
+- `/settings/carriers` (new page, new nav entry) — "Connect Royal Mail" form
+  (Click & Drop API key, required; Tracking API client id/secret, optional — a
+  tenant can use labels/orders without configuring tracking). `POST
+  /api/carriers/royal-mail/connect` verifies the key live (`GET /carriers`, a
+  real authenticated read — not `GET /version`, which needs no auth and would
+  prove nothing) before persisting, same "verify before persist" discipline every
+  channel connect route already follows, and records `carrier_connection.connected`/
+  `credentials_rotated` in the audit log (§17's own discipline, never logging the
+  secret itself).
+- `/picklists`' "Ready to ship" card: the existing free-text "Carrier (e.g. UPS)"
+  form is unchanged (still the fallback for any carrier without a live connector —
+  today, all 7 of the other 8), and a second form, "Ship via Royal Mail," appears
+  only when a tenant has an active Royal Mail connection. `POST
+  /api/orders/[id]/ship-via-carrier` builds a real `createShipment()` request from
+  the order's own lines (SKU/name/quantity/price, joined from `order_lines`/
+  `products`) plus a tenant-typed recipient address and package weight — **v1
+  deliberately narrow**: address/weight are typed into the form, not auto-resolved
+  from `orders.shipping_address`, since that JSONB's shape genuinely differs per
+  channel (see `extractUsShippingZip()`'s own per-channel field-path list, §8) and
+  no column in this schema carries a package weight yet — a real per-channel
+  address parser plus a weight data model is separate, larger work, not attempted
+  here. Records a `shipments` row, then — only once Royal Mail returns a real
+  tracking number — calls the exact same `WarehouseService.confirmShipment()` the
+  manual form already calls, so a Royal Mail-generated shipment and a hand-typed
+  one both flow through one, already-tested confirmation path. If Royal Mail
+  creates the order but returns no tracking number (the `labelErrors` split
+  outcome above), the order deliberately stays `packed` rather than being
+  transitioned on a degraded outcome — same discipline `confirmShipment()` itself
+  already applies when a channel call fails.
+
+**UNVERIFIED IN PRACTICE, same status every other connector in this codebase carried
+before its first live pass**: no real Royal Mail Click & Drop API key or Tracking
+API client_id/client_secret exists anywhere in this codebase or Arif's account yet.
+Pure request/response mapping and the split-outcome/void/tracking logic are
+unit-tested against a stubbed `fetch` (`packages/carrier-connectors/test/
+royal-mail-connector.test.ts`, 12 tests — including a real bug this pass's own test
+suite caught and fixed: `voidShipment()`'s generic request wrapper crashed calling
+`.json()` on Royal Mail's documented 204-No-Content DELETE response before the fix);
+`estimateRoyalMailRates()`'s pure surcharge-window logic is separately tested
+(`surcharges.test.ts`, 7 tests). Both wired into `scripts/run-tests.sh`'s
+`SAFE_TESTS`. Verified: `npm run db:migrate` clean, `npm run typecheck --workspaces`
+clean across all eleven workspaces (the new `@alltix/carrier-connectors` package
+included), `next build` clean (every new route/page compiles), and
+`bash scripts/run-tests.sh` — all 55 test files pass.
+
+**Deliberately not built this pass** (§0's own "don't expand scope without an
+explicit decision" rule, same as every other channel's own documented narrowing):
+the other 7 carriers (FedEx, UPS, DHL, Parcelforce, DPD, Evri, Hermes) — Arif's own
+"carrier-first, Royal Mail complete" phasing decision means none of them are touched
+until Royal Mail's own build is verified against real infrastructure; a real
+per-tenant carrier feature-flag system mirroring §15's channel flags; retry/
+circuit-breaker wiring mirroring §4.4 (no scheduler job exists for carriers the way
+one does for channel order-sync — a carrier connection is only ever used
+synchronously from the pack/ship flow today, so `carrier_connections`' own
+failure-tracking columns exist on the row but nothing writes to them yet); and
+replacing `estimateRoyalMailRates()`'s illustrative base-rate table with Royal
+Mail's actual published price list.
 
 ---
 

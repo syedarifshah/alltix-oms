@@ -49,6 +49,8 @@ SAFE_TESTS=(
   "packages/channel-connectors/test/tiktok-connector.test.ts"
   "packages/channel-connectors/test/tiktok-oauth.test.ts"
   "packages/channel-connectors/test/retry.test.ts"
+  "packages/carrier-connectors/test/royal-mail-connector.test.ts"
+  "packages/carrier-connectors/test/surcharges.test.ts"
   "packages/db/test/channel-connections-rls.test.ts"
   "packages/db/test/hr-rls.test.ts"
   "packages/rules-engine/test/evaluate-golden.test.ts"

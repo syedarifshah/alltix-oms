@@ -126,7 +126,7 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
     );
   }
 
-  const { allocatedOrders, picklists, pickingOrders, packedOrders } = await withTenant(pool, tenantId, async (client) => {
+  const { allocatedOrders, picklists, pickingOrders, packedOrders, isRoyalMailConnected } = await withTenant(pool, tenantId, async (client) => {
     const allocated = await client.query<AllocatedOrderRow>(
       `SELECT id, external_order_id, channel, placed_at FROM orders WHERE status = 'allocated' ORDER BY placed_at NULLS LAST, id`,
     );
@@ -163,11 +163,22 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
       `SELECT id, external_order_id, channel FROM orders WHERE status = 'packed' ORDER BY placed_at NULLS LAST, id`,
     );
 
+    // Gates whether the "Ship via Royal Mail" form (task #59, real label
+    // generation -- see /api/orders/[id]/ship-via-carrier's own doc
+    // comment) renders at all -- same "don't offer an action with nothing
+    // behind it" discipline /settings/channels' own isXEnabled checks
+    // already apply, just for a carrier connection instead of a channel
+    // feature flag.
+    const royalMail = await client.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM carrier_connections WHERE carrier = 'royal_mail' AND status = 'active'`,
+    );
+
     return {
       allocatedOrders: allocated.rows,
       picklists: groupPicklists(picklistRows.rows),
       pickingOrders: picking.rows,
       packedOrders: packed.rows,
+      isRoyalMailConnected: Number(royalMail.rows[0]!.count) > 0,
     };
   });
 
@@ -327,8 +338,57 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
               <form action={`/api/orders/${o.id}/ship`} method="POST" className="row">
                 <input type="text" name="carrier" placeholder="Carrier (e.g. UPS)" required />
                 <input type="text" name="trackingNumber" placeholder="Tracking number" required />
-                <button type="submit">Confirm shipment</button>
+                <button type="submit">Confirm shipment (manual tracking number)</button>
               </form>
+              {isRoyalMailConnected ? (
+                <details style={{ marginTop: 8 }}>
+                  <summary>Ship via Royal Mail (generate a real label)</summary>
+                  <form action={`/api/orders/${o.id}/ship-via-carrier`} method="POST" className="stack" style={{ marginTop: 8 }}>
+                    <label>
+                      Recipient name
+                      <input type="text" name="recipientName" required />
+                    </label>
+                    <label>
+                      Address line 1
+                      <input type="text" name="addressLine1" required />
+                    </label>
+                    <label>
+                      City
+                      <input type="text" name="city" required />
+                    </label>
+                    <label>
+                      Postal code
+                      <input type="text" name="postalCode" required />
+                    </label>
+                    <label>
+                      Country code
+                      <input type="text" name="countryCode" defaultValue="GB" required />
+                    </label>
+                    <label>
+                      Package weight (grams)
+                      <input type="number" name="weightGrams" min={1} max={30000} required />
+                    </label>
+                    <label>
+                      Shipping cost charged to customer (GBP)
+                      <input type="text" name="shippingCostChargedGbp" defaultValue="0.00" />
+                    </label>
+                    <label>
+                      Service code (optional)
+                      <input type="text" name="serviceCode" placeholder="e.g. TPLL" />
+                    </label>
+                    <button type="submit">Generate Royal Mail label &amp; confirm shipment</button>
+                    <p className="muted" style={{ margin: 0 }}>
+                      UNVERIFIED against real Royal Mail infrastructure — see <a href="/settings/carriers">Carriers</a>.
+                      No live rate-shopping exists for Royal Mail; enter the amount actually charged.
+                    </p>
+                  </form>
+                </details>
+              ) : (
+                <p className="muted" style={{ marginTop: 6, marginBottom: 0 }}>
+                  Connect Royal Mail on <a href="/settings/carriers">Carriers</a> to generate a real label instead of
+                  typing in a tracking number by hand.
+                </p>
+              )}
               {o.channel === "amazon" && (
                 <p className="muted" style={{ marginTop: 6, marginBottom: 0 }}>
                   Calls the connected Amazon channel&apos;s shipment-confirmation API — verified against the SP-API

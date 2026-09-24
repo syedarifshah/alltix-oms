@@ -22,6 +22,7 @@
   },
   "dependencies": {
     "@alltix/billing-service": "0.1.0",
+    "@alltix/carrier-connectors": "0.1.0",
     "@alltix/channel-connectors": "0.1.0",
     "@alltix/db": "0.1.0",
     "@alltix/inventory-service": "0.1.0",
