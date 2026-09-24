@@ -38,14 +38,14 @@ interface CarrierSettingsPageProps {
  * Royal Mail (carrier #1, §19.1), Evri (carrier #2, §19.2), FedEx (carrier
  * #3, §19.3), Parcelforce (carrier #4, §19.4, built once Arif explicitly
  * picked it -- overriding the UPS recommendation -- as "the next carrier" a
- * third time), and UPS (carrier #5, §19.5, built once Arif went WITH the
- * recommendation this time) are the only five with a real connector as of
- * this pass -- the remaining 2 (DHL/DPD -- Hermes itself was folded into
- * "Evri" per that connector's own research: Hermes UK rebranded to Evri in
- * 2022, one carrier not two) aren't listed here yet, same "don't render a
- * Connect option for something that doesn't exist" discipline
- * /settings/channels' own ChannelNotEnabledNotice applies to a flagged-off
- * channel.
+ * third time), UPS (carrier #5, §19.5, built once Arif went WITH the
+ * recommendation this time), and DHL (carrier #6, §19.6, Arif's own explicit
+ * pick again) are the only six with a real connector as of this pass -- the
+ * remaining 1 (DPD -- Hermes itself was folded into "Evri" per that
+ * connector's own research: Hermes UK rebranded to Evri in 2022, one carrier
+ * not two) isn't listed here yet, same "don't render a Connect option for
+ * something that doesn't exist" discipline /settings/channels' own
+ * ChannelNotEnabledNotice applies to a flagged-off channel.
  */
 export default async function CarrierSettingsPage({
   searchParams,
@@ -63,14 +63,12 @@ export default async function CarrierSettingsPage({
 
   const { connected, error } = await searchParams;
 
-  const { royalMailConnection, evriConnection, fedexConnection, parcelforceConnection, upsConnection } = await withTenant(
-    pool,
-    tenantId,
-    async (client) => {
+  const { royalMailConnection, evriConnection, fedexConnection, parcelforceConnection, upsConnection, dhlConnection } =
+    await withTenant(pool, tenantId, async (client) => {
       const result = await client.query<CarrierConnectionRow>(
         `SELECT id, carrier, external_account_id, status, consecutive_failures, last_failure_at, last_failure_message, created_at
          FROM carrier_connections
-        WHERE carrier IN ('royal_mail', 'evri', 'fedex', 'parcelforce', 'ups')
+        WHERE carrier IN ('royal_mail', 'evri', 'fedex', 'parcelforce', 'ups', 'dhl')
         ORDER BY created_at DESC`,
       );
       return {
@@ -79,22 +77,23 @@ export default async function CarrierSettingsPage({
         fedexConnection: result.rows.find((r) => r.carrier === "fedex") ?? null,
         parcelforceConnection: result.rows.find((r) => r.carrier === "parcelforce") ?? null,
         upsConnection: result.rows.find((r) => r.carrier === "ups") ?? null,
+        dhlConnection: result.rows.find((r) => r.carrier === "dhl") ?? null,
       };
-    },
-  );
+    });
 
   const isRoyalMailConnected = royalMailConnection?.status === "active";
   const isEvriConnected = evriConnection?.status === "active";
   const isFedExConnected = fedexConnection?.status === "active";
   const isParcelforceConnected = parcelforceConnection?.status === "active";
   const isUpsConnected = upsConnection?.status === "active";
+  const isDhlConnected = dhlConnection?.status === "active";
 
   return (
     <main className="page">
       <h1>Carriers</h1>
       <p className="subtitle">
         Real carrier label generation and tracking, separate from the marketplace connections on{" "}
-        <a href="/settings/channels">Channels</a>. Royal Mail, Evri, FedEx, Parcelforce, and UPS are the only five
+        <a href="/settings/channels">Channels</a>. Royal Mail, Evri, FedEx, Parcelforce, UPS, and DHL are the only six
         carriers built so far — see the pack/ship workflow on <a href="/picklists">Picklists</a> for where a
         connected carrier is actually used to generate a real shipping label.
       </p>
@@ -104,6 +103,7 @@ export default async function CarrierSettingsPage({
       {connected === "fedex" && <div className="alert alert-success">FedEx connected.</div>}
       {connected === "parcelforce" && <div className="alert alert-success">Parcelforce connected.</div>}
       {connected === "ups" && <div className="alert alert-success">UPS connected.</div>}
+      {connected === "dhl" && <div className="alert alert-success">DHL connected.</div>}
       {error?.startsWith("royal_mail_missing_fields") && (
         <div className="alert alert-danger">The Click &amp; Drop API key is required.</div>
       )}
@@ -167,6 +167,19 @@ export default async function CarrierSettingsPage({
       {error?.startsWith("ups_save_failed") && (
         <div className="alert alert-danger">
           Couldn&apos;t save this connection ({error.slice("ups_save_failed:".length)}).
+        </div>
+      )}
+      {error?.startsWith("dhl_missing_fields") && (
+        <div className="alert alert-danger">The DHL API key, API secret, and account number are all required.</div>
+      )}
+      {error?.startsWith("dhl_verify_failed") && (
+        <div className="alert alert-danger">
+          DHL rejected that credential set ({error.slice("dhl_verify_failed:".length)}).
+        </div>
+      )}
+      {error?.startsWith("dhl_save_failed") && (
+        <div className="alert alert-danger">
+          Couldn&apos;t save this connection ({error.slice("dhl_save_failed:".length)}).
         </div>
       )}
       {error === "not signed in" && <div className="alert alert-danger">Not signed in.</div>}
@@ -327,6 +340,38 @@ export default async function CarrierSettingsPage({
           <UpsConnectForm buttonLabel="Connect UPS" />
         )}
       </div>
+
+      <h2 style={{ marginTop: 24 }}>DHL</h2>
+      <div className="card">
+        <div className="alert alert-info" style={{ marginBottom: 12 }}>
+          UNVERIFIED against real DHL infrastructure — built against DHL Express&apos;s own public, self-serve
+          MyDHL API, but no real API key/secret or account number has round-tripped against it yet. DHL splits
+          shipping/rating and tracking across <strong>two separate DHL APIs with two different auth models</strong>
+          — the same shape Royal Mail&apos;s own two-API split established — so tracking needs a second, optional
+          Unified Tracking API key; a tenant can connect labels/rates without it. Also worth knowing: like FedEx and
+          UPS, DHL <strong>does</strong> expose a live rate-shopping endpoint, but — unlike Royal Mail, Parcelforce,
+          and UPS — DHL Express has <strong>no cancel/void-shipment endpoint at all</strong> (confirmed: DHL&apos;s
+          own cancel operation only cancels a pickup request, not the shipment/label itself).
+        </div>
+        {dhlConnection ? (
+          <div className="stack">
+            <div className="row">
+              <span className={isDhlConnected ? "badge badge-success" : "badge badge-danger"}>{dhlConnection.status}</span>
+            </div>
+            <div className="muted">Connected since {new Date(dhlConnection.created_at).toISOString()}</div>
+            {dhlConnection.status === "error" && (
+              <div className="alert alert-danger" style={{ marginTop: 8, marginBottom: 0 }}>
+                {dhlConnection.consecutive_failures} consecutive failure(s)
+                {dhlConnection.last_failure_message && `: ${dhlConnection.last_failure_message}`}.
+                Reconnect below once the underlying issue is fixed.
+              </div>
+            )}
+            <DhlConnectForm buttonLabel="Reconnect DHL" />
+          </div>
+        ) : (
+          <DhlConnectForm buttonLabel="Connect DHL" />
+        )}
+      </div>
     </main>
   );
 }
@@ -421,6 +466,30 @@ function UpsConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElement 
       <label>
         UPS account number
         <input type="text" name="accountNumber" placeholder="Required on every Shipping/Rating request" required />
+      </label>
+      <button type="submit">{buttonLabel}</button>
+    </form>
+  );
+}
+
+function DhlConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElement {
+  return (
+    <form action="/api/carriers/dhl/connect" method="POST" className="stack" style={{ marginTop: 8 }}>
+      <label>
+        DHL Express API key
+        <input type="text" name="apiKey" placeholder="From developer.dhl.com" required />
+      </label>
+      <label>
+        DHL Express API secret
+        <input type="password" name="apiSecret" placeholder="From developer.dhl.com" required />
+      </label>
+      <label>
+        DHL Express account number
+        <input type="text" name="accountNumber" placeholder="Required on every Shipping/Rating request" required />
+      </label>
+      <label>
+        Unified Tracking API key (optional)
+        <input type="password" name="trackingApiKey" placeholder="Leave blank to skip live tracking" />
       </label>
       <button type="submit">{buttonLabel}</button>
     </form>

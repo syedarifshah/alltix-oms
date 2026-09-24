@@ -170,14 +170,14 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
     // isXEnabled checks already apply, just for a carrier connection
     // instead of a channel feature flag. One query covering every carrier
     // this codebase has a real connector for (Royal Mail §19.1, Evri §19.2,
-    // FedEx §19.3, Parcelforce §19.4, UPS §19.5), not one query per carrier --
-    // confirmed a FOURTH time this pass that a new carrier just adds a row
-    // this GROUP BY already handles, exactly as intended when this was
-    // first generalized for Evri.
+    // FedEx §19.3, Parcelforce §19.4, UPS §19.5, DHL §19.6), not one query
+    // per carrier -- confirmed a FIFTH time this pass that a new carrier
+    // just adds a row this GROUP BY already handles, exactly as intended
+    // when this was first generalized for Evri.
     const connections = await client.query<{ carrier: string; count: string }>(
       `SELECT carrier, count(*)::text AS count
          FROM carrier_connections
-        WHERE carrier IN ('royal_mail', 'evri', 'fedex', 'parcelforce', 'ups') AND status = 'active'
+        WHERE carrier IN ('royal_mail', 'evri', 'fedex', 'parcelforce', 'ups', 'dhl') AND status = 'active'
         GROUP BY carrier`,
     );
     const connectedCarrierSet = new Set(connections.rows.filter((r) => Number(r.count) > 0).map((r) => r.carrier));
@@ -193,6 +193,7 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
         fedex: connectedCarrierSet.has("fedex"),
         parcelforce: connectedCarrierSet.has("parcelforce"),
         ups: connectedCarrierSet.has("ups"),
+        dhl: connectedCarrierSet.has("dhl"),
       },
     };
   });
@@ -359,7 +360,8 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
               connectedCarriers.evri ||
               connectedCarriers.fedex ||
               connectedCarriers.parcelforce ||
-              connectedCarriers.ups ? (
+              connectedCarriers.ups ||
+              connectedCarriers.dhl ? (
                 <details style={{ marginTop: 8 }}>
                   <summary>Ship via connected carrier (generate a real label)</summary>
                   <form action={`/api/orders/${o.id}/ship-via-carrier`} method="POST" className="stack" style={{ marginTop: 8 }}>
@@ -370,7 +372,7 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
                           offer an action with nothing behind it" discipline
                           the outer conditional above already applies, now at
                           the per-option level since a tenant could have just
-                          one (or a few) of the five connected. */}
+                          one (or a few) of the six connected. */}
                       <select
                         name="carrier"
                         defaultValue={
@@ -382,7 +384,9 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
                                 ? "fedex"
                                 : connectedCarriers.parcelforce
                                   ? "parcelforce"
-                                  : "ups"
+                                  : connectedCarriers.ups
+                                    ? "ups"
+                                    : "dhl"
                         }
                         required
                       >
@@ -391,6 +395,7 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
                         {connectedCarriers.fedex && <option value="fedex">FedEx</option>}
                         {connectedCarriers.parcelforce && <option value="parcelforce">Parcelforce</option>}
                         {connectedCarriers.ups && <option value="ups">UPS</option>}
+                        {connectedCarriers.dhl && <option value="dhl">DHL</option>}
                       </select>
                     </label>
                     <label>
@@ -426,22 +431,23 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
                       <input
                         type="text"
                         name="serviceCode"
-                        placeholder="e.g. TPLL (Royal Mail), a Sapient service code (Evri), a FedEx service type, Express24 (Parcelforce), or a UPS service code like 03"
+                        placeholder="e.g. TPLL (Royal Mail), a Sapient service code (Evri), a FedEx service type, Express24 (Parcelforce), a UPS service code like 03, or N (DHL Express Worldwide)"
                       />
                     </label>
                     <button type="submit">Generate label &amp; confirm shipment</button>
                     <p className="muted" style={{ margin: 0 }}>
                       UNVERIFIED against real carrier infrastructure — see <a href="/settings/carriers">Carriers</a>.
-                      All five carriers still require the amount actually charged to be entered by hand: Royal Mail,
-                      Evri, and Parcelforce expose no live rate-shopping endpoint at all, and FedEx's and UPS's own
-                      live rate endpoints (§19.3/§19.5) aren't called from this form yet.
+                      All six carriers still require the amount actually charged to be entered by hand: Royal Mail,
+                      Evri, and Parcelforce expose no live rate-shopping endpoint at all, and FedEx's, UPS's, and
+                      DHL's own live rate endpoints (§19.3/§19.5/§19.6) aren't called from this form yet. DHL also has
+                      no cancel/void-shipment operation at all (confirmed carrier-level limitation, not just unbuilt).
                     </p>
                   </form>
                 </details>
               ) : (
                 <p className="muted" style={{ marginTop: 6, marginBottom: 0 }}>
-                  Connect Royal Mail, Evri, FedEx, Parcelforce, or UPS on <a href="/settings/carriers">Carriers</a> to
-                  generate a real label instead of typing in a tracking number by hand.
+                  Connect Royal Mail, Evri, FedEx, Parcelforce, UPS, or DHL on <a href="/settings/carriers">Carriers</a>{" "}
+                  to generate a real label instead of typing in a tracking number by hand.
                 </p>
               )}
               {o.channel === "amazon" && (

@@ -7,6 +7,7 @@ import {
   createFedExConnectorFromCarrierConnection,
   createParcelforceConnectorFromCarrierConnection,
   createUpsConnectorFromCarrierConnection,
+  createDhlConnectorFromCarrierConnection,
 } from "@alltix/carrier-connectors";
 import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
@@ -20,8 +21,8 @@ export const dynamic = "force-dynamic";
  *  createShipment() call to -- kept in one place so adding a real carrier
  *  connector later means adding one entry here, not hunting through this
  *  route's own body (Parcelforce, §19.4, was the third carrier added this
- *  way after Evri and FedEx; UPS, §19.5, is the fourth, confirming the
- *  pattern generalizes a fourth time). Display name is
+ *  way after Evri and FedEx; UPS, §19.5, is the fourth; DHL, §19.6, is the
+ *  fifth, confirming the pattern generalizes a fifth time). Display name is
  *  what flows into WarehouseService.confirmShipment()'s own
  *  TrackingInfo.carrier (the channel-facing carrier name), same value every
  *  other confirmShipment() caller in this codebase already free-texts into
@@ -35,6 +36,7 @@ const CARRIER_CONNECTORS: Record<
   fedex: { displayName: "FedEx", createConnector: createFedExConnectorFromCarrierConnection },
   parcelforce: { displayName: "Parcelforce", createConnector: createParcelforceConnectorFromCarrierConnection },
   ups: { displayName: "UPS", createConnector: createUpsConnectorFromCarrierConnection },
+  dhl: { displayName: "DHL", createConnector: createDhlConnectorFromCarrierConnection },
 };
 
 /**

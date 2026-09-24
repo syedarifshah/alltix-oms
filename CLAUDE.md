@@ -49,10 +49,13 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
   complete and merged — see §19.4. UPS (carrier #5) is now built too — the
   recommended option and Arif's own explicit pick, going WITH the recommendation
   this time rather than overriding it, when asked which carrier to build next once
-  Parcelforce was complete and merged — see §19.5. The remaining 2 (DHL, DPD, and
-  whatever "Hermes" would have been had it turned out to be a separate carrier)
-  remain unbuilt, an explicit next-phase decision per this section's own "don't
-  expand scope without an explicit decision" rule, not an oversight.
+  Parcelforce was complete and merged — see §19.5. DHL (carrier #6) is now built
+  too — Arif's own explicit pick ("DHL"), given directly rather than via an
+  AskUserQuestion round, once UPS was complete and merged — see §19.6. The
+  remaining 1 (DPD, and whatever "Hermes" would have been had it turned out to be
+  a separate carrier) remains unbuilt, an explicit next-phase decision per this
+  section's own "don't expand scope without an explicit decision" rule, not an
+  oversight.
 
 Do not expand this scope without an explicit decision — every module below assumes it.
 
@@ -3488,7 +3491,7 @@ guarantee (§6, §11 item 6). A future new tenant-scoped table's migration shoul
 guarded-cast form directly from this section or from 0018/0035, not from an older
 migration that might itself predate 0018.
 
-## 19. Carrier Integration Layer (§0's new locked decision — Royal Mail carrier #1, Evri carrier #2, FedEx carrier #3, Parcelforce carrier #4, UPS carrier #5)
+## 19. Carrier Integration Layer (§0's new locked decision — Royal Mail carrier #1, Evri carrier #2, FedEx carrier #3, Parcelforce carrier #4, UPS carrier #5, DHL carrier #6)
 
 **Why a new layer, not an extension of §4's Channel Connector Layer**: a channel
 (Amazon/Shopify/Walmart/eBay/Temu/TikTok) is where an order comes FROM; a carrier is
@@ -4335,12 +4338,180 @@ pages both compile), and `bash scripts/run-tests.sh` — all 59 test files pass.
 
 **Deliberately not built this pass**, same "don't expand scope without an explicit
 decision" rule as §19.1's/§19.2's/§19.3's/§19.4's own closing paragraphs: the
-remaining 2 carriers (DHL, DPD); real Parcelforce manifest generation (still open
-from §19.4); real Sapient webhook receiving (still open from §19.2); wiring
-FedEx's AND UPS's own real live rate calls into `/picklists` (both now open, see
-above); a real per-tenant carrier feature-flag system mirroring §15's channel
+remaining 2 carriers at the time (DHL, DPD); real Parcelforce manifest generation
+(still open from §19.4); real Sapient webhook receiving (still open from §19.2);
+wiring FedEx's AND UPS's own real live rate calls into `/picklists` (both now open,
+see above); a real per-tenant carrier feature-flag system mirroring §15's channel
 flags; and retry/circuit-breaker wiring mirroring §4.4 (still no scheduler job
 exists for any carrier in this layer, same reasoning §19.1's own closing
+paragraph already gives). (DHL of that list is no longer unbuilt — see §19.6,
+immediately below.)
+
+### 19.6 DHL — carrier #6, built via DHL Express's own MyDHL API (split across two DHL APIs)
+
+**Why DHL, and why it's a genuine structural parallel to Royal Mail, not FedEx/UPS**:
+once UPS (§19.5) was complete, merged, and pushed to `origin/main`, Arif's next
+message was simply **"DHL"** — an explicit pick given directly, not solicited via an
+AskUserQuestion round the way every prior carrier transition in this layer was
+(Evri overriding a recommendation, FedEx/UPS following one, Parcelforce overriding
+one again). DHL Express's own **MyDHL API** (developer.dhl.com) turned out to be a
+genuinely public, self-serve REST API — the same general shape as FedEx's/UPS's own
+developer portals, not a closed/contract-gated one like Evri's or Parcelforce's. But
+its own SHAPE is a real, confirmed structural parallel to Royal Mail (§19.1) instead:
+DHL splits shipping/rating and tracking across **two genuinely separate DHL APIs
+with two different auth models and two different hosts** — MyDHL API (static Basic
+auth, `express.api.dhl.com`) for shipments/rates, and DHL's own group-wide "Unified
+Tracking API" (a `DHL-API-Key` subscription-key header, `api-eu.dhl.com`) for
+tracking — the same two-API split Royal Mail's own Click & Drop / Tracking API v2
+pair already established, not a FedEx/UPS-style single-host design.
+
+**Research trail — every field/endpoint marked CONFIRMED or INFERRED, same
+discipline every prior carrier's own research trail follows** (the full breakdown
+lives in `packages/carrier-connectors/src/dhl-connector.ts`'s own class doc comment,
+not fully restated here):
+
+- **Auth (MyDHL API)** — CONFIRMED as static HTTP Basic auth (no token exchange at
+  all, unlike UPS's/FedEx's/Evri's own client_credentials flows — the credential
+  pair travels directly on the `Authorization` header of every request) directly
+  from DHL's own official docs page, CROSS-CONFIRMED by two independent real
+  open-source client libraries (`booni3/dhl-express-rest`, `sonnenglas/mydhl-php-sdk`)
+  that both hard-code the identical base URLs. `booni3`'s own package also confirms
+  a required `x-version` header this connector sends as `3.3.2`, DHL's own
+  docs-stated current version.
+- **`POST /shipments`** — CONFIRMED path from both community sources. **A genuine,
+  three-way request-shape discrepancy across three independent sources, worth
+  flagging rather than silently picking one**: `booni3` uses flat top-level
+  `shipper`/`receiver` objects; `sonnenglas` uses flat `shipperAddress`/
+  `shipperContact`/`receiverAddress`/`receiverContact`; a third source
+  (`github.com/myorb/dhl-express-js`, whose own TypeScript type names read as
+  codegen-derived directly from DHL's own official OpenAPI schema, a stronger
+  provenance signal than a hand-written SDK) uses a NESTED shape instead
+  (`customerDetails: { shipperDetails, receiverDetails }`, `content: {
+  isCustomsDeclarable, description, packages, incoterm, unitOfMeasurement }`, plus
+  `accounts`/`productCode`/`plannedShippingDateAndTime`/`pickup`). This connector
+  uses the THIRD (nested) shape on that "codegen-derived type names outrank a
+  hand-written SDK's own naming" reasoning — **INFERRED, not independently
+  confirmed against a literal rendered example**, this connector's single
+  least-confirmed request body, same "flag it, don't hide it" precedent every other
+  connector's own least-confirmed field already sets (Temu's `skuStockTargetList`,
+  Evri's/Parcelforce's own request bodies, §4.7/§19.2/§19.4).
+- **CONFIRMED response field**: `shipmentTrackingNumber` (cross-confirmed by both
+  PHP SDKs, under slightly different property names, both describing the same
+  underlying field — a shipment's own tracking number, not a separate carrier-order
+  id the way Royal Mail's/FedEx's/UPS's own responses each carry). A base64-encoded
+  label document is CONFIRMED to exist but its exact top-level JSON wrapper shape is
+  INFERRED (`documents[].content`), read defensively.
+- **`voidShipment` deliberately NOT implemented — CONFIRMED as a real carrier-level
+  limitation, not just an unconfirmed shape** (a stronger, more specific finding
+  than Evri's/FedEx's own "nothing found" gaps, §19.2/§19.3): a real, published
+  community integration package (`packagist.org/packages/tcgunel/omniship-dhl-express`)
+  documents directly that "DHL Express does not provide a label-voiding endpoint. The
+  cancel operation cancels the associated pickup request," not the shipment/label
+  itself — implementing a `voidShipment()` that only cancels a pickup while a caller
+  reasonably expects it to void the shipment would be actively misleading, so it's
+  left unimplemented, optional on `CarrierConnector` precisely for a case like this.
+- **Tracking is a SEPARATE DHL API entirely** — CONFIRMED directly from DHL's own
+  official "Shipment Tracking - Unified" docs page, including a literal rendered
+  curl example: `GET https://api-eu.dhl.com/track/shipments?trackingNumber={number}`,
+  header `DHL-API-Key` (a subscription key from a SEPARATE developer.dhl.com app
+  registration, not MyDHL API's own Basic-auth pair). Response field names
+  CONFIRMED (`status`, `statusCode`, `description`, `timestamp`, `location`); the
+  exact `shipments[]`/`events[]` nesting is INFERRED, read defensively. This
+  connector's own `trackingApiKey` is optional, same "a tenant can skip live
+  tracking without blocking labels" precedent `RoyalMailCredentials.trackingClientId`/
+  `trackingClientSecret` already set (§19.1), throwing a clear explicit error rather
+  than guessing when it's missing.
+- **`POST /rates`** — CONFIRMED path, reusing the same nested request shape
+  `createShipment()` uses. Response shape is this connector's SECOND-least-confirmed
+  piece — DHL's own docs page only describes the operation in prose, confirming a
+  `products` array exists conceptually but not its exact field names;
+  `productName`/`productCode`/`totalPrice` are INFERRED, read defensively. This is
+  the THIRD carrier connector in this layer (after FedEx §19.3 and UPS §19.5) to
+  make a real live network call for a rate estimate, not a static table or an empty
+  list.
+- **Two "legacy API generation" red herrings, investigated and correctly avoided**:
+  `netresearch/dhl-sdk-api-express` and `spysystem/mydhl` both targeted an older,
+  SOAP-based DHL API generation (`wsbexpress.dhl.com/rest/sndpt`), not the current
+  REST MyDHL API this connector targets — recognized and excluded rather than used
+  uncritically, the same "show the work, not just the conclusion" standard
+  Parcelforce's own "new API" red-flag investigation already set (§19.4).
+
+**Built** (`packages/carrier-connectors/src/dhl-connector.ts`): `DhlConnector`
+implementing `CarrierConnector` — `authenticate()` (no network call — a static
+Basic-auth pair, not a client_credentials exchange, mirroring
+`ParcelforceConnector.authenticate()`'s own "return the credential itself as a
+placeholder token" shape for the same underlying reason: nothing to exchange),
+`verifyConnection()` (no cheaper authenticated read-only endpoint was found for
+MyDHL API this pass either — proxies via a minimal live `POST /rates` call,
+treating only a 401/403 as a rejected credential pair), `createShipment()` (`POST
+/shipments`), `trackShipment()` (`GET api-eu.dhl.com/track/shipments`, the separate
+Unified Tracking API, throwing when `trackingApiKey` isn't configured),
+`getRateEstimate()` (`POST /rates` — a real live call, the third in this layer).
+No `voidShipment`. `DhlCredentials` is `{apiKey, apiSecret, accountNumber,
+trackingApiKey?}` — the FOURTH carrier in this layer (after FedEx §19.3,
+Parcelforce §19.4, UPS §19.5) where `carrier_connections.external_account_id`
+holds a genuinely independent account identifier, and the FIRST to use
+`carrier_connections.encrypted_refresh_token` for a second, independent secret
+(the Unified Tracking API key) rather than a literal OAuth refresh token — same
+"reuse the column that roughly fits, document what it actually holds" precedent
+Shopify's own `encrypted_client_secret` reuse (a webhook secret, §4.5) and
+TikTok's own `external_account_id` reuse (`shop_cipher`, §4.8) already establish.
+No new migration needed: `'dhl'` was already an allowed
+`carrier_connections.carrier` CHECK value from migration 0039.
+
+**Wired into the app**, generalizing the existing five-carrier pattern to six rather
+than duplicating it — confirming, for a fifth time, that the design decided when
+Evri was added (§19.2's own "one shared route, not a near-duplicate per carrier"
+plan) really does generalize:
+
+- `/settings/carriers` gained a sixth card, "DHL" (API key + API secret + account
+  number, required, plus an optional Unified Tracking API key — a four-field form,
+  the first in this layer with an optional fourth field, mirroring Royal Mail's own
+  optional tracking-credential pair), backed by a new `POST /api/carriers/dhl/connect`
+  route — same "verify before persist" discipline as every other carrier connect
+  route in this layer, calling `DhlConnector.verifyConnection()` before persisting,
+  and recording `carrier_connection.connected`/`credentials_rotated` in the audit
+  log (§17) — `accountNumber` is safe to log in `details` (the same identifier a DHL
+  invoice or label already carries), unlike `apiKey`/`apiSecret`/`trackingApiKey`,
+  which never are. The page's own carrier-connections query now covers
+  `'royal_mail'`, `'evri'`, `'fedex'`, `'parcelforce'`, `'ups'`, and `'dhl'` in one
+  `WHERE carrier IN (...)` clause — a sixth carrier is, again, just an added value
+  in an existing list.
+- `/picklists`' "Ship via connected carrier" form's `<select name="carrier">` now
+  lists DHL as a sixth option, gated the identical way every other carrier's own
+  option already is. `POST /api/orders/[id]/ship-via-carrier`'s `CARRIER_CONNECTORS`
+  dispatch map gained exactly one more line — `dhl: { displayName: "DHL",
+  createConnector: createDhlConnectorFromCarrierConnection }` — covering the
+  label-generation call, the `shipments` row's own `carrier` column, and the display
+  name passed into `WarehouseService.confirmShipment()`'s `TrackingInfo.carrier`
+  field, the same one-already-tested confirmation path every carrier in this layer
+  shares, now proven to generalize a fifth time.
+- **Deliberately NOT wired this pass**: `DhlConnector.getRateEstimate()`'s own real
+  live rate-shopping call is not invoked anywhere in the app yet — same "genuinely
+  separate, additive piece of UI work" scope note FedEx's and UPS's own unwired live
+  rate calls already carry (§19.3/§19.5), now true of a third carrier too.
+
+**UNVERIFIED IN PRACTICE, same status every other carrier in this layer carried
+before its own first live pass**: no real DHL Express API key/secret, account
+number, or Unified Tracking API key exists anywhere in this codebase or Arif's
+account yet. Pure request/response mapping, the Basic-auth request-building logic,
+and the shipment/void/tracking/rate response parsing are unit-tested against a
+stubbed `fetch` (`packages/carrier-connectors/test/dhl-connector.test.ts`, 13
+tests), wired into `scripts/run-tests.sh`'s `SAFE_TESTS`. Verified: `npm run
+db:migrate` clean (no pending migration, as expected — `'dhl'` was already an
+allowed CHECK value), `npm run typecheck --workspaces` clean across all eleven
+workspaces, `next build` clean (the new connect route and the updated
+`/settings/carriers`/`/picklists` pages both compile), and `bash
+scripts/run-tests.sh` — all 60 test files pass.
+
+**Deliberately not built this pass**, same "don't expand scope without an explicit
+decision" rule as §19.1's/§19.2's/§19.3's/§19.4's/§19.5's own closing paragraphs:
+the remaining 1 carrier (DPD); real Parcelforce manifest generation (still open
+from §19.4); real Sapient webhook receiving (still open from §19.2); wiring
+FedEx's, UPS's, AND DHL's own real live rate calls into `/picklists` (all three now
+open, see above); a real per-tenant carrier feature-flag system mirroring §15's
+channel flags; and retry/circuit-breaker wiring mirroring §4.4 (still no scheduler
+job exists for any carrier in this layer, same reasoning §19.1's own closing
 paragraph already gives).
 
 ---
