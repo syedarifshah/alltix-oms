@@ -41,9 +41,11 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
   TikTok. Royal Mail is built — see §19.1. Evri (formerly Hermes -- Hermes UK
   rebranded to Evri in 2022, one carrier not two, confirmed during its own research
   pass) is now built too — Arif's own explicit pick when asked which carrier to
-  build next, once Royal Mail was complete and merged — see §19.2. The remaining 6
-  (FedEx, UPS, DHL, Parcelforce, DPD, and whatever "Hermes" would have been had it
-  turned out to be a separate carrier) remain unbuilt, an explicit next-phase
+  build next, once Royal Mail was complete and merged — see §19.2. FedEx (carrier
+  #3) is now built too — recommended and Arif's own explicit pick when asked which
+  carrier to build next once Evri was complete and merged — see §19.3. The
+  remaining 5 (UPS, DHL, Parcelforce, DPD, and whatever "Hermes" would have been had
+  it turned out to be a separate carrier) remain unbuilt, an explicit next-phase
   decision per this section's own "don't expand scope without an explicit decision"
   rule, not an oversight.
 
@@ -3481,7 +3483,7 @@ guarantee (§6, §11 item 6). A future new tenant-scoped table's migration shoul
 guarded-cast form directly from this section or from 0018/0035, not from an older
 migration that might itself predate 0018.
 
-## 19. Carrier Integration Layer (§0's new locked decision — Royal Mail carrier #1, Evri carrier #2)
+## 19. Carrier Integration Layer (§0's new locked decision — Royal Mail carrier #1, Evri carrier #2, FedEx carrier #3)
 
 **Why a new layer, not an extension of §4's Channel Connector Layer**: a channel
 (Amazon/Shopify/Walmart/eBay/Temu/TikTok) is where an order comes FROM; a carrier is
@@ -3777,15 +3779,181 @@ all 56 test files pass.
 
 **Deliberately not built this pass** (§0's own "don't expand scope without an
 explicit decision" rule, same as every other channel's/carrier's own documented
-narrowing): the remaining 6 carriers (FedEx, UPS, DHL, Parcelforce, DPD — Hermes is
-not a separate carrier, folded into Evri per this section's own research) — none of
-them are touched until this pass's own build is verified against real
-infrastructure; real Sapient webhook receiving (the honest fix for
+narrowing): the remaining 6 carriers at the time (FedEx, UPS, DHL, Parcelforce, DPD
+— Hermes is not a separate carrier, folded into Evri per this section's own
+research) — none of them touched until this pass's own build is verified against
+real infrastructure; real Sapient webhook receiving (the honest fix for
 `trackShipment()`'s own architectural mismatch, above); a real per-tenant carrier
 feature-flag system mirroring §15's channel flags; retry/circuit-breaker wiring
 mirroring §4.4 (same "no scheduler job exists for carriers yet" reasoning §19.1's
 own closing paragraph already gives); and any confirmed Evri/Sapient surcharge or
-base-price data to replace `getRateEstimate()`'s current empty-list return.
+base-price data to replace `getRateEstimate()`'s current empty-list return. (FedEx
+of that list is no longer unbuilt — see §19.3, immediately below.)
+
+### 19.3 FedEx — carrier #3, built via FedEx's own direct, fully public REST API
+
+**Why FedEx, and why it's this codebase's best-sourced carrier connector so far**:
+once Evri (§19.2) was complete, merged, and pushed to `origin/main`, Arif gave the
+same explicit instruction as before — "move on to the next carrier." Asked
+(AskUserQuestion) which of the remaining 5 to build next — FedEx recommended
+specifically because, unlike Royal Mail's partially session-gated docs (§19.1) and
+Evri's total absence of a public API (§19.2), `developer.fedex.com`'s own
+documentation pages render cleanly for a plain unauthenticated fetch, including a
+literal, rendered OAuth request/response example — Arif picked **FedEx**, following
+the recommendation this time rather than overriding it (the way Evri's own pick
+did). This makes FedEx a genuine change in kind from the previous two carriers, not
+just the next name off a list: it is the first carrier in this layer built against
+the carrier's own DIRECT API (like Royal Mail) rather than a third-party gateway
+(like Evri), and it renders well enough for an unauthenticated fetch to leave
+markedly fewer INFERRED fields than either Royal Mail's session-gated pages or
+Evri's third-party-gateway docs did.
+
+**Research trail — every field/endpoint marked CONFIRMED or INFERRED, same
+discipline §19.1's/§19.2's own research trails follow** (the full breakdown lives in
+`packages/carrier-connectors/src/fedex-connector.ts`'s own class doc comment, not
+fully restated here):
+
+- **Auth** — CONFIRMED end to end, including a literal rendered example, from
+  FedEx's own official page
+  (developer.fedex.com/api/en-us/catalog/authorization/docs.html): `POST
+  https://apis.fedex.com/oauth/token` (sandbox: `https://apis-sandbox.fedex.com/
+  oauth/token`, cross-confirmed via a real third-party integration writeup), form-
+  urlencoded `grant_type=client_credentials&client_id=...&client_secret=...`, JSON
+  response `{access_token, token_type, expires_in, scope}` — FedEx's own docs page
+  renders this exact example verbatim, the most-confirmed auth flow of any carrier
+  connector built so far. `client_id`/`client_secret` are FedEx's own "Project API
+  Key"/"Project API Secret Key," the same `client_credentials` shape as Walmart's
+  (§4.2) and Evri's (§19.2) own connectors, just FedEx's own naming.
+- **`POST /ship/v1/shipments`** — CONFIRMED path and CONFIRMED top-level request
+  shape (`accountNumber`, `pickupType`, `serviceType`, `packagingType`, `shipper`,
+  `recipients`, `shippingPaymentType`, `payerInformation`, `packages`,
+  `labelSpecification`, all wrapped in a `requestedShipment` object) from FedEx's
+  own docs page. **Two real, worth-flagging discrepancies found between that page
+  and a second, independent third-party integration writeup that renders a literal
+  example body**: (1) the payment field — the docs page names it
+  `shippingPaymentType`, the literal example shows it nested as
+  `shippingChargesPayment.paymentType`; this connector uses the literal,
+  example-confirmed nested shape. (2) the destination field — the docs page names it
+  `recipients` (plural array), the literal example shows singular `recipient`; this
+  connector INFERS the plural array shape, both because it's the OFFICIAL page's own
+  naming and because every other multi-piece-capable API in this carrier layer uses
+  an array there too. Response shape CONFIRMED for the core fields
+  (`masterTrackingNumber`/`trackingNumber`, a `packageDocuments` array with a `url`
+  field) via a real FedEx REST API wrapper's own documented fields, cross-checked
+  against FedEx's own docs page's own prose confirmation that "the successful
+  response will provide the tracking number and label information"; whether a
+  base64 `encodedLabel` field is ALSO present is INFERRED (read defensively
+  alongside `url`, same "read several plausible candidates" discipline
+  `EvriConnector`'s own response parsing already establishes).
+- **`POST /track/v1/trackingnumbers`** — CONFIRMED path and CONFIRMED literal
+  request-body shape (`{"trackingInfo": [{"trackingNumberInfo": {"trackingNumber":
+  "..."}}]}`, from a real Google-Sheets-integration writeup that renders both the
+  endpoint and a sample payload verbatim). Response field PATHS partially CONFIRMED
+  from FedEx's own docs page's own literal dotted-path example
+  (`trackResults.scanEvents.delayDetail.status`, confirming `trackResults` and a
+  nested `scanEvents` array exist as named) — the exact field names for a scan
+  event's own code/description/location/timestamp are INFERRED, modeled on Royal
+  Mail's own confirmed Tracking API v2 event shape for lack of a better source, same
+  "no better source" precedent this codebase's own least-confirmed fields already
+  carry (Temu's `skuStockTargetList`, Evri's request body, §4.7/§19.2).
+- **`POST /rate/v1/rates/quotes`** — CONFIRMED path and CONFIRMED response field
+  names (`transactionId`, a `rateReplyDetails` array with `serviceType`/
+  `serviceName`, `ratedShipmentDetails` with `totalNetCharge`), from a real FedEx
+  REST API wrapper's own literal example. **A genuine, confirmed difference from
+  Royal Mail and Evri, worth stating plainly: FedEx DOES expose a real live
+  rate-shopping endpoint** — neither Royal Mail's Click & Drop API (§19.1) nor
+  anything found for Sapient/Evri (§19.2) has one, so both of those connectors'
+  `getRateEstimate()` are necessarily non-network lookups.
+  `FedExConnector.getRateEstimate()` is therefore this codebase's FIRST carrier
+  connector to make a real live network call for a rate estimate, not a static
+  table (Royal Mail) or an empty list (Evri). Request body shape is INFERRED (no
+  literal request example found this pass, only the response) — modeled on the same
+  `requestedShipment` wrapper the Ship API itself confirms.
+- **`voidShipment` deliberately NOT implemented** — same reasoning Evri's own
+  connector already establishes (§19.2): a cancellation endpoint almost certainly
+  exists, but no literal, confirmed endpoint path was found this pass, and
+  `voidShipment` is optional on `CarrierConnector` precisely for this case.
+
+**Built** (`packages/carrier-connectors/src/fedex-connector.ts`): `FedExConnector`
+implementing `CarrierConnector` — `authenticate()` (real OAuth2 client_credentials
+exchange against `https://apis.fedex.com/oauth/token`, in-memory cached/refreshed
+near the documented one-hour expiry, same pattern as `WalmartConnector`/
+`EvriConnector`), `verifyConnection()` (forces a fresh token exchange — no cheaper
+authenticated read-only endpoint was found for FedEx this pass either, same
+reasoning `EvriConnector.verifyConnection()` already gives), `createShipment()`
+(`POST /ship/v1/shipments`), `trackShipment()` (`POST /track/v1/trackingnumbers`),
+`getRateEstimate()` (`POST /rate/v1/rates/quotes` — a real live call, see above). No
+`voidShipment`. `FedExCredentials` is `{clientId, clientSecret, accountNumber}` —
+three fields, not two: unlike Royal Mail's and Evri's own connect routes (both of
+which documented "nothing real to reuse" for `carrier_connections.
+external_account_id`), FedEx's Ship/Rate request bodies both require a real
+`accountNumber` field, so this is the FIRST carrier in this codebase's carrier
+layer where that column holds a genuinely independent account identifier rather
+than a repurposed value. No new migration needed: `'fedex'` was already an allowed
+`carrier_connections.carrier` CHECK value from migration 0039.
+
+**Wired into the app**, generalizing the existing two-carrier pattern to three
+rather than duplicating it — confirming, for a second time, that the design decided
+when Evri was added (§19.2's own "one shared route, not a near-duplicate per
+carrier" plan) really does generalize:
+
+- `/settings/carriers` gained a third card, "FedEx" (Project API Key + Project API
+  Secret Key + account number — three fields, the first carrier connect form in this
+  layer to need one beyond the client id/secret pair), backed by a new `POST
+  /api/carriers/fedex/connect` route — same "verify before persist" discipline as
+  Royal Mail's and Evri's own connect routes, calling `FedExConnector.
+  verifyConnection()` (a real token exchange) before persisting, and recording
+  `carrier_connection.connected`/`credentials_rotated` in the audit log (§17) —
+  `accountNumber` is safe to log in `details` (it's not a secret, the same
+  identifier already printed on any FedEx invoice or label), unlike `clientId`/
+  `clientSecret`, which never are. The page's own carrier-connections query now
+  covers `'royal_mail'`, `'evri'`, and `'fedex'` in one `WHERE carrier IN (...)`
+  clause, confirming a third carrier is genuinely just an added value in an existing
+  list, not a query change.
+- `/picklists`' "Ship via connected carrier" form's `<select name="carrier">` now
+  lists FedEx as a third option, gated the identical way Royal Mail's and Evri's own
+  options already are (only rendered when the tenant has an active `fedex`
+  `carrier_connections` row) — no restructuring of the conditional needed, just one
+  more clause, confirming the same thing the settings-page query change does.
+  `POST /api/orders/[id]/ship-via-carrier`'s `CARRIER_CONNECTORS` dispatch map (added
+  when Evri was built specifically so a third carrier would be a one-line addition,
+  not a new branch of route logic) gained exactly one line — `fedex: { displayName:
+  "FedEx", createConnector: createFedExConnectorFromCarrierConnection }` — covering
+  the label-generation call, the `shipments` row's own `carrier` column, and the
+  display name passed into `WarehouseService.confirmShipment()`'s
+  `TrackingInfo.carrier` field, the same one-already-tested confirmation path every
+  carrier in this layer shares.
+- **Deliberately NOT wired this pass**: `FedExConnector.getRateEstimate()`'s own
+  real live rate-shopping call is not invoked anywhere in the app yet — the
+  `/picklists` ship-via-carrier form still asks the tenant to type in the shipping
+  cost actually charged, same as Royal Mail's and Evri's own forms, even though
+  FedEx is technically capable of a live quote. Wiring a real "get a live FedEx
+  rate" button into that form is a genuinely separate, additive piece of UI work,
+  not a small extension of this pass's own "add a third carrier to the existing
+  dispatch map" scope — flagged here so it isn't mistaken for an oversight.
+
+**UNVERIFIED IN PRACTICE, same status Royal Mail and Evri each carried before their
+own first live pass**: no real FedEx Project API Key/Secret or account number
+exists anywhere in this codebase or Arif's account yet — despite being the
+best-DOCUMENTED connector in this codebase's carrier layer, nothing below has
+round-tripped against real FedEx infrastructure, sandbox or production. Pure
+request/response mapping, the token-caching logic, and the shipment/tracking/rate
+response parsing are unit-tested against a stubbed `fetch`
+(`packages/carrier-connectors/test/fedex-connector.test.ts`, 12 tests), wired into
+`scripts/run-tests.sh`'s `SAFE_TESTS`. Verified: `npm run db:migrate` clean (no
+pending migration, as expected — `'fedex'` was already an allowed CHECK value),
+`npm run typecheck --workspaces` clean across all eleven workspaces, `next build`
+clean (the new connect route and the updated `/settings/carriers`/`/picklists`
+pages both compile), and `bash scripts/run-tests.sh` — all 57 test files pass.
+
+**Deliberately not built this pass**, same "don't expand scope without an explicit
+decision" rule as §19.1's and §19.2's own closing paragraphs: the remaining 5
+carriers (UPS, DHL, Parcelforce, DPD — Hermes folded into Evri, per §19.2's own
+research); wiring `getRateEstimate()`'s real live rate call into `/picklists` (see
+above); real Sapient webhook receiving (still open from §19.2); a real per-tenant
+carrier feature-flag system mirroring §15's channel flags; and retry/circuit-
+breaker wiring mirroring §4.4 (still no scheduler job exists for any carrier in
+this layer, same reasoning §19.1's own closing paragraph already gives).
 
 ---
 
