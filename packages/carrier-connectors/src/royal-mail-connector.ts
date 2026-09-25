@@ -104,6 +104,24 @@ import type {
  * officially-sourced-where-possible API shapes, not a proven
  * implementation -- see .env.example's ROYAL_MAIL_* entries for what a real
  * verification pass would need.
+ *
+ * **Update, 25 Sept 2026 -- a real Click & Drop API key now exists (Arif's
+ * own real business account) and label creation has been tried for real,
+ * closing part of the "UNVERIFIED" status above.** `verifyConnection()`
+ * succeeded outright (a real key, confirmed live). `createShipment()` did
+ * NOT on the first attempt -- Royal Mail rejected it with errorCode 95,
+ * `"'Address' is required when 'AddressBookReference' is not provided"`,
+ * and its own echoed-back request showed `recipient` had been received as
+ * a literally empty object. This is what "CONFIRMED end to end from the
+ * official swagger" above was wrong about: `createShipment()`'s own
+ * `recipient` mapping is fixed now (see that method's own doc comment for
+ * the corrected, re-confirmed shape) -- `verifyConnection()`, the
+ * `/orders`-request's own TOP-LEVEL fields (`orderReference`/`subtotal`/
+ * `shippingCostCharged`/`total`/`currencyCode`/`packages`/`postageDetails`,
+ * all confirmed correct by the same live rejection, since Royal Mail
+ * echoed them all back unchanged), `voidShipment()`, and `trackShipment()`
+ * remain otherwise as originally built. Not yet re-attempted against a
+ * real order since this fix.
  */
 
 const CLICK_AND_DROP_BASE_URL = "https://api.parcel.royalmail.com/api/v1";
@@ -217,13 +235,36 @@ export class RoyalMailConnector implements CarrierConnector {
   }
 
   /**
-   * POST /orders (confirmed shape, this file's own class doc comment).
-   * Sends a single-order, single-package request -- Click & Drop's own
-   * `items` array supports a batch of up to 2,000 orders per call, not
-   * used here since this connector's only real caller (task #59's pack/
-   * ship flow) creates exactly one shipment per confirmed order, the same
-   * one-at-a-time granularity every other connector's own createListing()/
-   * confirmShipment() methods already use.
+   * POST /orders. Sends a single-order, single-package request -- Click &
+   * Drop's own `items` array supports a batch of up to 2,000 orders per
+   * call, not used here since this connector's only real caller (task #59's
+   * pack/ship flow) creates exactly one shipment per confirmed order, the
+   * same one-at-a-time granularity every other connector's own
+   * createListing()/confirmShipment() methods already use.
+   *
+   * **`recipient`'s own shape -- CONFIRMED live, 25 Sept 2026, replacing a
+   * real production bug this method originally shipped with.** The
+   * original build sent `recipient` as a flat object
+   * (`name`/`addressLine1`/`city`/`postalCode`/`countryCode`/`phone`/
+   * `email`), which this file's own earlier doc comment called "confirmed
+   * shape" -- that was wrong. The FIRST real order Arif submitted against
+   * production Royal Mail was rejected with errorCode 95, `"'Address' is
+   * required when 'AddressBookReference' is not provided"`
+   * (`fields: [{fieldName: "Recipient.Address"}]`), and Royal Mail's own
+   * echoed-back `failedOrders[].order.recipient` in that response was a
+   * literally empty `{}` -- every flat field this connector sent was
+   * silently dropped as unrecognized. Re-fetching the official swagger
+   * (`RecipientDetailsRequest`/`AddressRequest` definitions) after that
+   * real rejection confirms why: address fields belong in a NESTED
+   * `recipient.address` object, under different names than this connector
+   * originally guessed -- `fullName` (not `name`), `postcode` (not
+   * `postalCode`) -- alongside `addressLine2`/`addressLine3`/`city`/
+   * `county`/`countryCode`. `phoneNumber`/`emailAddress` (not `phone`/
+   * `email`) stay directly on `recipient`, siblings of `address`, not
+   * inside it -- confirmed by the same swagger fetch.
+   * `packages[].contents` (not `packageContents`, this method's other
+   * bug caught by the same rejection and the same swagger re-fetch) is
+   * fixed alongside it.
    *
    * A REAL, DOCUMENTED SPLIT OUTCOME worth being explicit about: Royal
    * Mail's own response can report the order itself created successfully
@@ -248,20 +289,22 @@ export class RoyalMailConnector implements CarrierConnector {
           total: request.totalGbp,
           currencyCode: "GBP",
           recipient: {
-            name: request.recipient.name,
-            addressLine1: request.recipient.addressLine1,
-            addressLine2: request.recipient.addressLine2,
-            city: request.recipient.city,
-            postalCode: request.recipient.postalCode,
-            countryCode: request.recipient.countryCode,
-            phone: request.recipient.phone,
-            email: request.recipient.email,
+            address: {
+              fullName: request.recipient.name,
+              addressLine1: request.recipient.addressLine1,
+              addressLine2: request.recipient.addressLine2,
+              city: request.recipient.city,
+              postcode: request.recipient.postalCode,
+              countryCode: request.recipient.countryCode,
+            },
+            phoneNumber: request.recipient.phone,
+            emailAddress: request.recipient.email,
           },
           postageDetails: request.serviceCode ? { serviceCode: request.serviceCode } : undefined,
           packages: request.packages.map((pkg) => ({
             weightInGrams: pkg.weightGrams,
             packageFormatIdentifier: pkg.packageFormat,
-            packageContents: pkg.items.map((item) => ({
+            contents: pkg.items.map((item) => ({
               name: item.name,
               SKU: item.sku,
               quantity: item.quantity,

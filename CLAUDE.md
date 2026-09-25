@@ -3681,6 +3681,65 @@ order/label creation via `/picklists`' own "Ship via connected carrier" form),
 order. The next step toward fully proving this connector is running one real
 shipment through `/picklists`.
 
+**Update — first real shipment attempt found and fixed two real production bugs in
+`createShipment()`'s own request shape, closing the gap the paragraph above left
+open**: Arif ran the full `/picklists` pack/ship workflow against the real,
+connected Royal Mail account and submitted a real shipment form. Two rounds, each
+uncovering the next problem:
+
+- **Bug A — Royal Mail's real rejection reason was being discarded.** The original
+  `createShipment()` only surfaced `errorCount` on a rejected order ("order creation
+  reported an unknown number of error(s), no order was created") — the actual
+  reason Royal Mail returned was silently dropped, because no confirmed field name
+  for a rejection's own detail existed anywhere in this connector's original
+  research pass (see `ClickAndDropCreateOrdersResponse`'s own doc comment). Fixed
+  by widening that response interface with an index signature and having the
+  no-`createdOrders` branch serialize and surface the ENTIRE raw response (truncated
+  to 2000 chars, the same defensive cap §19.11's own `last_failure_message.slice(0,
+  2000)` already uses) instead of just the count — whatever Royal Mail actually put
+  in the response now reaches the tenant-visible `/picklists` error banner. This is
+  what made Bug B below visible at all: without it, the real error text
+  (`errorCode`/`errorMessage`/`fields`) would have stayed invisible behind the same
+  generic message.
+- **Bug B — the real, root-cause bug: `recipient` was sent in the wrong shape
+  entirely.** Once Bug A's fix shipped and Arif resubmitted, the real rejection
+  came back: `errorCode: 95`, `"'Address' is required when 'AddressBookReference'
+  is not provided"`, `fields: [{fieldName: "Recipient.Address"}]` — and Royal
+  Mail's own echoed-back `failedOrders[].order.recipient` was a literally empty
+  `{}`. The original `createShipment()` sent `recipient` as a FLAT object
+  (`name`/`addressLine1`/`city`/`postalCode`/`countryCode`/`phone`/`email`) — this
+  file's own earlier text above had called that shape "CONFIRMED end to end from
+  the official swagger spec," which was simply wrong, not caught until a real order
+  was actually submitted. Re-fetching the official swagger
+  (`https://api.parcel.royalmail.com/doc/v1/click-and-drop-api-v1.yaml`) after this
+  real rejection confirms why: `RecipientDetailsRequest` requires address fields
+  NESTED under a `recipient.address` sub-object (`AddressRequest`), under different
+  names than what was sent — `fullName` (not `name`), `postcode` (not
+  `postalCode`) — with `phoneNumber`/`emailAddress` staying direct siblings of
+  `address` on `recipient`, not nested inside it. A second, related bug caught by
+  the same rejection and the same re-fetch: `packages[].contents` (the confirmed
+  `ShipmentPackageRequest` field name) was being sent as `packageContents` instead.
+  **Fixed**: `createShipment()`'s request-body construction now builds
+  `recipient: {address: {fullName, addressLine1, addressLine2, city, postcode,
+  countryCode}, phoneNumber, emailAddress}` and `packages[].contents` (not
+  `packageContents`) — see that method's own doc comment for the full corrected
+  shape. `packages/carrier-connectors/test/royal-mail-connector.test.ts`'s own
+  request-shape assertions were updated to match (the stale `packageContents`
+  assertion is now `contents`; new assertions cover `recipient.address.fullName`/
+  `recipient.address.postcode`/`recipient.phoneNumber`/`recipient.emailAddress`
+  explicitly, so a regression back to the flat shape would fail loudly).
+- **Not yet re-attempted against a real order since this fix** — `verifyConnection()`
+  and the request's own top-level fields (`orderReference`/`subtotal`/
+  `shippingCostCharged`/`total`/`currencyCode`/`packages`/`postageDetails`, all
+  confirmed correct by the same live rejection, since Royal Mail echoed them all
+  back unchanged) remain proven; `voidShipment()`/`trackShipment()` remain
+  unverified as before. The next step is the same as before this update: a real
+  shipment attempt through `/picklists`, now with the corrected `recipient` shape.
+  Verified this pass: `npx tsx --test
+  packages/carrier-connectors/test/royal-mail-connector.test.ts` (12/12 pass),
+  `npm run typecheck --workspaces` clean across all eleven workspaces, `next build`
+  clean, `bash scripts/run-tests.sh` — all 63 test files pass.
+
 ### 19.2 Evri (formerly Hermes) — carrier #2, built via the Sapient/Intersoft CORE API gateway
 
 **Why Evri, and why via a third-party gateway**: once Royal Mail (§19.1) was

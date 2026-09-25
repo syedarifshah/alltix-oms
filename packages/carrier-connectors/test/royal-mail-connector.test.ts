@@ -32,6 +32,8 @@ const SAMPLE_REQUEST: CreateShipmentRequest = {
     city: "London",
     postalCode: "SW1A 1AA",
     countryCode: "GB",
+    phone: "07700900000",
+    email: "jane@example.com",
   },
   subtotalGbp: "19.99",
   shippingCostChargedGbp: "3.99",
@@ -113,7 +115,22 @@ test("createShipment sends a Bearer-authorized POST /orders with the confirmed r
     assert.equal(capturedBody.items[0].orderReference, "ORDER-1");
     assert.equal(capturedBody.items[0].shippingCostCharged, "3.99");
     assert.equal(capturedBody.items[0].packages[0].weightInGrams, 500);
-    assert.equal(capturedBody.items[0].packages[0].packageContents[0].SKU, "WIDGET-1");
+    assert.equal(capturedBody.items[0].packages[0].contents[0].SKU, "WIDGET-1");
+    // Recipient address must be nested under `recipient.address`, using Royal
+    // Mail's own real field names (`fullName`/`postcode`, not `name`/
+    // `postalCode`) -- see createShipment()'s own doc comment for the real
+    // production bug this corrects (Royal Mail echoed back an empty
+    // `recipient: {}` when these were sent flat).
+    assert.equal(capturedBody.items[0].recipient.address.fullName, SAMPLE_REQUEST.recipient.name);
+    assert.equal(capturedBody.items[0].recipient.address.addressLine1, SAMPLE_REQUEST.recipient.addressLine1);
+    assert.equal(capturedBody.items[0].recipient.address.city, SAMPLE_REQUEST.recipient.city);
+    assert.equal(capturedBody.items[0].recipient.address.postcode, SAMPLE_REQUEST.recipient.postalCode);
+    assert.equal(capturedBody.items[0].recipient.address.countryCode, SAMPLE_REQUEST.recipient.countryCode);
+    // phoneNumber/emailAddress are siblings of `address`, not nested inside it.
+    assert.equal(capturedBody.items[0].recipient.phoneNumber, SAMPLE_REQUEST.recipient.phone);
+    assert.equal(capturedBody.items[0].recipient.emailAddress, SAMPLE_REQUEST.recipient.email);
+    assert.equal(capturedBody.items[0].recipient.address.phoneNumber, undefined);
+    assert.equal(capturedBody.items[0].recipient.address.emailAddress, undefined);
 
     assert.equal(result.carrierOrderId, "123456");
     assert.equal(result.trackingNumber, "RM123456789GB");
