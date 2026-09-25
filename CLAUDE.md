@@ -3846,6 +3846,63 @@ clean, `bash scripts/run-tests.sh` — all 63 test files pass. Not yet
 re-attempted against a real order since this fix — the next step is the same
 order, one more time, now finally requesting synchronous label generation.
 
+**Update — the retry came back, and it resolves this whole thread: the account
+genuinely does not have OBA status, confirmed rather than guessed, and there is
+no code fix for it.** Order 1003 was created (`labelErrors: []`,
+`generatedDocuments: []`) with `label: {includeLabelInResponse: true}` now being
+sent — and the response is byte-for-byte the same shape as order 1002's, before
+that field existed: no `trackingNumber`, no rejection, no error of any kind.
+This answers the open question the prior update left honestly unresolved (would a
+non-OBA account get "a new, clear, fully-visible rejection" or would it silently
+no-op) — it's the latter. Re-researched immediately rather than guessing again:
+the official swagger's own `GET /orders/{orderIdentifiers}/label` endpoint —
+the ONLY other way to get a label/tracking number for an order that already
+exists — is independently tagged **"Reserved for OBA customers only"** too, and
+its own documented failure mode is a flat `403 Forbidden: "Forbidden (Feature
+available for OBA accounts only)"`, no fallback described anywhere. Put
+together with `LabelGenerationRequest`'s own identical reservation (already
+found), this is now a confirmed, total picture, not a partial one: **Royal
+Mail's Click & Drop API gates ALL label/tracking-number generation — both the
+synchronous `includeLabelInResponse` path and the separate post-creation label
+endpoint — behind OBA (On Business Account) status.** A standard,
+pay-as-you-go Click & Drop account (the kind that doesn't have a negotiated
+business credit/invoicing relationship with Royal Mail) can create orders via
+this API — proven, repeatedly, this whole thread — but cannot get a label or a
+tracking number out of it via any API call, OBA or not: there is no
+documented non-OBA fallback endpoint, not one this connector missed.
+
+**This is not a bug in this codebase, and no further code change here can fix
+it** — five real bugs were found and fixed this thread (address shape,
+per-item weight, billing address, raw-response surfacing, and
+`includeLabelInResponse`), and all five were real, necessary, and got the
+integration exactly as far as Royal Mail's own API allows a non-OBA account to
+go: a genuinely created order, with everything else about the request now
+provably correct. What's left is external to this codebase, in order of what
+actually unblocks something:
+
+1. **Immediate, no waiting required**: order 1003 (and 1001, 1002) already
+   exist in Arif's real Royal Mail account — log into the Click & Drop web
+   app directly (not this app), find those orders, and print their labels
+   there. Royal Mail's own dashboard isn't gated by OBA the way the API is;
+   this gets a real tracking number for these specific orders today, by hand,
+   with no code involved.
+2. **The real fix**: Arif requests OBA (On Business Account) status from
+   Royal Mail directly — a business account/credit relationship, not
+   something any code change can grant. Once that's in place, the exact same
+   request shape this connector already sends (`includeLabelInResponse:
+   true`) should start working with no further changes needed here.
+3. Until #2 happens, every future order shipped via this connector will hit
+   the same wall — the `/picklists` flow will keep creating real Royal Mail
+   orders, correctly, and just never get a tracking number back
+   synchronously; each one would need the same manual print-from-dashboard
+   workaround as #1 above.
+
+`RoyalMailConnector`'s status moves from "unverified" to **"verified —
+order/label request shape fully correct, blocked on account-level OBA
+status, not on this code"** — a materially different, and better, place to be
+than an unverified connector, even though the end-to-end tracking number
+hasn't been obtained through this app yet.
+
 ### 19.2 Evri (formerly Hermes) — carrier #2, built via the Sapient/Intersoft CORE API gateway
 
 **Why Evri, and why via a third-party gateway**: once Royal Mail (§19.1) was
