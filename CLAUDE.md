@@ -60,7 +60,11 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
   remains unbuilt. With the lineup itself complete, a per-tenant carrier
   feature-flag system mirroring §15's channel flags — recommended and Arif's own
   explicit pick among 4 open follow-on items via AskUserQuestion — is now built
-  too, see §19.8.
+  too, see §19.8. Real Sapient tracking-webhook receiving — the honest fix for
+  Evri's/DPD's own `trackShipment()` architectural mismatch, recommended and
+  Arif's own explicit pick ("Sapient webhook receiving (Recommended)") among a
+  second round of open follow-on items via AskUserQuestion, once carrier
+  feature-flags closed out the first round — is now built too, see §19.9.
 
 Do not expand this scope without an explicit decision — every module below assumes it.
 
@@ -3729,7 +3733,10 @@ fully restated here):
   interface — but flagged explicitly as this connector's least-trustworthy method,
   not a confirmed-correct usage. A real integration pass should build real webhook
   receiving (mirroring Shopify's own `/api/webhooks/shopify`, §4.5) before relying
-  on this against real shipments.
+  on this against real shipments. **Update — that webhook receiver is now built,
+  see §19.9**: real tracking data now flows in via `POST /api/webhooks/sapient`
+  whenever Arif configures a webhook in Sapient's own portal, independent of
+  whether this method's own `trackShipment()` call is ever relied on.
 - **`voidShipment` deliberately NOT implemented** — a "Recall shipment" concept
   exists in Sapient's own docs (docs.intersoftsapient.net/docs/recall-shipment) but
   no literal endpoint path was found for it this pass; optional on the interface
@@ -4673,7 +4680,10 @@ wiring FedEx's, UPS's, AND DHL's own real live rate calls into `/picklists`
 scheduler job exists for any carrier in this layer). Any further carrier beyond
 this original 7 (a real Hermes-as-distinct-carrier scenario aside, since that
 turned out not to exist) is a new, explicit scope decision per §0's own "don't
-expand scope without an explicit decision" rule, not an oversight.
+expand scope without an explicit decision" rule, not an oversight. **Update**: the
+carrier feature-flag item is now built (§19.8), and the Sapient webhook-receiving
+item — the honest fix for the `trackShipment()` mismatch this paragraph names
+above — is now built too (§19.9).
 
 ### 19.8 Carrier Feature Flags (per-tenant rollout gating, §19.7's own standing open item)
 
@@ -4772,6 +4782,191 @@ precedent `channel-flags.test.ts` set), including a dedicated case proving
 No DB-layer test suite for the migration itself, same precedent migration 0032's own
 channel-flags migration set — verified instead via `tsc -b`, `npm run typecheck
 --workspaces`, `next build`, and `bash scripts/run-tests.sh`.
+
+### 19.9 Sapient Tracking Webhook Receiving (the honest fix for Evri's/DPD's own `trackShipment()` mismatch)
+
+**Status: built.** Both `EvriConnector.trackShipment()` (§19.2) and
+`DpdConnector.trackShipment()` (§19.7) have carried the same flagged architectural
+mismatch since Evri was built: `POST /v4/trackings` is Sapient's own endpoint for
+registering tracking numbers from OTHER systems, not for polling a shipment created
+within the same Sapient account — Sapient's own docs say real tracking delivery is
+a configured webhook instead. Once carrier feature-flags (§19.8) closed out that
+round's own recommended pick, Arif was asked (AskUserQuestion, 4 ranked options —
+real credentials, real Sapient webhook receiving, wiring FedEx's/UPS's/DHL's own
+live rate calls into `/picklists`, and retry/circuit-breaker wiring mirroring §4.4)
+which of the remaining open carrier-layer items to build next — recommended and
+Arif's own explicit pick, **"Sapient webhook receiving (Recommended)"** — over the
+other 3 options, since it fixes a real, already-documented mismatch affecting two
+carriers at once with no external blocker (unlike real credentials or Parcelforce
+manifest generation, both of which need Arif's own vendor-facing action first).
+
+**Research trail — every field/endpoint marked CONFIRMED or NOT CONFIRMED, same
+discipline every carrier's own research trail in this section follows** (the full
+breakdown lives in `packages/web/src/lib/sapient-webhook.ts`'s and
+`packages/web/src/app/api/webhooks/sapient/route.ts`'s own header comments, not
+fully restated here):
+
+- **CONFIRMED**: the delivery mechanism is a real `POST` to a configured callback
+  URL ("the sending application issues a POST request containing the payload to
+  the receiving application's endpoint," per Sapient's own docs).
+- **CONFIRMED**: webhook setup (`docs/create-tracking-webhook`) is a 5-step MANUAL
+  PORTAL process (access, configure, test, select event types, activate) — not a
+  REST API call this codebase can automate, unlike `ShopifyConnector.
+  registerWebhooks()`'s own real POST (§4.5). Arif configures this by hand in
+  Sapient's own portal once a real account exists, pointing the callback at this
+  route's own path on this app's deployed domain (see `/settings/carriers`' Evri/
+  DPD info boxes for the exact guidance shown).
+- **CONFIRMED**: two payload variants exist — "all tracking events" vs.
+  "milestones only" (configured per-webhook, Arif's own choice at setup time).
+- **CONFIRMED real retry/suspension policy** (`docs/webhook-suspension`): 8 retry
+  attempts at 5 min, 10 min, 15 min, 30 min, 5 hours, 18 hours, 72 hours, 72 hours,
+  after which Sapient suspends the webhook and the tenant loses all tracking data
+  for the suspended period — this is why the receiver's own idempotency handling
+  and "ack an unresolvable delivery with 200, don't retry-bait it" design (below)
+  both exist: real, confirmed facts driving the design, not guesses.
+- **CONFIRMED real milestone names, with an ordering** (`docs/
+  tracking-events-and-milestones`): "IT'S ON ITS WAY," "IN TRANSIT," "IN CUSTOMS,"
+  "OUT FOR DELIVERY," "DELIVERY ATTEMPT FAILED," "PART DELIVERED," "READY FOR
+  COLLECTION," "DELIVERED," "COLLECTED," "UNDELIVERABLE," "TRANSIT DELAY" (no
+  order) — plus a real, extensive event-code vocabulary on the same page (PSRE,
+  PSAN, DELV, POFD, and dozens more) — real VALUES a milestone/code field can
+  hold, not confirmation of the field's own name.
+- **NOT CONFIRMED, a genuine research gap, not a guess dressed up as fact**: the
+  literal JSON payload field names. Sapient's own dedicated reference page (the
+  "Tracking Webhook Push Payload Example") renders its actual example JSON via a
+  client-side widget this research pass's fetch tooling could not extract text
+  from, across multiple attempts including one explicitly asking for raw
+  `<code>`/`<pre>` blocks — a narrower version of the "unreadable JS SPA" problem
+  this file already documents for Temu's/TikTok's official docs (§4.7/§4.8), though
+  Sapient's own pages DO render conceptual prose, unlike a fully blank SPA.
+- **NOT CONFIRMED, also a genuine gap**: any signature/HMAC/shared-secret
+  verification mechanism for inbound deliveries — confirmed absent by its total
+  absence across every Sapient doc page fetched this pass (the overview, the setup
+  guide, the suspension-policy page) plus a dedicated web search for
+  `"intersoftsapient" webhook signature OR HMAC OR "shared secret" tracking`
+  (zero relevant results). Unlike Shopify's own HMAC-verified webhook (§4.5), this
+  receiver cannot cryptographically prove a delivery is genuinely from Sapient.
+
+**Schema** (migration `0041_shipment_tracking_events.sql`): `shipment_tracking_events`
+— a new append-only ledger table, same "the ledger should show why, not just the
+latest state" principle §2.2/§3 already apply to inventory events and order
+cancellation (`tenant_id`, `shipment_id` NOT NULL no `ON DELETE` — shipments rows
+are status-flipped, never deleted, same precedent `channel_connections`/
+`carrier_connections` both already establish — `carrier`, `event_code`/`milestone`/
+`description`/`location`/`occurred_at` all NULLABLE since the payload shape itself
+isn't confirmed field-by-field, `raw_payload JSONB NOT NULL` so nothing is ever lost
+even when the parser can't make sense of it, `idempotency_key TEXT UNIQUE` — real,
+not speculative, given Sapient's own confirmed retry policy above). Written with the
+guarded `NULLIF(...)` tenant_id cast from the start (§18's own closing
+instruction — crib the guarded form directly on a brand-new table, don't reproduce
+that bug class). `GRANT SELECT, INSERT` only, no `UPDATE`/`DELETE` — append-only by
+construction, same `audit_log` precedent (§17). `shipments` gains three columns
+recomputed directly on the row — `latest_tracking_status`, `latest_tracking_milestone`,
+`latest_tracking_at` — same "recompute latest state on the row, keep full history in
+a child table" convention `channel_connections`' own `consecutive_failures`/
+`last_failure_at` already establishes alongside `audit_log`'s separate full history.
+
+**The app-layer mitigation for the confirmed lack of a signature mechanism**: an
+optional `SAPIENT_WEBHOOK_SHARED_SECRET` env var, checked as a `?token=` query
+parameter Arif appends to the callback URL pasted into Sapient's portal —
+**this codebase's OWN invention, not something Sapient verifies or is even aware
+of**, documented as such in three places (`sapient-webhook.ts`'s header comment,
+the route's own header comment, and `/settings/carriers`' own UI text) so it's
+never mistaken for a real signature. No-op (skips the check entirely) when unset,
+same "wire it now, verify later" pattern every other optional credential in this
+codebase follows (§13). Blast-radius analysis, worth stating plainly rather than
+leaving implicit: even fully unconfigured, a forged delivery can only ever affect
+the ONE `shipments` row whose own tracking number matches what the forger guessed
+or already knew — it cannot create, cancel, or reroute an order, move money, or
+touch anything outside that single matched shipment.
+
+**Defensive parsing given the unconfirmed payload shape** (`packages/web/src/lib/
+sapient-webhook.ts`, `parseSapientTrackingWebhookPayload`/
+`buildSapientTrackingIdempotencyKey`): searches multiple candidate field-name
+variants (PascalCase first, matching Sapient's own confirmed convention elsewhere
+in `EvriConnector`'s `TrackingNumbers`/`TrackingNumber`/`ShipmentId`/`Status`, with
+camelCase/synonym fallbacks) across the payload's own top level plus one level of
+nesting under candidate wrapper keys (`Tracking`/`TrackingEvent`/`Event`/`Data` and
+lowercase variants) — same "flag it, don't hide it" / "read several plausible
+candidates" discipline this codebase already established for Temu's
+`skuStockTargetList` and Evri's/Parcelforce's/DHL's own request bodies (§4.7,
+§19.2/§19.4/§19.6). A field this parser doesn't recognize comes back `null` on that
+event, never guessed — the receiver route separately keeps the complete raw body
+regardless, so nothing is ever lost even when the parser can't make sense of it.
+Handles three top-level shapes uniformly (a bare array, a wrapped list under
+`Events`/`events`/`TrackingEvents`/etc., or a single event object) since none is
+confirmed for Sapient specifically and guessing wrong would silently drop real
+deliveries.
+
+**The receiver route** (`POST /api/webhooks/sapient`,
+`packages/web/src/app/api/webhooks/sapient/route.ts`): the optional
+`?token=`/`SAPIENT_WEBHOOK_SHARED_SECRET` check runs first, then parses the body,
+then — for each parsed event — resolves the owning shipment and tenant via
+`getAdminPool()` (bypasses RLS, `DATABASE_URL`), the same justified, narrowly-scoped
+cross-tenant lookup `resolveShopifyWebhookTenant()` already established (§4.5's own
+`/api/webhooks/shopify`) for exactly the same reason: a Sapient delivery carries no
+tenant id, only a tracking number. Scoped to `carrier IN ('evri', 'dpd')` — the only
+two carriers actually routed through Sapient — real defense against an accidental
+cross-carrier tracking-number collision, not just documentation. Every subsequent
+read/write goes through `getAppPool()` via `withTenant()`, scoped normally. Inserts
+a `shipment_tracking_events` row (`ON CONFLICT (idempotency_key) DO NOTHING`, so a
+Sapient-confirmed redelivery is a harmless no-op) and updates the parent
+`shipments` row's three "latest" columns via `COALESCE` (never blanking out a field
+an earlier event carried just because a later event didn't repeat it). An
+unresolvable tracking number (no matching `shipments` row) is logged and
+acknowledged with HTTP 200, not retried — Sapient's own confirmed 8-attempt/
+72-hour retry-then-suspend policy means retrying something permanently
+unresolvable would only burn through that budget and risk suspending real,
+resolvable deliveries right along with it.
+
+**Wired into the app**: `/orders/[id]` gained a new "Shipment tracking" section
+(previously `shipments` had zero existing read/display call sites anywhere in this
+app — confirmed by grep before building this, so without this the whole feature
+would be invisible/unverifiable even once real credentials existed) — carrier/
+tracking-number/status badges, a "Latest:" summary line, and a timeline of up to 20
+`shipment_tracking_events` rows (timestamp, milestone/description/event-code,
+location), newest first. `/settings/carriers`' Evri and DPD info boxes now say
+tracking is received via a Sapient-configured webhook (not "not built this pass,"
+their own prior wording), link to `/orders`, explain the manual 5-step portal
+setup, give the callback path (`/api/webhooks/sapient`), and explain the optional
+`SAPIENT_WEBHOOK_SHARED_SECRET`/`?token=` mitigation (DPD's own box points back to
+Evri's for the shared-secret note, since both carriers share the one endpoint).
+
+**Tests**: pure-function coverage for `sapient-webhook.ts`
+(`packages/web/test/sapient-webhook.test.ts`, 18 tests) — PascalCase field
+recognition, camelCase/synonym fallback, nested-wrapper-key scopes (including a
+top-level field winning over the same name found nested), all three top-level
+payload shapes (bare array / wrapped list / single event), an empty wrapped-list
+falling back to single-event parsing, unparseable-date handling
+(`firstDateAcross` returning `null` rather than a raw string), a non-object/
+non-array body parsing to `[]`, numeric-value coercion, blank-string handling, and
+idempotency-key determinism/uniqueness across shipment id and the
+eventCode→milestone→description→`"unknown-event"` fallback chain. Wired into
+`scripts/run-tests.sh`'s `SAFE_TESTS`. Verified: `npm run db:migrate` (migration
+0041's first real application), `npm run typecheck --workspaces` clean across all
+eleven workspaces, `next build` clean (the new route and the updated `/orders/[id]`/
+`/settings/carriers` pages all compile), `bash scripts/run-tests.sh` — all 62 test
+files pass (61 previous + the new `sapient-webhook.test.ts`).
+
+**UNVERIFIED IN PRACTICE, same status every other carrier feature in this layer
+carried before its own first live pass**: no real Sapient account exists to
+actually configure a webhook against and trigger a live delivery — this route's
+own SQL/logic has not been smoke-tested against real Postgres with a synthetic
+payload the way §17's audit log and several other features were before being
+called done, only typechecked/built. The payload-shape and signature gaps flagged
+in the research trail above remain genuinely open until a real delivery is
+received and inspected; `raw_payload` exists specifically so that first real
+delivery can be read back afterward to confirm or correct this parser's own
+assumptions, rather than guessing twice.
+
+**Deliberately not built this pass**, same "don't expand scope without an explicit
+decision" rule as every other carrier section's own closing paragraph: real
+Parcelforce manifest generation (§19.4, still open); wiring FedEx's/UPS's/DHL's own
+real live rate calls into `/picklists` (§19.3/§19.5/§19.6, still open); retry/
+circuit-breaker wiring mirroring §4.4 (still no scheduler job exists for any
+carrier in this layer); and obtaining real credentials for any of the 7 carriers or
+for Sapient itself, all of which need Arif's own vendor-facing action, not more of
+this codebase's own code.
 
 ---
 

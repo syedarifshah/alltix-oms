@@ -269,8 +269,14 @@ export default async function CarrierSettingsPage({
           third-party multi-carrier shipping gateway), not a direct Evri API. No real client ID/secret has
           round-tripped against it yet. Also worth knowing: no live rate-shopping endpoint was found for Sapient
           either — rate estimates return empty (unlike Royal Mail, no confirmed Evri surcharge or base-price data
-          exists to estimate from). Real-time tracking is delivered via a Sapient-configured webhook, not built this
-          pass — see <a href="/picklists">Picklists</a>&apos; own shipping form for what is built.
+          exists to estimate from). Real-time tracking is now received via a Sapient-configured webhook — see{" "}
+          <a href="/orders">Orders</a> for the tracking history on a shipped order, once one exists. This is not
+          something this codebase can configure automatically (Sapient&apos;s own webhook setup is a 5-step PORTAL
+          process, not a REST call) — once you have a real Sapient account, point its tracking webhook callback URL
+          at <code>/api/webhooks/sapient</code> on this app&apos;s own domain. Sapient publishes no signature/HMAC
+          mechanism to verify a delivery is genuinely from them; if the <code>SAPIENT_WEBHOOK_SHARED_SECRET</code>{" "}
+          environment variable is set, append <code>?token=&lt;that value&gt;</code> to the callback URL as this
+          app&apos;s own mitigation.
         </div>
         {evriConnection ? (
           <div className="stack">
@@ -439,7 +445,11 @@ export default async function CarrierSettingsPage({
           client ID/secret has round-tripped against it yet. Also worth knowing: no live rate-shopping endpoint was
           found for Sapient either — rate estimates return empty (same as Evri, no confirmed DPD surcharge or
           base-price data exists to estimate from), and — like Evri — no confirmed cancel-shipment endpoint was
-          found, so void is not implemented.
+          found, so void is not implemented. Real-time tracking is now received via the same Sapient-configured
+          webhook as Evri&apos;s — see <a href="/orders">Orders</a> for the tracking history on a shipped order, once
+          one exists. Once you have a real Sapient account, point its tracking webhook callback URL at{" "}
+          <code>/api/webhooks/sapient</code> on this app&apos;s own domain (the same one endpoint handles both
+          carriers — see Evri&apos;s own card above for the shared-secret note).
         </div>
         {dpdConnection ? (
           <div className="stack">

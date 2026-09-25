@@ -76,6 +76,40 @@ interface PicklistLineRow {
   internal_sku: string;
 }
 
+/** The most recent non-void carrier shipment for this order (migration
+ *  0039) -- at most one row is ever read, per shipments' own doc comment
+ *  ("callers needing 'the current shipment for this order' filter to
+ *  status != 'void' and take the most recent"). latest_tracking_* (migration
+ *  0041) is this row's own recomputed-on-write summary of whatever
+ *  shipmentTrackingEvents below actually contains -- shown here so the page
+ *  doesn't need to compute "the latest one" client-side. */
+interface ShipmentRow {
+  id: string;
+  carrier: string;
+  tracking_number: string | null;
+  status: string;
+  latest_tracking_status: string | null;
+  latest_tracking_milestone: string | null;
+  latest_tracking_at: string | null;
+  created_at: string;
+}
+
+/** One row per event actually received via /api/webhooks/sapient
+ *  (CLAUDE.md §19.9) -- only ever populated for Evri/DPD shipments, since
+ *  that's the only two carriers routed through Sapient's own webhook.
+ *  event_code/milestone/description/location/occurred_at are all nullable
+ *  by design (see shipment_tracking_events' own migration 0041 doc comment
+ *  on why) -- rendered defensively, never assuming any one of them is
+ *  present. */
+interface ShipmentTrackingEventRow {
+  event_code: string | null;
+  milestone: string | null;
+  description: string | null;
+  location: string | null;
+  occurred_at: string | null;
+  created_at: string;
+}
+
 interface TimelineEntry {
   at: string;
   label: string;
@@ -187,7 +221,7 @@ export default async function OrderDetailPage({ params, searchParams }: OrderDet
     const order = orderResult.rows[0];
     if (!order) return null;
 
-    const [lines, events, ruleExecutions, picklistLines, splitFromOrder, splitIntoOrders] = await Promise.all([
+    const [lines, events, ruleExecutions, picklistLines, splitFromOrder, splitIntoOrders, shipment] = await Promise.all([
       client.query<OrderLineRow>(
         `SELECT
            ol.id, ol.quantity, ol.unit_price, ol.fulfillment_type,
@@ -243,7 +277,34 @@ export default async function OrderDetailPage({ params, searchParams }: OrderDet
           ])
         : Promise.resolve({ rows: [] as RelatedOrderRow[] }),
       client.query<RelatedOrderRow>(`SELECT id, status, external_order_id FROM orders WHERE split_from_order_id = $1`, [id]),
+      client.query<ShipmentRow>(
+        `SELECT id, carrier, tracking_number, status, latest_tracking_status, latest_tracking_milestone,
+                latest_tracking_at, created_at
+           FROM shipments
+          WHERE order_id = $1 AND status != 'void'
+          ORDER BY created_at DESC
+          LIMIT 1`,
+        [id],
+      ),
     ]);
+
+    const shipmentRow = shipment.rows[0] ?? null;
+    // Only Evri/DPD shipments ever have tracking events (they're the only
+    // two carriers routed through Sapient's own webhook, CLAUDE.md §19.9) --
+    // this query still runs unconditionally for any carrier's shipment, it
+    // just always returns zero rows for the other five, same "no special
+    // casing needed, the data just isn't there" shape every other
+    // carrier-agnostic query in this app already has.
+    const trackingEvents = shipmentRow
+      ? await client.query<ShipmentTrackingEventRow>(
+          `SELECT event_code, milestone, description, location, occurred_at, created_at
+             FROM shipment_tracking_events
+            WHERE shipment_id = $1
+            ORDER BY COALESCE(occurred_at, created_at) DESC
+            LIMIT 20`,
+          [shipmentRow.id],
+        )
+      : { rows: [] as ShipmentTrackingEventRow[] };
 
     return {
       order,
@@ -251,6 +312,8 @@ export default async function OrderDetailPage({ params, searchParams }: OrderDet
       timeline: buildTimeline(order, events.rows, ruleExecutions.rows, picklistLines.rows),
       splitFromOrder: splitFromOrder.rows[0] ?? null,
       splitIntoOrders: splitIntoOrders.rows,
+      shipment: shipmentRow,
+      trackingEvents: trackingEvents.rows,
     };
   });
 
@@ -258,7 +321,7 @@ export default async function OrderDetailPage({ params, searchParams }: OrderDet
     notFound();
   }
 
-  const { order, lines, timeline, splitFromOrder, splitIntoOrders } = data;
+  const { order, lines, timeline, splitFromOrder, splitIntoOrders, shipment, trackingEvents } = data;
 
   return (
     <main className="page">
@@ -389,6 +452,52 @@ export default async function OrderDetailPage({ params, searchParams }: OrderDet
           </tbody>
         </table>
       </div>
+
+      {shipment && (
+        <>
+          <h2>Shipment tracking</h2>
+          <div className="card" style={{ marginBottom: 20 }}>
+            <div className="row">
+              <span className="badge">{shipment.carrier}</span>
+              {shipment.tracking_number && <span className="mono">{shipment.tracking_number}</span>}
+              <span className={shipment.status === "error" ? "badge badge-danger" : "badge badge-success"}>
+                {shipment.status}
+              </span>
+            </div>
+            {shipment.latest_tracking_status || shipment.latest_tracking_milestone ? (
+              <div className="muted" style={{ marginTop: 8 }}>
+                Latest: {shipment.latest_tracking_milestone && <strong>{shipment.latest_tracking_milestone}</strong>}
+                {shipment.latest_tracking_milestone && shipment.latest_tracking_status && " — "}
+                {shipment.latest_tracking_status}
+                {shipment.latest_tracking_at && ` (as of ${new Date(shipment.latest_tracking_at).toISOString()})`}
+              </div>
+            ) : (
+              <div className="muted" style={{ marginTop: 8 }}>
+                No tracking updates received yet
+                {(shipment.carrier === "evri" || shipment.carrier === "dpd") &&
+                  " — delivered via a Sapient tracking webhook once configured (CLAUDE.md §19.9), not polled automatically."}
+              </div>
+            )}
+            {trackingEvents.length > 0 && (
+              <ul className="timeline" style={{ marginTop: 12 }}>
+                {trackingEvents.map((evt, i) => (
+                  <li key={i}>
+                    <div className="timeline-time">
+                      {new Date(evt.occurred_at ?? evt.created_at).toISOString()}
+                    </div>
+                    <div>
+                      {evt.milestone && <strong>{evt.milestone}</strong>}
+                      {evt.milestone && (evt.description || evt.event_code) && " — "}
+                      {evt.description ?? evt.event_code ?? "(no description on this event)"}
+                    </div>
+                    {evt.location && <div className="muted">{evt.location}</div>}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </>
+      )}
 
       <h2>Activity</h2>
       <p className="subtitle">

@@ -29,6 +29,7 @@ SAFE_TESTS=(
   "packages/web/test/channel-flags.test.ts"
   "packages/web/test/carrier-flags.test.ts"
   "packages/web/test/rate-limit.test.ts"
+  "packages/web/test/sapient-webhook.test.ts"
   "packages/web/test/tenant-isolation.e2e.test.ts"
   "packages/web/test/hr-mutations-e2e.test.ts"
   "packages/web/test/locations-mutations-e2e.test.ts"
