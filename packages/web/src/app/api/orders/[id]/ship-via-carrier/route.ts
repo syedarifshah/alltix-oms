@@ -16,6 +16,7 @@ import { getWarehouseService } from "@/lib/services";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
 import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 import { isCarrierEnabledForTenant, type Carrier } from "@/lib/carrier-flags";
+import { recordCarrierFailure, recordCarrierSuccess } from "@/lib/carrier-failure-tracking";
 
 export const dynamic = "force-dynamic";
 
@@ -89,6 +90,15 @@ const CARRIER_CONNECTORS: Record<
  * anywhere in this codebase or Arif's account yet -- this route's logic is
  * complete and typechecked, but nobody has generated a real label through
  * it for either carrier.
+ *
+ * Update -- cross-run circuit-breaker wiring now built (CLAUDE.md §19.11,
+ * carrier-failure-tracking.ts): connector.createShipment()'s own real
+ * network call is wrapped so a failure increments
+ * carrier_connections.consecutive_failures (tripping status to 'error'
+ * after CARRIER_CONSECUTIVE_FAILURE_ERROR_THRESHOLD in a row) and a success
+ * resets it -- this route being the only place a carrier connection is ever
+ * used after connect is exactly why carrier-flags.ts's own header comment
+ * already called it out as "the ongoing-use" site.
  */
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }): Promise<Response> {
   const pool = getAppPool();
@@ -172,28 +182,40 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     const total = subtotal + Number(shippingCostChargedGbp || "0");
 
     const connector = await carrierConfig.createConnector(pool, user.tenantId);
-    const shipment = await connector.createShipment({
-      orderId: order.id,
-      orderReference: order.external_order_id.slice(0, 40),
-      orderDate: order.placed_at ?? new Date().toISOString(),
-      recipient: { name: recipientName, addressLine1, city, postalCode, countryCode },
-      subtotalGbp: subtotal.toFixed(2),
-      shippingCostChargedGbp: Number(shippingCostChargedGbp || "0").toFixed(2),
-      totalGbp: total.toFixed(2),
-      serviceCode: serviceCode || undefined,
-      packages: [
-        {
-          weightGrams,
-          packageFormat: "parcel",
-          items: order.lines.map((line) => ({
-            name: line.name ?? "Item",
-            sku: line.internal_sku ?? undefined,
-            quantity: line.quantity,
-            unitValueGbp: Number(line.unit_price).toFixed(2),
-          })),
-        },
-      ],
-    });
+
+    // Cross-run circuit-breaker (CLAUDE.md §4.4's carrier-layer counterpart,
+    // see carrier-failure-tracking.ts's own header comment): only the real,
+    // live connector call itself is tracked -- not carrierConfig.createConnector()
+    // above, which already fails on its own unrelated "not connected" condition.
+    let shipment;
+    try {
+      shipment = await connector.createShipment({
+        orderId: order.id,
+        orderReference: order.external_order_id.slice(0, 40),
+        orderDate: order.placed_at ?? new Date().toISOString(),
+        recipient: { name: recipientName, addressLine1, city, postalCode, countryCode },
+        subtotalGbp: subtotal.toFixed(2),
+        shippingCostChargedGbp: Number(shippingCostChargedGbp || "0").toFixed(2),
+        totalGbp: total.toFixed(2),
+        serviceCode: serviceCode || undefined,
+        packages: [
+          {
+            weightGrams,
+            packageFormat: "parcel",
+            items: order.lines.map((line) => ({
+              name: line.name ?? "Item",
+              sku: line.internal_sku ?? undefined,
+              quantity: line.quantity,
+              unitValueGbp: Number(line.unit_price).toFixed(2),
+            })),
+          },
+        ],
+      });
+    } catch (err) {
+      await recordCarrierFailure(pool, user.tenantId, carrier as Carrier, errorMessage(err));
+      throw err;
+    }
+    await recordCarrierSuccess(pool, user.tenantId, carrier as Carrier);
 
     await withTenant(pool, user.tenantId, async (client) => {
       await client.query(

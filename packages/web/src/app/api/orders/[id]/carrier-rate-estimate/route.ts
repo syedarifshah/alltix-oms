@@ -10,6 +10,7 @@ import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectWithError, errorMessage } from "@/lib/route-helpers";
 import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
 import { isCarrierEnabledForTenant, type Carrier } from "@/lib/carrier-flags";
+import { recordCarrierFailure, recordCarrierSuccess } from "@/lib/carrier-failure-tracking";
 
 export const dynamic = "force-dynamic";
 
@@ -73,6 +74,14 @@ export const dynamic = "force-dynamic";
  * codebase or Arif's account yet, so this route's own live network call has
  * never actually round-tripped against real carrier infrastructure --
  * complete and typechecked, not proven.
+ *
+ * Update -- cross-run circuit-breaker wiring now built (CLAUDE.md §19.11,
+ * carrier-failure-tracking.ts): connector.getRateEstimate()'s own real
+ * network call is wrapped the same way ship-via-carrier's own
+ * connector.createShipment() call is -- a rate-estimate failure counts
+ * toward the same carrier_connections.consecutive_failures counter a real
+ * shipment failure would, since both are genuine live calls against the
+ * same underlying carrier connection.
  */
 const RATE_ESTIMATE_CONNECTORS: Record<
   string,
@@ -123,11 +132,24 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   try {
     const connector = await carrierConfig.createConnector(pool, user.tenantId);
-    const estimates = await connector.getRateEstimate({
-      weightGrams,
-      destinationCountryCode: countryCode,
-      shipDate: new Date().toISOString(),
-    });
+
+    // Cross-run circuit-breaker (CLAUDE.md §4.4's carrier-layer counterpart,
+    // see carrier-failure-tracking.ts's own header comment) -- same
+    // "only the real, live connector call itself is tracked" discipline
+    // ship-via-carrier's own route already applies, not the credential load
+    // above (which fails on its own unrelated "not connected" condition).
+    let estimates;
+    try {
+      estimates = await connector.getRateEstimate({
+        weightGrams,
+        destinationCountryCode: countryCode,
+        shipDate: new Date().toISOString(),
+      });
+    } catch (err) {
+      await recordCarrierFailure(pool, user.tenantId, carrier as Carrier, errorMessage(err));
+      throw err;
+    }
+    await recordCarrierSuccess(pool, user.tenantId, carrier as Carrier);
 
     const url = new URL("/picklists", req.url);
     url.searchParams.set("rateQuoteOrderId", id);

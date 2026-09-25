@@ -12,12 +12,15 @@ export const dynamic = "force-dynamic";
 /** consecutive_failures/last_failure_at/last_failure_message mirror
  *  channel_connections' own failure-tracking columns (migration 0021) --
  *  carrier_connections (migration 0039) was given the identical shape from
- *  the start, but nothing writes to them yet (no scheduler job exists for
- *  carriers the way it does for channel order-sync -- a carrier connection
- *  is only ever used synchronously, from the pack/ship flow, task #59's own
- *  ship-via-carrier route, not polled on a cron). Kept on the row and shown
- *  here anyway so a future retry-tracking pass (mirroring CLAUDE.md §4.4)
- *  has somewhere to write without a schema change. */
+ *  the start. Update: these are now real, written columns, not just
+ *  reserved schema -- CLAUDE.md §19.11's cross-run circuit-breaker pass
+ *  (packages/web/src/lib/carrier-failure-tracking.ts) wires
+ *  recordCarrierFailure()/recordCarrierSuccess() into ship-via-carrier's own
+ *  connector.createShipment() call and carrier-rate-estimate's own
+ *  connector.getRateEstimate() call -- the only two places a carrier
+ *  connection is ever used after connect (still no scheduler job exists for
+ *  carriers the way there is for channel order-sync, so both writers are
+ *  triggered by a real synchronous tenant request, not a cron tick). */
 interface CarrierConnectionRow {
   id: string;
   carrier: string;

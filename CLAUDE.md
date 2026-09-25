@@ -68,7 +68,13 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
   UPS's/DHL's own real live rate calls are now wired into `/picklists` too — the
   next genuinely buildable-now item once Sapient webhook receiving closed out its
   own round (real Parcelforce manifest generation and real carrier credentials both
-  still need Arif's own vendor-facing action first) — see §19.10.
+  still need Arif's own vendor-facing action first) — see §19.10. Cross-run
+  circuit-breaker wiring for carrier connections, mirroring §4.4's own
+  channel-level version, is now built too — the last genuinely buildable-now item
+  on this layer's own standing punch list, closing it out entirely; everything
+  still open in this layer (real Parcelforce manifest generation, real credentials
+  for any of the 7 carriers or for Sapient) is now exclusively blocked on Arif's
+  own next vendor-facing step, not more of this codebase's own code — see §19.11.
 
 Do not expand this scope without an explicit decision — every module below assumes it.
 
@@ -5057,7 +5063,134 @@ go through `fetchWithBackoff`'s in-process retry, the same wrapper every carrier
 connector's own fetch calls already use, but the cross-run circuit-breaker half of
 §4.4 — tripping and recording a connection-level failure state — is still open);
 and obtaining real credentials for any of the 7 carriers, which needs Arif's own
-vendor-facing action, not more of this codebase's own code.
+vendor-facing action, not more of this codebase's own code. **Update — the
+retry/circuit-breaker item is now built too, see §19.11**, covering both
+`ship-via-carrier`'s own `createShipment()` call and this route's own
+`getRateEstimate()` call.
+
+### 19.11 Cross-Run Circuit-Breaker Wiring for Carrier Connections (§4.4's carrier-layer counterpart)
+
+**Status: built.** Every carrier section since Royal Mail (§19.1) flagged this as a
+standing open item, and §19.10's own closing paragraph named it again as one of the
+few things left once FedEx's/UPS's/DHL's own live rate calls were wired into
+`/picklists`. `carrier_connections` (migration 0039) has carried
+`consecutive_failures`/`last_failure_at`/`last_failure_message`/
+`status IN (..., 'error')` — the identical shape `channel_connections`' own §4.4
+circuit breaker already uses — since the very first carrier migration, but nothing
+ever wrote to them. This closes that gap: the one item on the standing carrier-layer
+punch list that needed no external credential, vendor action, or new AskUserQuestion
+round to build — the same "pick among what's buildable without an external blocker"
+reasoning that made Sapient webhook receiving (§19.9) and this same live-rate-wiring
+pass (§19.10) each the prior round's own pick.
+
+**Why this is structurally different from `channel_connections`' own version, not a
+copy-paste**: channels have a cron-driven scheduler job that discovers
+`status = 'active'` connections on a schedule, so `recordSyncFailure()`/
+`recordSyncSuccess()` (`packages/scheduler/src/index.ts`) run against an admin pool
+from a background process with no tenant session of its own. Carriers have **no
+scheduler job at all** — `carrier-flags.ts`'s own header comment already said so
+when carrier feature-flags were built (§19.8): a carrier connection is only ever
+used synchronously, from a signed-in tenant's own real request. So
+`recordCarrierFailure()`/`recordCarrierSuccess()`
+(`packages/web/src/lib/carrier-failure-tracking.ts`) take the ordinary tenant-scoped
+`pool` every other route-level helper in this app already takes (`checkRateLimit`,
+`isCarrierEnabledForTenant`) and open their own short-lived `withTenant` transaction,
+rather than an already-open `client` the way `audit-log.ts`'s `recordAuditEvent`
+does — there's no existing open transaction worth reusing at either call site (the
+label-generating `INSERT INTO shipments` is deliberately its own separate
+`withTenant` block, so a failed carrier call never rolls back alongside it).
+
+**The two call sites — the only two places a carrier connection is ever used after
+connect**: `POST /api/orders/[id]/ship-via-carrier`'s own `connector.createShipment()`
+call, and `POST /api/orders/[id]/carrier-rate-estimate`'s own
+`connector.getRateEstimate()` call (§19.10) — both wrapped in a narrow try/catch that
+calls `recordCarrierFailure()` and rethrows on a thrown error, or calls
+`recordCarrierSuccess()` right after a successful response. Deliberately **not**
+wrapped around `carrierConfig.createConnector()`/`loadXCredentialsFromCarrierConnection()`
+itself in either route — that call already fails on its own separate, unrelated
+condition ("no active `carrier_connections` row for this tenant/carrier at all," since
+every `loadXCredentialsFromCarrierConnection()` in `@alltix/carrier-connectors`
+already filters `WHERE carrier = '...' AND status = 'active'`), which is not a
+carrier API failure to circuit-break on — counting it as a fresh failure would
+double-count the same outage (or the same "never connected at all") forever. A
+partial-success response (Royal Mail's/Evri's own confirmed `labelErrors`-without-a-
+throw outcome, §19.1/§19.2) still counts as a success here — the API call itself
+didn't throw, which is the only signal this circuit breaker tracks.
+
+**A genuinely free consequence of infrastructure that already existed for an
+unrelated reason, worth being explicit about since it closes the one open design
+question every prior carrier section's own closing paragraph left unanswered
+("whether a tripped connection should be excluded from dispatch")**: once
+`recordCarrierFailure()` trips a connection to `status = 'error'`, every
+`loadXCredentialsFromCarrierConnection()` stops returning a row for it on the very
+next call — `createXConnectorFromCarrierConnection()` throws
+`No active 'x' carrier_connections row found for tenant ...` instead, which both
+routes' own pre-existing catch blocks already turn into a `redirectWithError` the
+tenant sees on `/picklists`. No new exclusion logic was needed anywhere — it falls
+out of the `WHERE ... AND status = 'active'` filter every carrier connector's own
+credential-loading function already had, for the ordinary "not connected" case, since
+before this pass.
+
+**Recovery is manual, same story channels already carry (§4.4's own doc comment)**:
+the tenant re-submits their credentials on `/settings/carriers`, which re-verifies
+live via `verifyConnection()` before writing `status = 'active'` **and**
+`consecutive_failures = 0` again (every one of the 7 carrier connect routes'
+`ON CONFLICT ... DO UPDATE` already did this from the moment each carrier was first
+built — confirmed by grep before writing this pass, not a change made here) — nothing
+in `recordCarrierFailure()`/`recordCarrierSuccess()` auto-retries or un-trips an
+`error` row on its own.
+
+**Alerting**: a single `[ALERT]`-tagged `console.error` plus a Sentry event
+(`captureAlert()`) fires exactly once, on the call that crosses
+`CARRIER_CONSECUTIVE_FAILURE_ERROR_THRESHOLD` (3, the identical value
+`channel_connections`' own `CONSECUTIVE_FAILURE_ERROR_THRESHOLD` uses, kept as its
+own separate literal rather than imported — `packages/scheduler` depends on nothing
+carrier-related and shouldn't gain a dependency just to re-export one constant, same
+"two independent copies of a small shared idea" precedent `channel-flags.ts`/
+`carrier-flags.ts`'s own `ALL_CHANNELS`/`ALL_CARRIERS` lists already established) —
+not on every failure after it. Deliberately does **not** email the tenant the way
+`recordSyncFailure()`'s own threshold-crossing branch does for channels — no
+`notifyTenantUsers()` call was added here; `/settings/carriers` already surfaces
+`status`/`consecutive_failures`/`last_failure_message` visibly on the page (built
+ahead of this pass, when `carrier_connections`' failure-tracking columns were first
+reserved — see that page's own doc comment, now updated to say these columns are
+real and written, not just reserved schema), and email-on-trip was judged unnecessary
+scope for a feature whose entire audience today is one self-testing tenant; revisit
+if/when this platform has real, unattended multi-tenant carrier traffic worth
+paging on.
+
+**Tests**: no new dedicated test file — `recordCarrierFailure()`/
+`recordCarrierSuccess()` are thin, direct SQL wrappers with no pure decision logic to
+extract the same way `sapient-webhook.ts`'s own parser had (§19.9), mirroring
+`recordAuditEvent`'s own "no dedicated test file" precedent (§17) for the identical
+reason. Verified instead via `npm run typecheck --workspaces` (clean across all
+eleven workspaces), `next build` (clean — both routes and the updated
+`/settings/carriers` page compile), `bash scripts/run-tests.sh` (all 63 test files
+pass, unchanged), and a manual smoke test against real local Postgres — 18
+assertions covering: a first failure incrementing the counter and staying `active`;
+a second failure staying `active`; a third failure crossing the threshold and
+tripping `status` to `'error'` (with the `[ALERT]` log line firing exactly once); a
+fourth failure continuing to increment without un-tripping or re-alerting;
+`recordCarrierSuccess()` resetting `consecutive_failures` to 0 while deliberately
+leaving `status`/`last_failure_message` in place (recovery is via reconnect, not a
+successful call); `recordCarrierSuccess()` as a safe no-op on an already-0 row;
+cross-tenant isolation (a second tenant's own row is untouched by the first's
+failures); and `recordCarrierFailure()` as a safe no-op (zero rows matched, no
+throw) against a `(tenant, carrier)` pair with no `carrier_connections` row at all —
+all passed.
+
+**UNVERIFIED IN PRACTICE, same status every other carrier feature in this layer
+carries**: no real credentials exist for any of the 7 carriers, so this circuit
+breaker's own trip/recovery logic has been proven against real Postgres with
+synthetic failures, not against a real, repeatedly-failing carrier API in
+production.
+
+**Deliberately not built this pass**: real Parcelforce manifest generation (§19.4,
+still open); obtaining real credentials for any of the 7 carriers or for Sapient
+itself (both need Arif's own vendor-facing action, not more of this codebase's own
+code). With this pass built, every carrier-layer item that was buildable without an
+external blocker is now built — what remains open is exclusively blocked on Arif's
+own next step with a real carrier/Sapient vendor.
 
 ---
 
