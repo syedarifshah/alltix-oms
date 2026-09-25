@@ -3663,6 +3663,24 @@ clean across all eleven workspaces (the new `@alltix/carrier-connectors` package
 included), `next build` clean (every new route/page compiles), and
 `bash scripts/run-tests.sh` — all 55 test files pass.
 
+**Update — a real Royal Mail Click & Drop API key has now round-tripped against
+production infrastructure, closing part of the "UNVERIFIED IN PRACTICE" status
+above**: Arif generated a real, live Click & Drop API key from his own real Royal
+Mail business account (Settings → Integrations → Add New Integration → Click & Drop
+API) and submitted it via `/settings/carriers`' own "Connect Royal Mail" form.
+`POST /api/carriers/royal-mail/connect`'s own `verifyConnection()` call — a real,
+live, authenticated `GET /carriers` request against `api.parcel.royalmail.com` —
+succeeded, and the connection now shows `status: active` on `/settings/carriers`
+("Connected since 2026-09-25T19:27:45.808Z"). This is the FIRST real credential
+verification success anywhere across this entire 7-carrier layer (§19.1–§19.7) —
+every other carrier remains exactly as UNVERIFIED as before. **Narrower than it
+might sound**: this only proves the API key itself is valid and that this
+connector's auth/base-URL/header shape is correct — `createShipment()` (real
+order/label creation via `/picklists`' own "Ship via connected carrier" form),
+`trackShipment()`, and `voidShipment()` have not yet been exercised against a real
+order. The next step toward fully proving this connector is running one real
+shipment through `/picklists`.
+
 ### 19.2 Evri (formerly Hermes) — carrier #2, built via the Sapient/Intersoft CORE API gateway
 
 **Why Evri, and why via a third-party gateway**: once Royal Mail (§19.1) was
