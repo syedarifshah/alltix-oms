@@ -270,10 +270,25 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       // transition on a degraded outcome" discipline
       // WarehouseService.confirmShipment() already applies when the channel
       // call itself fails.
+      //
+      // Surface the raw response here too, not just the bare "no tracking
+      // number" message -- found and fixed the same way Bug #1
+      // (createShipment()'s own thrown-error path, CLAUDE.md §19.1) already
+      // was: this branch is the OTHER place a carrier response reaches the
+      // tenant, and it was silently discarding whatever `labelErrors`/etc.
+      // Royal Mail actually put in the response, forcing a database query
+      // to see the real reason instead of just reading it off /picklists.
+      // Same 2000-char truncation cap as the thrown-error path.
+      let rawDetail: string;
+      try {
+        rawDetail = JSON.stringify(shipment.raw).slice(0, 2000);
+      } catch {
+        rawDetail = "(response not serializable)";
+      }
       return redirectWithError(
         req,
         "/picklists",
-        `${carrierConfig.displayName} created order ${shipment.carrierOrderId} but returned no tracking number -- check the shipment and retry.`,
+        `${carrierConfig.displayName} created order ${shipment.carrierOrderId} but returned no tracking number -- check the shipment and retry. Raw response: ${rawDetail}`,
       );
     }
 

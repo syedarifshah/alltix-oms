@@ -3790,11 +3790,33 @@ billing address. `royal-mail-connector.test.ts` gained matching assertions
 loudly. Verified this pass: `npx tsx --test
 packages/carrier-connectors/test/royal-mail-connector.test.ts` (12/12 pass),
 `npm run typecheck --workspaces` clean across all twelve workspaces, `next build`
-clean, `bash scripts/run-tests.sh` — all 63 test files pass. Not yet
-re-attempted against a real order since this fix — the next step is unchanged
-from before: a real shipment attempt through `/picklists`, now with the
-corrected `recipient` shape, a real `unitWeightGrams` on every item, and a real
-`billing` object.
+clean, `bash scripts/run-tests.sh` — all 63 test files pass.
+
+**Update — real progress: Royal Mail actually created a real order (1001) on the
+next attempt, all four earlier bugs now behind it — but returned no tracking
+number, and the error banner that surfaced didn't say why.** Address, per-item
+weight, and billing all passed validation this time — the order genuinely exists
+on Royal Mail's side now. But `shipment.trackingNumber` came back empty, which
+`ship-via-carrier`'s own route already treats as a real, documented split
+outcome (the order created, but Royal Mail's own `labelErrors` mechanism, per
+`createShipment()`'s own doc comment, can fail label/tracking generation
+independently) — the order correctly stays `packed` rather than being
+transitioned on a degraded outcome. **The gap**: unlike `createShipment()`'s own
+thrown-error path (Bug #1, which surfaces the ENTIRE raw response), this
+particular branch of the route only ever said "returned no tracking number --
+check the shipment and retry," discarding whatever `labelErrors`/other detail
+Royal Mail actually put in the response — the same class of information-loss
+Bug #1 already fixed once, just in the other branch of this same route. **Fixed**:
+this branch now includes the same truncated (2000-char) raw response JSON in the
+redirect error, so the real reason (once seen) shows up directly on `/picklists`
+instead of requiring a database query against `shipments.raw_payload` (which
+already had it, just not surfaced to the tenant). Verified: `npm run typecheck
+--workspace=@alltix/web` and `npm run typecheck --workspaces` both clean, `next
+build` clean, `bash scripts/run-tests.sh` — all 63 test files pass (no dedicated
+new test — a plain string-interpolation change in a route with no pure-function
+extraction, same precedent the per-item-weight fix above already set). The next
+step: retry the same order — the raw response this time should finally reveal
+*why* Royal Mail didn't return a tracking number for order 1001.
 
 ### 19.2 Evri (formerly Hermes) — carrier #2, built via the Sapient/Intersoft CORE API gateway
 
