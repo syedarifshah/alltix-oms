@@ -57,7 +57,10 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
   explicit "Yes, build DPD now (Recommended)" confirmation via AskUserQuestion,
   once DHL was complete and merged — see §19.7. This closes out the full
   originally-requested 7-carrier lineup; no carrier from that original list
-  remains unbuilt.
+  remains unbuilt. With the lineup itself complete, a per-tenant carrier
+  feature-flag system mirroring §15's channel flags — recommended and Arif's own
+  explicit pick among 4 open follow-on items via AskUserQuestion — is now built
+  too, see §19.8.
 
 Do not expand this scope without an explicit decision — every module below assumes it.
 
@@ -4671,6 +4674,104 @@ scheduler job exists for any carrier in this layer). Any further carrier beyond
 this original 7 (a real Hermes-as-distinct-carrier scenario aside, since that
 turned out not to exist) is a new, explicit scope decision per §0's own "don't
 expand scope without an explicit decision" rule, not an oversight.
+
+### 19.8 Carrier Feature Flags (per-tenant rollout gating, §19.7's own standing open item)
+
+**Status: built.** Every carrier section since Royal Mail (§19.1) flagged "a real
+per-tenant carrier feature-flag system mirroring §15's channel flags" as a standing
+open item; §19.7's own closing paragraph named it again as one of the few things
+left once DPD closed out the full 7-carrier lineup. Once all 7 carriers were built,
+wired, and merged, Arif was asked (AskUserQuestion, 4 ranked options) which of the
+remaining open items on this layer to tackle first — recommended and Arif's own
+explicit pick, **"Carrier feature-flags (Recommended)"** — over the other 3 options
+offered (obtaining real credentials, real Sapient webhook receiving, and wiring the
+live rate calls into `/picklists`). Real Parcelforce manifest generation (§19.4) is
+a further, separately-standing open item not itself one of the 4 options offered
+this round.
+
+**Why this is worth having even with one tenant, same reasoning §15's own opening
+paragraph gives for channels**: `/settings/carriers`' own subtitle already says all 7
+carriers are built but every one of them is UNVERIFIED against real infrastructure
+(§19.1–§19.7, each). Before this, any signed-up tenant could click "Connect DPD" or
+"Connect Parcelforce" into a connector nobody has ever round-tripped against real
+carrier infrastructure — the exact same risk §15 closed for channels, now true of
+every carrier in this layer instead of just some channels. This lets a real
+credential get verified against ONE tenant's connection first, with every other
+tenant's "Connect X" simply not appearing, before a carrier is rolled out
+generally.
+
+**Schema** (`0040_tenants_enabled_carriers.sql`): `tenants.enabled_carriers TEXT[]
+NOT NULL DEFAULT ARRAY['royal_mail','evri','fedex','parcelforce','ups','dhl','dpd']`
+— every carrier this codebase has a connector for, so a tenant nobody has touched
+this for sees IDENTICAL behavior before and after this migration (same "genuinely
+additive, zero behavior change until someone opts a tenant out" discipline migration
+0032's own channel-flags column already used). A `CHECK (enabled_carriers <@
+ARRAY[...])` mirrors the identical list hardcoded at the app layer
+(`packages/web/src/lib/carrier-flags.ts`'s own `ALL_CARRIERS`) — defense-in-depth,
+same "never rely on one layer alone" principle §6 already applies to tenant
+isolation. Deliberately excludes `'hermes'` even though `carrier_connections`' own
+CHECK constraint (migration 0039) still allows it as a historical value — Hermes was
+never built as a separate carrier (folded into Evri, §19.2), so there's no
+connector, no connect route, and no `/settings/carriers` card for it to gate; this
+column's CHECK is intentionally narrower than `carrier_connections`' own 8-value
+list. As with channels, there is no single source of truth these lists derive from
+(nor does `scripts/set-carrier-flags.ts`'s own third copy, deliberately not imported
+from `@alltix/web`'s `src/` — same "scripts never reach into `@alltix/web`'s own
+`src/`" boundary `set-channel-flags.ts`'s own header comment already establishes):
+an 8th carrier connector means updating all three lists by hand.
+
+**Scope — gates both connecting AND ongoing use, a real structural difference from
+channels' own one-time-connect-plus-scheduler-gate shape**: channels have a
+scheduler job to gate their *ongoing* sync (§15's own "Scope" paragraph); carriers
+have no scheduler job at all — `carrier_connections`' own failure-tracking columns'
+doc comment already says so ("a carrier connection is only ever used synchronously,
+from the pack/ship flow," §19's own opening note to §19.1's settings-page comment).
+So this feature gates carriers at TWO points instead of channels' two-phases-of-one:
+- **Connect time** — every one of the 7 carrier connect routes
+  (`/api/carriers/{royal-mail,evri,fedex,parcelforce,ups,dhl,dpd}/connect`) now
+  checks `isCarrierEnabledForTenant` right after the existing rate-limit guard and
+  before any form parsing/network/DB work, redirecting to `/settings/carriers` with
+  a `<carrier>_carrier_not_enabled` error if the flag is off — same placement and
+  same "right after resolving the caller, before any real work" ordering every
+  rate-limited route in this app already uses (§16).
+- **Ongoing use** — `POST /api/orders/[id]/ship-via-carrier` (the route every
+  connected carrier's actual label-generation call goes through, §19.1's own
+  "Wired into the app" paragraph) now checks the same flag right after resolving
+  `carrierConfig` from the tenant's chosen carrier and before touching the order or
+  making a real, money-costing call to the carrier — this route is carriers'
+  functional equivalent of a channel's own scheduled sync tick, the ONE place a
+  carrier connection is ever used after the initial connect, so gating it here is
+  what makes turning a carrier's flag off actually stop a tenant from generating
+  more real labels through it, not just stop new connections.
+
+Like channels, this deliberately does NOT retroactively hide an already-connected
+carrier's settings card (`/settings/carriers` only ever consults the flag on the
+NOT-yet-connected branch of each carrier's own card, via the new
+`CarrierNotEnabledNotice` component — a direct mirror of `ChannelNotEnabledNotice`)
+and does NOT filter the `/picklists` "Ship via connected carrier" `<select>` — that
+dropdown is already scoped to carriers the tenant has an active connection for
+(§19.2's own "Wired into the app" paragraph), and a tenant who already connected a
+carrier keeps using it exactly as before; the flag change takes effect at
+`ship-via-carrier`'s own gate on the next real ship attempt, not by rewriting what
+the picklist page shows.
+
+**No operator UI — a CLI script instead, same reasoning as §15's own LaunchDarkly
+call**: `npm run platform:set-carrier-flags` (`scripts/set-carrier-flags.ts`) takes
+`TENANT_ID`/`ENABLED_CARRIERS` (comma-separated) and replaces that tenant's list
+wholesale — a near-literal mirror of `scripts/set-channel-flags.ts`, right down to
+its own `recordAuditEvent` call (`action: "settings.carrier_flags_changed"`,
+`userId: null` — an operator running this script from a shell has no Clerk session
+to attribute the change to, same NULL-means-no-human-actor semantics §17 already
+establishes). There is no multi-tenant admin surface anywhere in this codebase yet
+to hang a real toggle UI off of, same as channels.
+
+**Tests**: `packages/web/test/carrier-flags.test.ts` covers the one pure function
+here (`filterKnownCarriers` — same "extract the pure decision, test it directly"
+precedent `channel-flags.test.ts` set), including a dedicated case proving
+`'hermes'` is dropped even though `carrier_connections`' own CHECK still allows it.
+No DB-layer test suite for the migration itself, same precedent migration 0032's own
+channel-flags migration set — verified instead via `tsc -b`, `npm run typecheck
+--workspaces`, `next build`, and `bash scripts/run-tests.sh`.
 
 ---
 

@@ -5,6 +5,7 @@ import { getAppPool } from "@/lib/db";
 import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
 import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
+import { isCarrierEnabledForTenant } from "@/lib/carrier-flags";
 
 export const dynamic = "force-dynamic";
 
@@ -49,6 +50,10 @@ export async function POST(req: NextRequest): Promise<Response> {
 
   if (await checkRateLimit(pool, user.tenantId, "carriers.dpd.connect")) {
     return redirectWithError(req, "/settings/carriers", RATE_LIMIT_ERROR_MESSAGE);
+  }
+
+  if (!(await isCarrierEnabledForTenant(pool, user.tenantId, "dpd"))) {
+    return redirectWithError(req, "/settings/carriers", "dpd_carrier_not_enabled");
   }
 
   const formData = await req.formData();

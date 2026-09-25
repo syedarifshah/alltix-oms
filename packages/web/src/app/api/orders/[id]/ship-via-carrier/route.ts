@@ -15,6 +15,7 @@ import { requireCurrentUser } from "@/lib/with-tenant-auth";
 import { getWarehouseService } from "@/lib/services";
 import { redirectTo, redirectWithError, errorMessage } from "@/lib/route-helpers";
 import { checkRateLimit, RATE_LIMIT_ERROR_MESSAGE } from "@/lib/rate-limit";
+import { isCarrierEnabledForTenant, type Carrier } from "@/lib/carrier-flags";
 
 export const dynamic = "force-dynamic";
 
@@ -107,6 +108,18 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   if (!carrierConfig) {
     return redirectWithError(req, "/picklists", `Unknown or unsupported carrier '${carrier}'.`);
   }
+
+  // Carrier feature-flag gate -- the ongoing-use analog of a channel's own
+  // scheduler-sync gate (CLAUDE.md's own "Carrier Feature Flags" section):
+  // carriers have no scheduler job at all, so this POST is the only place a
+  // carrier connection is ever used after the initial connect. `carrier` is
+  // already a validated key of CARRIER_CONNECTORS above, which is built from
+  // the exact same 7-carrier set carrier-flags.ts's own ALL_CARRIERS lists,
+  // so this cast is safe.
+  if (!(await isCarrierEnabledForTenant(pool, user.tenantId, carrier as Carrier))) {
+    return redirectWithError(req, "/picklists", `${carrierConfig.displayName} is not enabled for your account.`);
+  }
+
   const recipientName = String(formData.get("recipientName") ?? "").trim();
   const addressLine1 = String(formData.get("addressLine1") ?? "").trim();
   const city = String(formData.get("city") ?? "").trim();

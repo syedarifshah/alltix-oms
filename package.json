@@ -40,7 +40,8 @@
     "temu:order-sync-scheduler": "tsx scripts/temu-order-sync-scheduler.ts",
     "tiktok:order-sync-job": "tsx scripts/tiktok-order-sync-job.ts",
     "tiktok:order-sync-scheduler": "tsx scripts/tiktok-order-sync-scheduler.ts",
-    "platform:set-channel-flags": "tsx scripts/set-channel-flags.ts"
+    "platform:set-channel-flags": "tsx scripts/set-channel-flags.ts",
+    "platform:set-carrier-flags": "tsx scripts/set-carrier-flags.ts"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",

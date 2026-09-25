@@ -5,6 +5,7 @@ import { withTenant } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { getEnabledCarriers } from "@/lib/carrier-flags";
 
 export const dynamic = "force-dynamic";
 
@@ -71,6 +72,7 @@ export default async function CarrierSettingsPage({
     upsConnection,
     dhlConnection,
     dpdConnection,
+    enabledCarriers,
   } = await withTenant(pool, tenantId, async (client) => {
     const result = await client.query<CarrierConnectionRow>(
       `SELECT id, carrier, external_account_id, status, consecutive_failures, last_failure_at, last_failure_message, created_at
@@ -78,6 +80,7 @@ export default async function CarrierSettingsPage({
         WHERE carrier IN ('royal_mail', 'evri', 'fedex', 'parcelforce', 'ups', 'dhl', 'dpd')
         ORDER BY created_at DESC`,
     );
+    const enabledCarriers = await getEnabledCarriers(client, tenantId);
     return {
       royalMailConnection: result.rows.find((r) => r.carrier === "royal_mail") ?? null,
       evriConnection: result.rows.find((r) => r.carrier === "evri") ?? null,
@@ -86,6 +89,7 @@ export default async function CarrierSettingsPage({
       upsConnection: result.rows.find((r) => r.carrier === "ups") ?? null,
       dhlConnection: result.rows.find((r) => r.carrier === "dhl") ?? null,
       dpdConnection: result.rows.find((r) => r.carrier === "dpd") ?? null,
+      enabledCarriers,
     };
   });
 
@@ -96,6 +100,22 @@ export default async function CarrierSettingsPage({
   const isUpsConnected = upsConnection?.status === "active";
   const isDhlConnected = dhlConnection?.status === "active";
   const isDpdConnected = dpdConnection?.status === "active";
+
+  // Feature-flag gate -- see the enabledCarriers query above and
+  // CarrierNotEnabledNotice below. Only consulted for the "not connected
+  // yet" branch of each carrier's own card: an already-connected carrier's
+  // settings card is unaffected by this flag either way, same "the flag
+  // change takes effect for that tenant's *use*, not by rewriting what
+  // their settings page shows for a carrier they've already connected"
+  // design channel-flags.ts's own precedent (CLAUDE.md §15) already
+  // established.
+  const isRoyalMailEnabled = enabledCarriers.includes("royal_mail");
+  const isEvriEnabled = enabledCarriers.includes("evri");
+  const isFedExEnabled = enabledCarriers.includes("fedex");
+  const isParcelforceEnabled = enabledCarriers.includes("parcelforce");
+  const isUpsEnabled = enabledCarriers.includes("ups");
+  const isDhlEnabled = enabledCarriers.includes("dhl");
+  const isDpdEnabled = enabledCarriers.includes("dpd");
 
   return (
     <main className="page">
@@ -234,8 +254,10 @@ export default async function CarrierSettingsPage({
             )}
             <RoyalMailConnectForm buttonLabel="Reconnect Royal Mail" />
           </div>
-        ) : (
+        ) : isRoyalMailEnabled ? (
           <RoyalMailConnectForm buttonLabel="Connect Royal Mail" />
+        ) : (
+          <CarrierNotEnabledNotice carrier="Royal Mail" />
         )}
       </div>
 
@@ -267,8 +289,10 @@ export default async function CarrierSettingsPage({
             )}
             <EvriConnectForm buttonLabel="Reconnect Evri" />
           </div>
-        ) : (
+        ) : isEvriEnabled ? (
           <EvriConnectForm buttonLabel="Connect Evri" />
+        ) : (
+          <CarrierNotEnabledNotice carrier="Evri" />
         )}
       </div>
 
@@ -298,8 +322,10 @@ export default async function CarrierSettingsPage({
             )}
             <FedExConnectForm buttonLabel="Reconnect FedEx" />
           </div>
-        ) : (
+        ) : isFedExEnabled ? (
           <FedExConnectForm buttonLabel="Connect FedEx" />
+        ) : (
+          <CarrierNotEnabledNotice carrier="FedEx" />
         )}
       </div>
 
@@ -331,8 +357,10 @@ export default async function CarrierSettingsPage({
             )}
             <ParcelforceConnectForm buttonLabel="Reconnect Parcelforce" />
           </div>
-        ) : (
+        ) : isParcelforceEnabled ? (
           <ParcelforceConnectForm buttonLabel="Connect Parcelforce" />
+        ) : (
+          <CarrierNotEnabledNotice carrier="Parcelforce" />
         )}
       </div>
 
@@ -360,8 +388,10 @@ export default async function CarrierSettingsPage({
             )}
             <UpsConnectForm buttonLabel="Reconnect UPS" />
           </div>
-        ) : (
+        ) : isUpsEnabled ? (
           <UpsConnectForm buttonLabel="Connect UPS" />
+        ) : (
+          <CarrierNotEnabledNotice carrier="UPS" />
         )}
       </div>
 
@@ -392,8 +422,10 @@ export default async function CarrierSettingsPage({
             )}
             <DhlConnectForm buttonLabel="Reconnect DHL" />
           </div>
-        ) : (
+        ) : isDhlEnabled ? (
           <DhlConnectForm buttonLabel="Connect DHL" />
+        ) : (
+          <CarrierNotEnabledNotice carrier="DHL" />
         )}
       </div>
 
@@ -424,12 +456,25 @@ export default async function CarrierSettingsPage({
             )}
             <DpdConnectForm buttonLabel="Reconnect DPD" />
           </div>
-        ) : (
+        ) : isDpdEnabled ? (
           <DpdConnectForm buttonLabel="Connect DPD" />
+        ) : (
+          <CarrierNotEnabledNotice carrier="DPD" />
         )}
       </div>
     </main>
   );
+}
+
+/**
+ * Mirrors ChannelNotEnabledNotice (/settings/channels' own page component)
+ * exactly -- see CLAUDE.md's "Carrier Feature Flags" section for the full
+ * design. Only ever shown for a carrier with NO existing connection (see
+ * isXEnabled's own comment above): an already-connected carrier keeps its
+ * normal connected-state card regardless of this flag.
+ */
+function CarrierNotEnabledNotice({ carrier }: { carrier: string }): ReactElement {
+  return <p className="muted">{carrier} isn&apos;t available for your account yet.</p>;
 }
 
 function RoyalMailConnectForm({ buttonLabel }: { buttonLabel: string }): ReactElement {

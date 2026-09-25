@@ -1,0 +1,44 @@
+-- Per-tenant carrier rollout gating -- the same feature migration
+-- 0032_tenants_enabled_channels.sql built for channels, now applied to
+-- carrier_connections (migration 0039). CLAUDE.md's own "Deliberately not
+-- built this pass" paragraph on every carrier section since Royal Mail
+-- (§19.1) has flagged "a real per-tenant carrier feature-flag system
+-- mirroring §15's channel flags" as a standing open item -- this closes it,
+-- picked as the first follow-on task once all 7 originally-requested
+-- carriers were built and merged (§19.7), Arif's own explicit choice among
+-- four options offered.
+--
+-- Why this matters now specifically: with all 7 carriers built and live on
+-- /settings/carriers as of §19.7, any signed-up tenant can already click
+-- "Connect DPD" or "Connect Parcelforce" into infrastructure that has
+-- never round-tripped against real carrier infrastructure once -- the
+-- exact same risk §15's own header comment named for channels
+-- ("Walmart/eBay/Temu/TikTok's wiring is complete but UNVERIFIED"), now
+-- true of every carrier in this layer instead of just some channels.
+--
+-- DEFAULT is every carrier this codebase has a connector for -- so a
+-- tenant who's never had this touched sees IDENTICAL behavior after this
+-- migration as before it (every "Connect X" button on /settings/carriers
+-- still renders). Genuinely additive, same "zero behavior change until a
+-- tenant is explicitly opted out" discipline migrations 0031/0032 already
+-- used.
+--
+-- Deliberately excludes 'hermes' even though carrier_connections' own
+-- CHECK constraint (migration 0039) still allows it as a carrier value --
+-- Hermes was never built as a separate carrier (folded into Evri per
+-- §19.2's own research: Hermes UK rebranded to Evri in 2022), so there is
+-- no connector, no connect route, and no /settings/carriers card for it to
+-- gate. This column's CHECK constraint is intentionally NARROWER than
+-- carrier_connections' own -- it lists only the 7 carriers with a real
+-- connector, not carrier_connections' 8-value historical list.
+--
+-- CHECK (<@, "is contained by") mirrors the app-level ALL_CARRIERS list in
+-- packages/web/src/lib/carrier-flags.ts -- defense-in-depth, same "never
+-- rely on one layer alone" principle CLAUDE.md §6 already applies to
+-- tenant isolation, applied here to input validation (same reasoning
+-- migrations 0031/0032 already give). UPDATE was already GRANTed on
+-- tenants (migration 0010) -- no new GRANT needed.
+ALTER TABLE tenants
+  ADD COLUMN enabled_carriers TEXT[] NOT NULL
+    DEFAULT ARRAY['royal_mail', 'evri', 'fedex', 'parcelforce', 'ups', 'dhl', 'dpd']
+  CHECK (enabled_carriers <@ ARRAY['royal_mail', 'evri', 'fedex', 'parcelforce', 'ups', 'dhl', 'dpd']);
