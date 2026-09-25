@@ -4060,6 +4060,51 @@ own closing paragraph already gives); and any confirmed Evri/Sapient surcharge o
 base-price data to replace `getRateEstimate()`'s current empty-list return. (FedEx
 of that list is no longer unbuilt — see §19.3, immediately below.)
 
+**Update — a real, direct Evri-owned API path exists after all, found via a later
+research pass prompted by Arif's own search; the original "Evri publishes no
+self-serve API of any kind" framing above was too strong.** Cross-confirmed across
+FOUR independent, non-copying integration platforms that all connect to Evri for
+their own customers — ShipEngine, Shiptheory, Starshipit, AfterShip — plus a
+dedicated Evri API integration guide (paul-walsh.co.uk, the same author already
+cited as a source for this codebase's own Royal Mail research, §19.1): Evri
+provisions real, direct credentials — **Client ID, Client Secret, a username and
+password, and (separately, for tracking) a Tracking API Key/Client ID/Secret** —
+to a business once it has an **"EVRi Corporate" account**, requested from a real
+Evri Account Manager or integration team, not self-serve. None of these four
+sources mentions Intersoft, Sapient, or any third-party gateway at all — the
+credentials flow directly from Evri to the integrating business. Per paul-walsh.co.uk:
+auth is OAuth2 client_credentials (Client ID + Client Secret exchanged for a
+Bearer token, "included in the header of every subsequent API request" — the
+same shape `EvriConnector.authenticate()` already implements against Sapient's
+own host, just pointed at the wrong one), a real sandbox environment exists with
+separate test credentials, and eligibility carries a real (unpublished) minimum
+shipment-volume threshold plus a requirement to get test labels approved by Evri
+before production access opens — narrower gating than Sapient's own advertised
+"free sandbox for anyone," but a direct relationship with no reseller.
+
+**What this means in practice, stated plainly rather than glossed over**: this
+codebase's `EvriConnector` was built and is still wired against Intersoft
+Sapient (§19.2's own main research trail above, unchanged and still accurate for
+what it documents) — a legitimate, real, working path, just not the only one, and
+not confirmed to be the cheapest or fastest one. A genuinely direct Evri
+integration is a SEPARATE credential set and (per the little that's confirmed)
+likely a different base URL/host than Sapient's own — none of the five sources
+found this pass rendered the literal request/response shape or endpoint paths for
+Evri's own direct API, only its credential field names and auth mechanism, so
+switching `EvriConnector` to talk to Evri directly instead of via Sapient is NOT
+attempted here — it would mean re-deriving the request/response shape from
+scratch against a source this pass didn't find, the same "don't guess a shape
+with no confirmed source" discipline this file holds everywhere else. **Arif's own
+call, not decided here**: pursue Evri's own direct EVRi Corporate account (likely
+better long-term — no reseller markup, but sales-gated with an unpublished volume
+threshold and a test-label approval step) instead of, or alongside, the Intersoft
+Sapient path already documented above. If Arif gets real EVRi Corporate
+credentials before Sapient ones, the honest next step is researching the real
+endpoint/request shape for Evri's own direct API properly (the same disciplined
+pass every other connector in this file got) before building anything against it
+— not retrofitting Sapient's own confirmed shape onto a different host and
+hoping it matches.
+
 ### 19.3 FedEx — carrier #3, built via FedEx's own direct, fully public REST API
 
 **Why FedEx, and why it's this codebase's best-sourced carrier connector so far**:
