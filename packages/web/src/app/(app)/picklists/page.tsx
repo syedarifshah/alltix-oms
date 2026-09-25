@@ -2,6 +2,7 @@ import type { ReactElement } from "react";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { withTenant } from "@alltix/db";
+import type { RateEstimate } from "@alltix/carrier-connectors";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
@@ -91,7 +92,31 @@ interface PackedOrderRow {
 }
 
 interface PicklistsPageProps {
-  searchParams: Promise<{ error?: string }>;
+  searchParams: Promise<{ error?: string; rateQuoteOrderId?: string; rateQuoteCarrier?: string; rateQuote?: string }>;
+}
+
+/** Parses the redirect-carried live-rate-quote query params (see
+ *  /api/orders/[id]/carrier-rate-estimate's own doc comment for why the
+ *  quote travels this way instead of a session/flash mechanism this
+ *  codebase doesn't have). Deliberately permissive on a malformed/tampered
+ *  `rateQuote` param -- returns null rather than throwing, since this is
+ *  just a redirect-carried display value, not something any real mutation
+ *  or auth decision depends on. */
+function parseRateQuote(params: { rateQuoteOrderId?: string; rateQuoteCarrier?: string; rateQuote?: string }): {
+  orderId: string;
+  carrierDisplayName: string;
+  estimates: RateEstimate[];
+} | null {
+  if (!params.rateQuoteOrderId || !params.rateQuoteCarrier || !params.rateQuote) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(params.rateQuote);
+    if (!Array.isArray(parsed)) return null;
+    return { orderId: params.rateQuoteOrderId, carrierDisplayName: params.rateQuoteCarrier, estimates: parsed as RateEstimate[] };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -115,7 +140,9 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
 
   const pool = getAppPool();
   const tenantId = await resolveTenantId(pool, authContext.clerkUserId);
-  const { error } = await searchParams;
+  const resolvedSearchParams = await searchParams;
+  const { error } = resolvedSearchParams;
+  const rateQuote = parseRateQuote(resolvedSearchParams);
 
   if (!tenantId) {
     return (
@@ -442,11 +469,12 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
                     <button type="submit">Generate label &amp; confirm shipment</button>
                     <p className="muted" style={{ margin: 0 }}>
                       UNVERIFIED against real carrier infrastructure — see <a href="/settings/carriers">Carriers</a>.
-                      All seven carriers still require the amount actually charged to be entered by hand: Royal Mail,
-                      Evri, Parcelforce, and DPD expose no live rate-shopping endpoint at all, and FedEx's, UPS's, and
-                      DHL's own live rate endpoints (§19.3/§19.5/§19.6) aren't called from this form yet. DHL also has
-                      no cancel/void-shipment operation at all (confirmed carrier-level limitation, not just
-                      unbuilt), and neither does DPD (no confirmed Sapient endpoint found, same as Evri).
+                      All seven carriers still require the amount actually charged to be entered by hand here: Royal
+                      Mail, Evri, Parcelforce, and DPD expose no live rate-shopping endpoint at all, and FedEx&apos;s,
+                      UPS&apos;s, and DHL&apos;s own live rates (§19.3/§19.5/§19.6) are available below as a separate
+                      &quot;Get a live rate estimate&quot; lookup, not auto-filled into this field. DHL also has no
+                      cancel/void-shipment operation at all (confirmed carrier-level limitation, not just unbuilt),
+                      and neither does DPD (no confirmed Sapient endpoint found, same as Evri).
                     </p>
                   </form>
                 </details>
@@ -456,6 +484,58 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
                   <a href="/settings/carriers">Carriers</a> to generate a real label instead of typing in a tracking
                   number by hand.
                 </p>
+              )}
+              {(connectedCarriers.fedex || connectedCarriers.ups || connectedCarriers.dhl) && (
+                <details style={{ marginTop: 8 }}>
+                  <summary>Get a live rate estimate (FedEx/UPS/DHL only)</summary>
+                  <form
+                    action={`/api/orders/${o.id}/carrier-rate-estimate`}
+                    method="POST"
+                    className="row"
+                    style={{ marginTop: 8, flexWrap: "wrap" }}
+                  >
+                    <select name="carrier" required>
+                      {connectedCarriers.fedex && <option value="fedex">FedEx</option>}
+                      {connectedCarriers.ups && <option value="ups">UPS</option>}
+                      {connectedCarriers.dhl && <option value="dhl">DHL</option>}
+                    </select>
+                    <input type="number" name="weightGrams" min={1} max={30000} placeholder="Weight (grams)" required />
+                    <input type="text" name="countryCode" defaultValue="GB" placeholder="Destination country code" required />
+                    <button type="submit">Get rate</button>
+                  </form>
+                  <p className="muted" style={{ margin: "4px 0 0" }}>
+                    A real live call to the carrier&apos;s own rate-shopping endpoint (CLAUDE.md §19.3/§19.5/§19.6) —
+                    not auto-filled into &quot;Shipping cost charged&quot; above; read the result below and type it in
+                    by hand.
+                  </p>
+                </details>
+              )}
+              {rateQuote && rateQuote.orderId === o.id && (
+                <div className="card" style={{ marginTop: 8 }}>
+                  <strong>
+                    {rateQuote.carrierDisplayName} rate estimate{rateQuote.estimates.length === 0 ? " — no services returned" : ""}
+                  </strong>
+                  {rateQuote.estimates.length > 0 && (
+                    <table style={{ marginTop: 6 }}>
+                      <thead>
+                        <tr>
+                          <th>Service</th>
+                          <th>Estimated cost (GBP)</th>
+                          <th>Surcharges included</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {rateQuote.estimates.map((est, i) => (
+                          <tr key={`${est.serviceCode}-${i}`}>
+                            <td>{est.serviceName}</td>
+                            <td>£{est.estimatedCostGbp}</td>
+                            <td>{est.surchargesApplied ? "yes" : "no"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
               )}
               {o.channel === "amazon" && (
                 <p className="muted" style={{ marginTop: 6, marginBottom: 0 }}>

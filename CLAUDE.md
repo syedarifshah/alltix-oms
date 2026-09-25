@@ -64,7 +64,11 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
   Evri's/DPD's own `trackShipment()` architectural mismatch, recommended and
   Arif's own explicit pick ("Sapient webhook receiving (Recommended)") among a
   second round of open follow-on items via AskUserQuestion, once carrier
-  feature-flags closed out the first round — is now built too, see §19.9.
+  feature-flags closed out the first round — is now built too, see §19.9. FedEx's/
+  UPS's/DHL's own real live rate calls are now wired into `/picklists` too — the
+  next genuinely buildable-now item once Sapient webhook receiving closed out its
+  own round (real Parcelforce manifest generation and real carrier credentials both
+  still need Arif's own vendor-facing action first) — see §19.10.
 
 Do not expand this scope without an explicit decision — every module below assumes it.
 
@@ -3951,6 +3955,9 @@ carrier" plan) really does generalize:
   rate" button into that form is a genuinely separate, additive piece of UI work,
   not a small extension of this pass's own "add a third carrier to the existing
   dispatch map" scope — flagged here so it isn't mistaken for an oversight.
+  **Update — now wired, see §19.10**: `/picklists` gained a separate "Get a live
+  rate estimate" lookup once all three of FedEx's/UPS's/DHL's own live rate calls
+  could be wired together as one small feature.
 
 **UNVERIFIED IN PRACTICE, same status Royal Mail and Evri each carried before their
 own first live pass**: no real FedEx Project API Key/Secret or account number
@@ -4330,7 +4337,7 @@ per carrier" plan) really does generalize:
   real live rate-shopping call is not invoked anywhere in the app yet — same
   "genuinely separate, additive piece of UI work" scope note FedEx's own
   unwired live rate call already carries (§19.3), now true of a second carrier
-  too.
+  too. **Update — now wired, see §19.10**, alongside FedEx's and DHL's own.
 
 **UNVERIFIED IN PRACTICE, same status every other carrier in this layer carried
 before its own first live pass**: no real UPS Client ID/Secret or UPS account
@@ -4501,7 +4508,9 @@ plan) really does generalize:
 - **Deliberately NOT wired this pass**: `DhlConnector.getRateEstimate()`'s own real
   live rate-shopping call is not invoked anywhere in the app yet — same "genuinely
   separate, additive piece of UI work" scope note FedEx's and UPS's own unwired live
-  rate calls already carry (§19.3/§19.5), now true of a third carrier too.
+  rate calls already carry (§19.3/§19.5), now true of a third carrier too. **Update
+  — now wired, see §19.10**, once all three carriers' live rate calls could be
+  wired together as one small feature.
 
 **UNVERIFIED IN PRACTICE, same status every other carrier in this layer carried
 before its own first live pass**: no real DHL Express API key/secret, account
@@ -4962,11 +4971,93 @@ assumptions, rather than guessing twice.
 **Deliberately not built this pass**, same "don't expand scope without an explicit
 decision" rule as every other carrier section's own closing paragraph: real
 Parcelforce manifest generation (§19.4, still open); wiring FedEx's/UPS's/DHL's own
-real live rate calls into `/picklists` (§19.3/§19.5/§19.6, still open); retry/
-circuit-breaker wiring mirroring §4.4 (still no scheduler job exists for any
-carrier in this layer); and obtaining real credentials for any of the 7 carriers or
-for Sapient itself, all of which need Arif's own vendor-facing action, not more of
-this codebase's own code.
+real live rate calls into `/picklists` (§19.3/§19.5/§19.6, still open at the time —
+now built, see §19.10); retry/circuit-breaker wiring mirroring §4.4 (still no
+scheduler job exists for any carrier in this layer); and obtaining real credentials
+for any of the 7 carriers or for Sapient itself, all of which need Arif's own
+vendor-facing action, not more of this codebase's own code.
+
+### 19.10 Live Rate Estimates Wired into `/picklists` (FedEx, UPS, DHL)
+
+**Status: built.** §19.3's, §19.5's, and §19.6's own "Deliberately NOT wired this
+pass" paragraphs each flagged the same gap separately as each connector was built:
+`FedExConnector`/`UpsConnector`/`DhlConnector` all implement a real, confirmed live
+`getRateEstimate()` call (§19.3/§19.5/§19.6's own research trails), but nothing in
+the app ever invoked it — every carrier's "Ship via connected carrier" form on
+`/picklists` still asked the tenant to type `shippingCostChargedGbp` in by hand,
+even for the three carriers technically capable of a live quote. Once real Sapient
+webhook receiving (§19.9) closed out that round's own recommended pick, this was
+the next genuinely buildable-now item among the remaining open carrier-layer work
+(the others — real Parcelforce manifest generation, and real credentials for any
+carrier — both need Arif's own vendor-facing action first, not more of this
+codebase's own code) — recommended and built directly on that reasoning, the same
+"pick among what's buildable without an external blocker" logic that made Sapient
+webhook receiving the prior round's own pick.
+
+**Why a separate route, not a parameter on `ship-via-carrier`**: a rate estimate is
+a read-only call — no shipment is created, no label costs real money, no order
+state changes — so it doesn't belong behind the same order-status/carrier-
+connection mutation path a real label-generating POST does. It also only needs the
+`{weightGrams, destinationCountryCode, shipDate}` triple `CarrierConnector.
+getRateEstimate()`'s own interface already takes (`connector.ts`), genuinely less
+than `ship-via-carrier`'s own recipient-address/service-code fields — its own small
+form, not a "preview" step bolted onto the existing one.
+
+**Built**: `POST /api/orders/[id]/carrier-rate-estimate`
+(`packages/web/src/app/api/orders/[id]/carrier-rate-estimate/route.ts`) — same
+"verify the caller, rate-limit, gate on the carrier feature flag" ordering every
+other mutation route in this app follows (§16), dispatching to whichever of
+`FedExConnector`/`UpsConnector`/`DhlConnector` the tenant picks via a small
+`RATE_ESTIMATE_CONNECTORS` map (deliberately NOT the same `CARRIER_CONNECTORS` map
+`ship-via-carrier`'s own route already has — this one only ever lists the three
+carriers with a real live rate endpoint, so a carrier with no live rates, like Royal
+Mail or Evri, was never a case this route needed to special-case or reject at
+runtime; it simply isn't in the map). Only FedEx/UPS/DHL are ever offered on
+`/picklists`' own new "Get a live rate estimate" form, gated the same "only render
+what the tenant has an active connection for" discipline every other carrier
+control on that page already uses.
+
+**Deliberately no client-side auto-fill**: this app has no client JS anywhere
+(`/hr`, `/locations`, `/products`, and every carrier form on `/picklists` itself all
+use the same plain form-POST-then-redirect convention) — there is no in-browser way
+to copy a returned quote into `ship-via-carrier`'s own `shippingCostChargedGbp`
+field without introducing exactly the client-side scripting this codebase has
+deliberately avoided everywhere else. The quote instead travels back via a
+redirect's own `rateQuoteOrderId`/`rateQuoteCarrier`/`rateQuote` (a JSON-encoded
+`RateEstimate[]`) query params — the same "state travels in the redirect URL, the
+page reads `searchParams`" shape `redirectWithError`'s own `?error=` convention
+already establishes, just carrying a small JSON payload instead of a single string
+— and `/picklists` renders it as a plain read-only table next to the ONE order
+card whose id matches `rateQuoteOrderId`, for the tenant to read and type in by
+hand. `parseRateQuote()` (the page's own new helper) is deliberately permissive on
+a malformed/tampered `rateQuote` param — returns `null` rather than throwing, since
+nothing about this value drives a mutation or an auth decision, only a display.
+
+**Tests**: no new dedicated test file — this route's own logic (dispatch to one of
+three connectors, the carrier feature-flag gate, the redirect-carried JSON payload)
+has no pure decision function worth extracting the way `sapient-webhook.ts`'s own
+parser did (§19.9), and — same reasoning §17's own audit-log pass gives for every
+carrier-credential-writing route — it makes a real network call to a live carrier
+rate endpoint before ever reaching the redirect, and every one of FedEx's/UPS's/
+DHL's own connectors is already documented elsewhere in this codebase as
+UNVERIFIED IN PRACTICE against real infrastructure, so an e2e test through the
+real route would either need to fake that network call or would never get past it.
+Verified via `npx tsc --noEmit -p .` (clean) and `next build` (clean — the new
+route and the updated `/picklists` page both compile).
+
+**UNVERIFIED IN PRACTICE, same status every other carrier feature in this layer
+carries**: no real FedEx/UPS/DHL credentials exist anywhere in this codebase or
+Arif's account yet, so this route's own live network call has never actually
+round-tripped against real carrier infrastructure.
+
+**Deliberately not built this pass**: real Parcelforce manifest generation (§19.4,
+still open); retry/circuit-breaker wiring mirroring §4.4 (still no scheduler job
+exists for any carrier in this layer — this route's own outbound calls DO already
+go through `fetchWithBackoff`'s in-process retry, the same wrapper every carrier
+connector's own fetch calls already use, but the cross-run circuit-breaker half of
+§4.4 — tripping and recording a connection-level failure state — is still open);
+and obtaining real credentials for any of the 7 carriers, which needs Arif's own
+vendor-facing action, not more of this codebase's own code.
 
 ---
 
