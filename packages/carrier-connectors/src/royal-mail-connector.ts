@@ -122,6 +122,26 @@ import type {
  * echoed them all back unchanged), `voidShipment()`, and `trackShipment()`
  * remain otherwise as originally built. Not yet re-attempted against a
  * real order since this fix.
+ *
+ * **Update, 25 Sept 2026 -- a second real rejection, on the very next
+ * attempt after the recipient/contents fix above shipped, found a THIRD
+ * bug -- this one outside this class entirely.** Royal Mail rejected the
+ * retry with errorCode 97, `"When value 'SKU' is provided values
+ * 'UnitValue' and 'UnitWeightInGrams' should either be both provided or
+ * both excluded from request"`, against every `packages[].contents[]`
+ * entry. This class's own `createShipment()` above was never the problem --
+ * it faithfully forwards whatever `unitWeightGrams` a caller supplies on
+ * `ShipmentPackageItem` (always has). The real bug was one level up, in
+ * this connector's only real caller,
+ * `packages/web/src/app/api/orders/[id]/ship-via-carrier/route.ts`: that
+ * route always sends `sku`/`unitValueGbp` for every line but never
+ * populated `unitWeightGrams` at all, since no per-item weight exists
+ * anywhere in this schema (only a single package-level weight, typed into
+ * the form). Fixed at that call site, not here -- see that route's own doc
+ * comment for the approximation used (splitting the package's own total
+ * weight evenly across every unit). Documented here too since it's the
+ * kind of caller-side gap a future carrier connector's own real caller
+ * could reproduce identically.
  */
 
 const CLICK_AND_DROP_BASE_URL = "https://api.parcel.royalmail.com/api/v1";

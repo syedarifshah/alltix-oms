@@ -181,6 +181,28 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     const subtotal = order.lines.reduce((sum, line) => sum + Number(line.unit_price) * line.quantity, 0);
     const total = subtotal + Number(shippingCostChargedGbp || "0");
 
+    // A real production bug, found via Arif's own second live Royal Mail
+    // shipment attempt: Royal Mail rejects a package content line with
+    // errorCode 97 ("When value 'SKU' is provided values 'UnitValue' and
+    // 'UnitWeightInGrams' should either be both provided or both excluded
+    // from request") whenever `sku`/`unitValueGbp` are sent without a
+    // per-item weight -- and this route always sends both `sku` and
+    // `unitValueGbp` (below) but had no per-item weight to send at all: no
+    // column in this schema carries a per-line weight (see this route's own
+    // class doc comment on why address/weight are typed into this form
+    // rather than resolved from richer data), only this form's own single
+    // package-level `weightGrams`. Rather than drop `sku`/`unitValueGbp`
+    // (real, useful customs/manifest data) to dodge the rule, this
+    // approximates a per-unit weight by splitting the package's own total
+    // weight evenly across every unit in it -- an honest approximation, not
+    // real per-item weight data, but one that satisfies the carrier's own
+    // validation without fabricating a number pulled from nowhere. A
+    // genuinely per-line weight would need a real schema change (a weight
+    // column on `order_lines` or `products`), not attempted here.
+    const totalQuantity = order.lines.reduce((sum, line) => sum + line.quantity, 0);
+    const approximateUnitWeightGrams =
+      totalQuantity > 0 ? Math.max(1, Math.round(weightGrams / totalQuantity)) : undefined;
+
     const connector = await carrierConfig.createConnector(pool, user.tenantId);
 
     // Cross-run circuit-breaker (CLAUDE.md §4.4's carrier-layer counterpart,
@@ -207,6 +229,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
               sku: line.internal_sku ?? undefined,
               quantity: line.quantity,
               unitValueGbp: Number(line.unit_price).toFixed(2),
+              unitWeightGrams: approximateUnitWeightGrams,
             })),
           },
         ],

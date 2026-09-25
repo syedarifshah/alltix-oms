@@ -3728,17 +3728,44 @@ uncovering the next problem:
   assertion is now `contents`; new assertions cover `recipient.address.fullName`/
   `recipient.address.postcode`/`recipient.phoneNumber`/`recipient.emailAddress`
   explicitly, so a regression back to the flat shape would fail loudly).
-- **Not yet re-attempted against a real order since this fix** — `verifyConnection()`
-  and the request's own top-level fields (`orderReference`/`subtotal`/
+- The request's own top-level fields (`orderReference`/`subtotal`/
   `shippingCostCharged`/`total`/`currencyCode`/`packages`/`postageDetails`, all
   confirmed correct by the same live rejection, since Royal Mail echoed them all
   back unchanged) remain proven; `voidShipment()`/`trackShipment()` remain
-  unverified as before. The next step is the same as before this update: a real
-  shipment attempt through `/picklists`, now with the corrected `recipient` shape.
-  Verified this pass: `npx tsx --test
-  packages/carrier-connectors/test/royal-mail-connector.test.ts` (12/12 pass),
-  `npm run typecheck --workspaces` clean across all eleven workspaces, `next build`
-  clean, `bash scripts/run-tests.sh` — all 63 test files pass.
+  unverified as before.
+
+**Update — a THIRD bug, found on the very next attempt right after the fix above
+shipped, this one outside `RoyalMailConnector` entirely**: Arif retried the same
+shipment form immediately. Royal Mail rejected it again, a genuinely different
+error this time — errorCode 97, `"When value 'SKU' is provided values 'UnitValue'
+and 'UnitWeightInGrams' should either be both provided or both excluded from
+request"`, against every `packages[].contents[]` entry. `RoyalMailConnector.
+createShipment()` itself was never the bug here — it faithfully forwards whatever
+`unitWeightGrams` a caller supplies. The real bug was one level up, in this
+connector's only real caller, `packages/web/src/app/api/orders/[id]/
+ship-via-carrier/route.ts`: that route always sends `sku`/`unitValueGbp` for every
+line item (real, useful customs/manifest data, read straight off `order_lines`/
+`products`) but never populated `unitWeightGrams` at all — no column anywhere in
+this schema carries a per-line weight, only this route's own form's single
+package-level `weightGrams`. **Fixed**: rather than drop `sku`/`unitValueGbp` to
+dodge the rule, the route now approximates a per-unit weight by splitting the
+package's own total weight evenly across every unit in the order (`Math.max(1,
+Math.round(weightGrams / totalQuantity))`) — an honest, documented approximation,
+not real per-item weight data (a genuinely per-line weight would need a real
+schema change, not attempted here), but one that satisfies Royal Mail's own
+validation without fabricating a number pulled from nowhere.
+`RoyalMailConnector`'s own class doc comment was updated to record this third bug
+and point at the route as where it was actually fixed, so a future carrier
+connector's own real caller reproducing the identical caller-side gap isn't a
+surprise. Not yet re-attempted against a real order since this fix. Verified this
+pass: `npm run typecheck --workspaces` clean across all eleven workspaces, `next
+build` clean, `bash scripts/run-tests.sh` — all 63 test files pass (this fix has
+no dedicated new test — it's a plain arithmetic computation in a route with no
+pure-function extraction elsewhere in this file, same "no test file, verified via
+typecheck/build" precedent several of this route's own sibling routes already
+carry). The next step is unchanged from before: a real shipment attempt through
+`/picklists`, now with both the corrected `recipient` shape and a real
+`unitWeightGrams` on every item.
 
 ### 19.2 Evri (formerly Hermes) — carrier #2, built via the Sapient/Intersoft CORE API gateway
 
