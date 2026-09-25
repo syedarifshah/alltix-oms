@@ -131,6 +131,17 @@ test("createShipment sends a Bearer-authorized POST /orders with the confirmed r
     assert.equal(capturedBody.items[0].recipient.emailAddress, SAMPLE_REQUEST.recipient.email);
     assert.equal(capturedBody.items[0].recipient.address.phoneNumber, undefined);
     assert.equal(capturedBody.items[0].recipient.address.emailAddress, undefined);
+    // `billing` must always be sent, mirroring `recipient`'s own address --
+    // see createShipment()'s own doc comment for the fourth real production
+    // bug this corrects (Royal Mail rejected an order with no `billing` at
+    // all on four separate Billing.Address.* "required" errors).
+    assert.equal(capturedBody.items[0].billing.address.fullName, SAMPLE_REQUEST.recipient.name);
+    assert.equal(capturedBody.items[0].billing.address.addressLine1, SAMPLE_REQUEST.recipient.addressLine1);
+    assert.equal(capturedBody.items[0].billing.address.city, SAMPLE_REQUEST.recipient.city);
+    assert.equal(capturedBody.items[0].billing.address.postcode, SAMPLE_REQUEST.recipient.postalCode);
+    assert.equal(capturedBody.items[0].billing.address.countryCode, SAMPLE_REQUEST.recipient.countryCode);
+    assert.equal(capturedBody.items[0].billing.phoneNumber, SAMPLE_REQUEST.recipient.phone);
+    assert.equal(capturedBody.items[0].billing.emailAddress, SAMPLE_REQUEST.recipient.email);
 
     assert.equal(result.carrierOrderId, "123456");
     assert.equal(result.trackingNumber, "RM123456789GB");

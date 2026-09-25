@@ -142,6 +142,27 @@ import type {
  * weight evenly across every unit). Documented here too since it's the
  * kind of caller-side gap a future carrier connector's own real caller
  * could reproduce identically.
+ *
+ * **Update, 25 Sept 2026 -- a fourth bug, found on the immediate next
+ * retry after the weight fix above, this one back inside this class.**
+ * Once `packages[].contents[]` passed validation, Royal Mail's response
+ * moved on to reject the order on FOUR `Billing.Address.*` errors (city,
+ * addressLine1, full-name-or-company-name, UK postcode all "required") --
+ * this connector had never sent a `billing` object at all. Re-fetching the
+ * official swagger's own `BillingDetailsRequest` definition afterward
+ * shows its own description says billing is only required "when 'Use
+ * shipping address for billing address' setting is set to 'false' and
+ * 'Recipient.AddressBookReference' is provided" -- neither condition
+ * applies here (this connector never sends an AddressBookReference at
+ * all), yet the real, live account rejected the order anyway. Rather than
+ * chase down that account-level setting, `createShipment()` now always
+ * sends `billing` mirroring `recipient`'s own address (same nested
+ * `address`/`fullName`/`postcode` shape, plus sibling `phoneNumber`/
+ * `emailAddress`) -- the same outcome "use shipping address for billing
+ * address" would produce, and the only sane default available: this
+ * connector's own `CreateShipmentRequest` (and `ship-via-carrier`'s own
+ * form) collects one address, not two. Not yet re-attempted against a real
+ * order since this fix.
  */
 
 const CLICK_AND_DROP_BASE_URL = "https://api.parcel.royalmail.com/api/v1";
@@ -286,6 +307,12 @@ export class RoyalMailConnector implements CarrierConnector {
    * bug caught by the same rejection and the same swagger re-fetch) is
    * fixed alongside it.
    *
+   * **`billing` -- added after a fourth real rejection, see this class's
+   * own doc comment for the full trace.** Always sent, mirroring
+   * `recipient`'s own address/phoneNumber/emailAddress -- the sane default
+   * when this connector's own `CreateShipmentRequest` has no separate
+   * billing-address concept.
+   *
    * A REAL, DOCUMENTED SPLIT OUTCOME worth being explicit about: Royal
    * Mail's own response can report the order itself created successfully
    * while `labelErrors` is non-empty (label generation failed
@@ -309,6 +336,30 @@ export class RoyalMailConnector implements CarrierConnector {
           total: request.totalGbp,
           currencyCode: "GBP",
           recipient: {
+            address: {
+              fullName: request.recipient.name,
+              addressLine1: request.recipient.addressLine1,
+              addressLine2: request.recipient.addressLine2,
+              city: request.recipient.city,
+              postcode: request.recipient.postalCode,
+              countryCode: request.recipient.countryCode,
+            },
+            phoneNumber: request.recipient.phone,
+            emailAddress: request.recipient.email,
+          },
+          // `billing` -- see this method's own doc comment (the 25 Sept 2026
+          // update, third real production bug) for why this is sent at all:
+          // Royal Mail's own swagger describes `billing` as required only
+          // when a specific account setting is off AND an AddressBookReference
+          // is used -- neither applies here (this connector never sends an
+          // AddressBookReference), yet a real order was rejected with
+          // Billing.Address.* errors regardless. Rather than guess at that
+          // account setting, this mirrors `recipient`'s own address as the
+          // billing address -- the same outcome "use shipping address for
+          // billing address" would produce, and the only sane default when
+          // this v1 form (ship-via-carrier's own route) collects no separate
+          // billing address at all.
+          billing: {
             address: {
               fullName: request.recipient.name,
               addressLine1: request.recipient.addressLine1,

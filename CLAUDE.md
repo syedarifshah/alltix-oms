@@ -3763,9 +3763,38 @@ build` clean, `bash scripts/run-tests.sh` — all 63 test files pass (this fix h
 no dedicated new test — it's a plain arithmetic computation in a route with no
 pure-function extraction elsewhere in this file, same "no test file, verified via
 typecheck/build" precedent several of this route's own sibling routes already
-carry). The next step is unchanged from before: a real shipment attempt through
-`/picklists`, now with both the corrected `recipient` shape and a real
-`unitWeightGrams` on every item.
+carry).
+
+**Update — a FOURTH bug, found on the immediate next retry after the weight fix
+above, this one back inside `RoyalMailConnector` itself**: once
+`packages[].contents[]` passed validation, Royal Mail's response moved on to a
+different rejection entirely — four `Billing.Address.*` "required" errors
+(`City`, `AddressLine1`, "at least FullName or CompanyName", "UK postcode
+required"). `createShipment()` had never sent a `billing` object at all.
+Re-fetching the official swagger's own `BillingDetailsRequest` definition
+afterward shows its own description says billing is only required "when 'Use
+shipping address for billing address' setting is set to 'false' and
+'Recipient.AddressBookReference' is provided" — neither condition applies here
+(this connector never sends an `AddressBookReference`), yet the real, live
+account rejected the order anyway; the swagger's own stated condition and the
+real account's actual behavior disagree, and the real behavior is what matters.
+**Fixed**: rather than chase down that account-level setting, `createShipment()`
+now always sends `billing` mirroring `recipient`'s own address (same nested
+`address`/`fullName`/`postcode` shape, plus sibling `phoneNumber`/
+`emailAddress`) — the same outcome "use shipping address for billing address"
+would produce, and the only sane default available, since neither
+`CreateShipmentRequest` nor `ship-via-carrier`'s own form collects a separate
+billing address. `royal-mail-connector.test.ts` gained matching assertions
+(`billing.address.fullName`/`postcode`/etc., `billing.phoneNumber`/
+`emailAddress`) so a regression back to "no billing sent at all" would fail
+loudly. Verified this pass: `npx tsx --test
+packages/carrier-connectors/test/royal-mail-connector.test.ts` (12/12 pass),
+`npm run typecheck --workspaces` clean across all twelve workspaces, `next build`
+clean, `bash scripts/run-tests.sh` — all 63 test files pass. Not yet
+re-attempted against a real order since this fix — the next step is unchanged
+from before: a real shipment attempt through `/picklists`, now with the
+corrected `recipient` shape, a real `unitWeightGrams` on every item, and a real
+`billing` object.
 
 ### 19.2 Evri (formerly Hermes) — carrier #2, built via the Sapient/Intersoft CORE API gateway
 
