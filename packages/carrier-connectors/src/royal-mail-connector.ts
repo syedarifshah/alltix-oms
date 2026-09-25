@@ -161,8 +161,16 @@ import type {
  * `emailAddress`) -- the same outcome "use shipping address for billing
  * address" would produce, and the only sane default available: this
  * connector's own `CreateShipmentRequest` (and `ship-via-carrier`'s own
- * form) collects one address, not two. Not yet re-attempted against a real
- * order since this fix.
+ * form) collects one address, not two.
+ *
+ * **Update, 25 Sept 2026 -- a fifth real attempt, and real progress: Royal
+ * Mail created a genuine order (1002) with no rejection at all**
+ * (`labelErrors: []`), but no `trackingNumber` in the response either --
+ * see `createShipment()`'s own doc comment for the fix (`label.
+ * includeLabelInResponse: true`, confirmed via the official swagger's
+ * `LabelGenerationRequest` definition, and its own real, unconfirmed "OBA
+ * customers only" caveat). Not yet re-attempted against a real order since
+ * this fix.
  */
 
 const CLICK_AND_DROP_BASE_URL = "https://api.parcel.royalmail.com/api/v1";
@@ -313,6 +321,28 @@ export class RoyalMailConnector implements CarrierConnector {
    * when this connector's own `CreateShipmentRequest` has no separate
    * billing-address concept.
    *
+   * **`label: {includeLabelInResponse: true}` -- added after a FIFTH real
+   * attempt, this one not a rejection at all: Royal Mail created a real
+   * order (1002) with `labelErrors: []` (no error) and NO `trackingNumber`
+   * field in the response whatsoever.** Re-fetching the official swagger's
+   * own `CreateOrderRequest`/`LabelGenerationRequest` definitions afterward
+   * confirms why: whether a label/tracking number is generated
+   * SYNCHRONOUSLY in the create-order response is gated by a separate
+   * `label` request object (distinct from `postageDetails`), whose own
+   * `includeLabelInResponse` boolean this connector never set -- so it
+   * defaulted to no synchronous generation at all, order created and
+   * nothing more. This is now always sent as `{includeLabelInResponse:
+   * true}`. **A real, confirmed caveat, not silently glossed over**:
+   * `LabelGenerationRequest`'s own swagger description says it is
+   * "Reserved for OBA customers only" (same reservation `GET
+   * /orders/{id}/label` itself carries) -- whether Arif's real Click & Drop
+   * account has OBA (On Business Account) status is unconfirmed. If it
+   * doesn't, this field will most likely surface as a new, clearer
+   * rejection on the next attempt (visible in full, per Bug #1's own fix
+   * above) rather than a silent no-op -- which is itself useful
+   * information, not a wasted attempt: it would mean the honest fix is
+   * requesting OBA status from Royal Mail, not more code here.
+   *
    * A REAL, DOCUMENTED SPLIT OUTCOME worth being explicit about: Royal
    * Mail's own response can report the order itself created successfully
    * while `labelErrors` is non-empty (label generation failed
@@ -372,6 +402,11 @@ export class RoyalMailConnector implements CarrierConnector {
             emailAddress: request.recipient.email,
           },
           postageDetails: request.serviceCode ? { serviceCode: request.serviceCode } : undefined,
+          // `label.includeLabelInResponse` -- see this method's own doc
+          // comment (the fifth real attempt) for why this is sent at all:
+          // without it, Royal Mail creates the order but never generates a
+          // label or a tracking number synchronously at all.
+          label: { includeLabelInResponse: true },
           packages: request.packages.map((pkg) => ({
             weightInGrams: pkg.weightGrams,
             packageFormatIdentifier: pkg.packageFormat,

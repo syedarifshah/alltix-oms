@@ -3818,6 +3818,34 @@ extraction, same precedent the per-item-weight fix above already set). The next
 step: retry the same order — the raw response this time should finally reveal
 *why* Royal Mail didn't return a tracking number for order 1001.
 
+**Update — the raw response worked exactly as intended: real progress, a fifth
+real bug found and fixed, this one not a rejection at all.** The next retry
+created another genuine order (1002) with `labelErrors: []` (no error reported)
+and simply no `trackingNumber` field anywhere in the response — `{orderIdentifier:
+1002, orderReference, createdOn, orderDate, packages: [{packageNumber: 1}],
+labelErrors: [], generatedDocuments: []}`. Re-fetching the official swagger's own
+`CreateOrderRequest`/`LabelGenerationRequest` definitions afterward explains why:
+whether a label/tracking number is generated SYNCHRONOUSLY at all is gated by a
+separate `label` request object (distinct from `postageDetails`), whose own
+`includeLabelInResponse` boolean this connector never set — so Royal Mail simply
+never generated one, order created and nothing more, not an error condition at
+all. **Fixed**: `createShipment()` now always sends `label:
+{includeLabelInResponse: true}`. **A real, confirmed caveat, not glossed over**:
+the swagger's own `LabelGenerationRequest` description says it is "Reserved for
+OBA customers only" (the same reservation `GET /orders/{id}/label` itself
+carries) — whether Arif's real Click & Drop account has OBA (On Business Account)
+status is unconfirmed. If it doesn't, thanks to Bug #1's own fix this should
+surface as a new, clear, fully-visible rejection on the next attempt rather than
+a silent no-op — itself useful information (the honest fix would then be
+requesting OBA status from Royal Mail directly, not more code here), not a
+wasted attempt either way. `royal-mail-connector.test.ts` gained a matching
+`label.includeLabelInResponse === true` assertion. Verified: `npx tsx --test
+packages/carrier-connectors/test/royal-mail-connector.test.ts` (12/12 pass),
+`npm run typecheck --workspaces` clean across all twelve workspaces, `next build`
+clean, `bash scripts/run-tests.sh` — all 63 test files pass. Not yet
+re-attempted against a real order since this fix — the next step is the same
+order, one more time, now finally requesting synchronous label generation.
+
 ### 19.2 Evri (formerly Hermes) — carrier #2, built via the Sapient/Intersoft CORE API gateway
 
 **Why Evri, and why via a third-party gateway**: once Royal Mail (§19.1) was

@@ -142,6 +142,12 @@ test("createShipment sends a Bearer-authorized POST /orders with the confirmed r
     assert.equal(capturedBody.items[0].billing.address.countryCode, SAMPLE_REQUEST.recipient.countryCode);
     assert.equal(capturedBody.items[0].billing.phoneNumber, SAMPLE_REQUEST.recipient.phone);
     assert.equal(capturedBody.items[0].billing.emailAddress, SAMPLE_REQUEST.recipient.email);
+    // Without `label.includeLabelInResponse: true`, Royal Mail creates the
+    // order but never generates a label/tracking number synchronously at
+    // all -- see createShipment()'s own doc comment for the fifth real
+    // production bug this corrects (a real order created with empty
+    // labelErrors and no trackingNumber field whatsoever).
+    assert.equal(capturedBody.items[0].label.includeLabelInResponse, true);
 
     assert.equal(result.carrierOrderId, "123456");
     assert.equal(result.trackingNumber, "RM123456789GB");
