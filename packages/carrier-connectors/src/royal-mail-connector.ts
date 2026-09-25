@@ -136,6 +136,19 @@ interface ClickAndDropCreateOrdersResponse {
   successCount?: number;
   errorCount?: number;
   createdOrders?: ClickAndDropOrderResponse[];
+  /** Deliberately untyped/unconfirmed -- no official swagger example of a
+   *  REJECTED order's own response body was ever found during this
+   *  connector's original research pass (only the success shape,
+   *  `createdOrders`, was confirmed). Rather than guess a field name and
+   *  risk silently dropping the real reason, `createShipment()`'s own
+   *  error path below serializes and surfaces the ENTIRE raw response
+   *  object -- whatever Royal Mail actually put in it (errors/orderErrors/
+   *  failureReasons/etc., all real candidate names for this kind of API,
+   *  none confirmed) reaches the tenant-visible error banner on
+   *  /picklists instead of being silently discarded. Once a real rejection
+   *  has been seen and its actual field name confirmed, this interface
+   *  should gain that field for real, typed handling. */
+  [key: string]: unknown;
 }
 
 interface TrackingEventsResponse {
@@ -267,8 +280,23 @@ export class RoyalMailConnector implements CarrierConnector {
 
     const created = result.createdOrders?.[0];
     if (!created) {
+      // Surface the ENTIRE raw response, not just errorCount -- see this
+      // interface's own doc comment above on why: no confirmed field name
+      // exists for a rejected order's own real reason, so the safest thing
+      // to do with an unconfirmed shape is show all of it rather than
+      // silently drop whatever Royal Mail actually said. A truncated
+      // stringify (2000 chars, same defensive cap CLAUDE.md §19.11's own
+      // last_failure_message.slice(0, 2000) already uses) keeps this from
+      // blowing up the redirect's own ?error= query string on an unusually
+      // large response.
+      let rawDetail: string;
+      try {
+        rawDetail = JSON.stringify(result).slice(0, 2000);
+      } catch {
+        rawDetail = "(response not serializable)";
+      }
       throw new Error(
-        `Royal Mail Click & Drop: order creation reported ${result.errorCount ?? "an unknown number of"} error(s), no order was created`,
+        `Royal Mail Click & Drop: order creation reported ${result.errorCount ?? "an unknown number of"} error(s), no order was created -- raw response: ${rawDetail}`,
       );
     }
 
