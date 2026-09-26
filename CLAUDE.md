@@ -4105,6 +4105,39 @@ pass every other connector in this file got) before building anything against it
 — not retrofitting Sapient's own confirmed shape onto a different host and
 hoping it matches.
 
+**Update — the direct-contact path for EVRi Corporate is now confirmed, and so is a
+real (not "unpublished") volume threshold that changes the practical calculus for
+this codebase's current stage.** Two real contact channels for reaching Evri
+directly, cross-checked this pass: the "Enquire today" form on
+`evri.com/business` (Evri's own front door for a business/corporate-account
+conversation), and a direct integration-team email,
+`IT.Integration@hermes-europe.co.uk` (Evri's legacy Hermes domain, still cited as
+active for this purpose by a dedicated third-party Evri API integration guide).
+Evri's own general customer-service line (0330 808 5458) is explicitly NOT this
+channel — Evri's own copy says it "cannot help with business account queries."
+
+**The volume threshold is no longer unpublished**: `evri.com/business` states
+outright that the Corporate Account (the tier with API access) is scoped for
+"large corporations & global brands" at **5,000+ parcels a week** — a real,
+stated number, not a guess. Also newly confirmed: "Evri Business" and "EVRi
+Corporate" are two distinct tiers, not one — third-party carrier-management docs
+(Linnworks, ShipEngine) describe an active EVRi-Business-to-EVRi-Corporate
+migration, implying Business is the older/lower tier being sunset in favor of
+Corporate, which is the one with real API access.
+
+**What this means in practice**: at this codebase's current stage — one
+self-testing tenant, nowhere near 5,000 parcels/week on its own account — the
+direct EVRi Corporate path is realistically not obtainable purely on Arif's own
+shipping volume. Worth raising directly in the enquiry anyway, since it's a
+genuinely different conversation: AlltixOMS is a multichannel OMS platform that
+would integrate Evri on behalf of its own future merchant tenants, not a single
+shipper moving parcels under its own name — account managers sometimes evaluate a
+software/platform integration differently than a single high-volume shipper, though
+this is a reasonable angle to raise, not a confirmed way around the threshold.
+Not decided here, same "Arif's own call" precedent as the rest of this
+section — this just makes the real cost of pursuing this path explicit rather
+than leaving "unpublished" understating how real a barrier it may be.
+
 ### 19.3 FedEx — carrier #3, built via FedEx's own direct, fully public REST API
 
 **Why FedEx, and why it's this codebase's best-sourced carrier connector so far**:
