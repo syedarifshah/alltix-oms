@@ -4261,6 +4261,40 @@ Not decided here, same "Arif's own call" precedent as the rest of this
 section — this just makes the real cost of pursuing this path explicit rather
 than leaving "unpublished" understating how real a barrier it may be.
 
+**Update (2026-09-27) — the `IT.Integration@hermes-europe.co.uk` channel above is
+now confirmed dead.** Arif actually emailed it pursuing a real EVRi Corporate API
+conversation and got an automatic-reply bounce back the same day: "This mailbox is
+no longer available to raise issues. Please log issues via the Client IT
+Self-Service Portal: https://hermesuk.service-now.com/csm" (Evri Limited corporate
+signature block). So this file's own prior claim that the mailbox was "still cited
+as active... by a dedicated third-party API integration guide" is now known to be
+stale — a third party's page saying an address is active doesn't mean Evri still
+mans it, the same "don't trust a source past its own confirmation date" caution
+this section already applies to Evri elsewhere.
+
+Whether the replacement portal (`hermesuk.service-now.com/csm`) is actually a
+viable channel for a *new* business's Corporate API enquiry, rather than an
+existing-client/employee IT ticketing system, could not be directly confirmed this
+pass: fetching `/csm` itself wasn't possible in this research session, and the
+sibling path on the same ServiceNow instance, `/sp`, is blocked from automated
+fetching by that site's own robots.txt. The one piece of real signal found — a
+search-engine result independently titling that `/sp` page "Login - Evri Employee
+Center" — points toward this ServiceNow instance being Evri's internal/existing-client
+IT-support system, not a new-business sales or partnership front door; no source
+found this pass describes the self-service portal as a place to start a *new*
+Corporate account conversation, and the previously-cited third-party integration
+guide (paul-walsh.co.uk) only describes credentials being issued "once your
+business account is established," assuming an Account Manager relationship
+already exists — it never describes how that first contact is made.
+
+**What this means in practice**: treat the self-service portal as unproven and
+likely not the right channel for a first enquiry. The `evri.com/business` "Enquire
+today" form (already documented above, along with the real 5,000+ parcels/week
+threshold) remains this file's one confirmed, real front door for a new EVRi
+Corporate API conversation — not this bounced mailbox, and not its ServiceNow
+replacement. Arif's own call, same precedent as the rest of this section, on
+whether to try the self-service portal anyway despite the above.
+
 ### 19.3 FedEx — carrier #3, built via FedEx's own direct, fully public REST API
 
 **Why FedEx, and why it's this codebase's best-sourced carrier connector so far**:
