@@ -4295,6 +4295,34 @@ Corporate API conversation — not this bounced mailbox, and not its ServiceNow
 replacement. Arif's own call, same precedent as the rest of this section, on
 whether to try the self-service portal anyway despite the above.
 
+**Update (2026-09-27) — the `evri.com/business` "Enquire today" form was actually
+submitted, and the earlier "not realistically obtainable" reading above is now
+outdated.** Two things changed the calculus from what §19.2 assumed at the time:
+AlltixOMS now has real contracts with a few large companies and expects to be
+handling 30,000+ orders/week (well past the 5,000 parcels/week Corporate
+threshold, not "one self-testing tenant nowhere near it" as this section
+previously stated); and the form itself has a "How many parcels do you need to
+send?" step whose top band is simply "Over 5,000 per week" — so 30,000+/week is
+answered the same as any volume past that line, with no finer-grained tier to
+signal the platform's actual scale.
+
+The form was completed as: "Yes, I send parcels every week" / "Over 5000 per
+week." Evri's own confirmation screen responded "Congratulations! You qualify for
+an Evri Business account. We'll be reaching out to you very soon to chat about
+your business account application," with follow-up promised by email. Two things
+worth flagging plainly rather than glossing over: (1) the confirmation names an
+"Evri Business account," and this section already established Business and
+Corporate are two distinct tiers (Business being the lower/sunsetting one) — so
+it is not yet confirmed this enquiry lands Arif in the Corporate/API-access
+conversation specifically rather than the standard Business tier, only that a
+real human at Evri will now follow up; (2) the platform-not-single-shipper
+framing (AlltixOMS integrating Evri on behalf of many merchant tenants) was
+never surfaced anywhere in this generic two-step form, since it only asks for
+volume/frequency, not context — worth raising directly once a real person
+responds, not assumed to have been conveyed already. Next real step is external
+and reactive: wait for Evri's follow-up email and, once contact is made, confirm
+explicitly it's the Corporate/API tier being discussed, not Business.
+
 ### 19.3 FedEx — carrier #3, built via FedEx's own direct, fully public REST API
 
 **Why FedEx, and why it's this codebase's best-sourced carrier connector so far**:
