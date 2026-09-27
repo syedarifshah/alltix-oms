@@ -7,6 +7,7 @@ import type {
   CarrierTenantCredentials,
   CreateShipmentRequest,
   CreateShipmentResult,
+  ManifestResult,
   RateEstimate,
   TrackingResult,
 } from "./connector.js";
@@ -161,15 +162,18 @@ import type {
  *   read-only operation -- meaning a real credential-verification failure
  *   and an unrelated malformed-request failure may be indistinguishable
  *   until this is tried against a real UAT account.
- * - **Manifesting is confirmed required, not optional**: ShipEngine's own
- *   docs state plainly, "Manifests are required for Parcelforce Worldwide
- *   shipments and must be printed" -- cross-confirming that
- *   `createManifest`/`printManifest` are real, load-bearing operations,
- *   not decorative WSDL entries. **Deliberately NOT implemented this
- *   pass** -- see the closing "Deliberately not built" paragraph in
- *   CLAUDE.md §19.4; a real integration cannot skip this step, but wiring
- *   a manifest-generation flow is a genuinely separate, additive piece of
- *   work from "add a fourth carrier to the existing dispatch map."
+ * - **Manifesting is confirmed required, not optional -- now implemented**:
+ *   ShipEngine's own docs state plainly, "Manifests are required for
+ *   Parcelforce Worldwide shipments and must be printed" -- cross-confirming
+ *   that `createManifest`/`printManifest` are real, load-bearing operations,
+ *   not decorative WSDL entries. Deliberately NOT implemented in this
+ *   connector's original pass (see CLAUDE.md §19.4's own "Deliberately not
+ *   built this pass" line, repeated again in §19.10/§19.11 as the one
+ *   carrier-layer item still open once every other genuinely
+ *   buildable-without-a-vendor-credential item was closed out) -- **now
+ *   built**, see {@link ParcelforceConnector.generateManifest}'s own doc
+ *   comment for the request/response shape and what's CONFIRMED vs
+ *   INFERRED about it specifically.
  * - **No XML parsing library exists anywhere in this codebase** -- every
  *   carrier/channel connector built so far talks JSON. Rather than adding
  *   a new npm dependency for one carrier, this file hand-rolls a minimal,
@@ -426,6 +430,74 @@ export class ParcelforceConnector implements CarrierConnector {
    *  pass. */
   async getRateEstimate(_request: { weightGrams: number; destinationCountryCode: string; shipDate: string }): Promise<RateEstimate[]> {
     return [];
+  }
+
+  /**
+   * `createManifest` + `printManifest` -- CONFIRMED to exist as real
+   * operation NAMES on the same ten-operation `ShipServiceSoapBinding` this
+   * connector's other five methods already draw from (see this file's own
+   * class doc comment), and CONFIRMED load-bearing (not decorative) by
+   * ShipEngine's own docs: "Manifests are required for Parcelforce
+   * Worldwide shipments and must be printed." Nothing found this pass
+   * confirms either operation's own request or response field names --
+   * **the single least-confirmed piece of this method, same "flag it,
+   * don't hide it" precedent every other under-confirmed field in this
+   * connector (and this codebase's carrier/channel layer generally)
+   * already carries** (createShipment's own Consignment body, Find's own
+   * entire purpose, both above).
+   *
+   * **Deliberately a single, no-argument, close-of-day call, not a
+   * per-shipment selection**: no source found anywhere in this codebase's
+   * own carrier-layer research (Royal Mail, Evri/DPD's shared Sapient
+   * gateway, FedEx, UPS, DHL) describes a manifest step that takes a list
+   * of shipment ids to include -- every confirmed or inferred description
+   * of "manifesting" in general UK-courier practice is a single sweep that
+   * captures everything shipped under a contract/department since the
+   * previous manifest. `createManifest`'s own request body is therefore
+   * modeled on the same `ContractNumber`/`DepartmentId` pair
+   * `createShipment` already sends (this connector's own established
+   * pattern for "identify the account this operation is scoped to"), with
+   * no shipment-specific field at all -- INFERRED, not confirmed, but the
+   * only shape consistent with every other source this pass could find.
+   *
+   * **The "nothing pending" outcome is treated as a real, non-error
+   * result, not a fault**: since no confirmed response shape exists either
+   * way, a `createManifest` response with no manifest-number tag found is
+   * read as "there was nothing new to manifest" (a real, ordinary, daily
+   * outcome for a low-volume tenant who shipped nothing since the last
+   * manifest) rather than thrown as an error -- {@link
+   * ParcelforceConnector.parcelforceRequest}'s own SOAP-fault detection
+   * already throws on an actual carrier-reported error before this method
+   * ever gets to check for a manifest number, so a genuine failure still
+   * surfaces as a thrown error, not a silently-empty result.
+   *
+   * `printManifest` is only called when `createManifest` actually returned
+   * a manifest number -- calling it with nothing to print would be a
+   * request this pass has no confirmed shape for anyway, and there would be
+   * nothing meaningful to ask for.
+   */
+  async generateManifest(): Promise<ManifestResult> {
+    const createBodyXml = `
+      <ns:ContractNumber>${xmlEscape(this.credentials.contractNumber)}</ns:ContractNumber>
+      <ns:DepartmentId>${DEFAULT_DEPARTMENT_ID}</ns:DepartmentId>`;
+    const createResponseXml = await this.parcelforceRequest("createManifest", createBodyXml);
+
+    const manifestNumber = xmlTagAny(createResponseXml, ["ManifestNumber", "ManifestId", "ManifestReference"]);
+    if (!manifestNumber) {
+      // A real, non-error outcome -- see this method's own doc comment on
+      // why "nothing pending to manifest" is not treated as a failure.
+      return { manifestNumber: null, documentBase64: null, raw: createResponseXml };
+    }
+
+    const printBodyXml = `<ns:ManifestNumber>${xmlEscape(manifestNumber)}</ns:ManifestNumber>`;
+    const printResponseXml = await this.parcelforceRequest("printManifest", printBodyXml);
+    const documentBase64 = xmlTagAny(printResponseXml, ["Document", "DocumentData", "ManifestDocument", "ManifestImage"]);
+
+    return {
+      manifestNumber,
+      documentBase64,
+      raw: { createResponseXml, printResponseXml },
+    };
   }
 }
 

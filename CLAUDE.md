@@ -67,14 +67,15 @@ Full source blueprint: `ERPOMSSaaSBlueprint.pdf` (keep in repo root or /docs).
   feature-flags closed out the first round — is now built too, see §19.9. FedEx's/
   UPS's/DHL's own real live rate calls are now wired into `/picklists` too — the
   next genuinely buildable-now item once Sapient webhook receiving closed out its
-  own round (real Parcelforce manifest generation and real carrier credentials both
-  still need Arif's own vendor-facing action first) — see §19.10. Cross-run
-  circuit-breaker wiring for carrier connections, mirroring §4.4's own
-  channel-level version, is now built too — the last genuinely buildable-now item
-  on this layer's own standing punch list, closing it out entirely; everything
-  still open in this layer (real Parcelforce manifest generation, real credentials
-  for any of the 7 carriers or for Sapient) is now exclusively blocked on Arif's
-  own next vendor-facing step, not more of this codebase's own code — see §19.11.
+  own round — see §19.10. Cross-run circuit-breaker wiring for carrier connections,
+  mirroring §4.4's own channel-level version, is now built too — see §19.11. Real
+  Parcelforce manifest generation — the one remaining genuinely buildable-now item,
+  needing no external vendor credential the way real carrier credentials or a real
+  Sapient account both do — is now built too, closing out this layer's own standing
+  punch list entirely; everything still open in this layer (real credentials for
+  any of the 7 carriers, or for Sapient itself) is now exclusively blocked on
+  Arif's own next vendor-facing step, not more of this codebase's own code — see
+  §19.12.
 
 Do not expand this scope without an explicit decision — every module below assumes it.
 
@@ -5497,16 +5498,17 @@ Arif's account yet, so this route's own live network call has never actually
 round-tripped against real carrier infrastructure.
 
 **Deliberately not built this pass**: real Parcelforce manifest generation (§19.4,
-still open); retry/circuit-breaker wiring mirroring §4.4 (still no scheduler job
-exists for any carrier in this layer — this route's own outbound calls DO already
-go through `fetchWithBackoff`'s in-process retry, the same wrapper every carrier
-connector's own fetch calls already use, but the cross-run circuit-breaker half of
-§4.4 — tripping and recording a connection-level failure state — is still open);
-and obtaining real credentials for any of the 7 carriers, which needs Arif's own
-vendor-facing action, not more of this codebase's own code. **Update — the
+still open at the time); retry/circuit-breaker wiring mirroring §4.4 (still no
+scheduler job exists for any carrier in this layer — this route's own outbound calls
+DO already go through `fetchWithBackoff`'s in-process retry, the same wrapper every
+carrier connector's own fetch calls already use, but the cross-run circuit-breaker
+half of §4.4 — tripping and recording a connection-level failure state — is still
+open); and obtaining real credentials for any of the 7 carriers, which needs Arif's
+own vendor-facing action, not more of this codebase's own code. **Update — the
 retry/circuit-breaker item is now built too, see §19.11**, covering both
 `ship-via-carrier`'s own `createShipment()` call and this route's own
-`getRateEstimate()` call.
+`getRateEstimate()` call. **Update — real Parcelforce manifest generation is now
+built too, see §19.12.**
 
 ### 19.11 Cross-Run Circuit-Breaker Wiring for Carrier Connections (§4.4's carrier-layer counterpart)
 
@@ -5626,11 +5628,139 @@ synthetic failures, not against a real, repeatedly-failing carrier API in
 production.
 
 **Deliberately not built this pass**: real Parcelforce manifest generation (§19.4,
-still open); obtaining real credentials for any of the 7 carriers or for Sapient
-itself (both need Arif's own vendor-facing action, not more of this codebase's own
-code). With this pass built, every carrier-layer item that was buildable without an
-external blocker is now built — what remains open is exclusively blocked on Arif's
-own next step with a real carrier/Sapient vendor.
+still open at the time); obtaining real credentials for any of the 7 carriers or for
+Sapient itself (both need Arif's own vendor-facing action, not more of this
+codebase's own code). With this pass built, every carrier-layer item that was
+buildable without an external blocker is now built — what remains open is
+exclusively blocked on Arif's own next step with a real carrier/Sapient vendor.
+**Update — real Parcelforce manifest generation is now built too, see §19.12**,
+closing out that one remaining item; everything left open in this layer is now
+exclusively blocked on Arif's own next vendor-facing step.
+
+### 19.12 Real Parcelforce Manifest Generation (§19.4's/§19.10's/§19.11's own standing "Deliberately not built this pass" line)
+
+**Status: built.** Every carrier-layer section since Parcelforce was built (§19.4)
+carried "real Parcelforce manifest generation" as a standing open item, repeated
+again in §19.10's and §19.11's own closing paragraphs as the one item left once
+real credentials and real Sapient webhook receiving were each either closed out or
+blocked on Arif's own next vendor-facing step. Once §19.11's own circuit-breaker
+pass closed out everything else buildable without an external blocker, this was the
+last remaining genuinely buildable-now item — no new AskUserQuestion round was
+needed, since every other open item in this layer needs Arif's own vendor-facing
+action first (real credentials, or a real Sapient account to configure a webhook
+against) and this one doesn't.
+
+**Why this was worth building, not just a nice-to-have**: ShipEngine's own
+documented Parcelforce integration guide states plainly, "Manifests are required
+for Parcelforce Worldwide shipments and must be printed" — a real, confirmed,
+load-bearing requirement, not a decorative WSDL entry (§19.4's own class doc
+comment already established `createManifest`/`printManifest` as real, confirmed
+operation NAMES on `ParcelforceConnector`'s own `ShipServiceSoapBinding`).
+`shipments.status`'s own CHECK constraint has allowed a `'manifested'` value since
+the very first carrier migration (0039) — this pass is what finally gives that
+value a real writer.
+
+**Schema** (`migrations/0042_carrier_manifests.sql`): a new `carrier_manifests`
+table — one row per real manifest actually generated, since a single manifest
+covers many shipments at once (the real-world "close of day, hand everything to the
+driver at once" convention every UK courier's own manifest step follows, per
+`ParcelforceConnector.generateManifest()`'s own doc comment) — rather than
+duplicating `manifest_number`/`document_base64` onto every shipment row it covers,
+same "the ledger should show why, don't repeat the same large blob N times"
+reasoning `shipment_tracking_events` (migration 0041, §19.9) already applies to a
+different one-to-many relationship in this same layer. Written with the guarded
+`NULLIF(...)` tenant_id cast from the start (§18's own closing instruction — this
+table is new as of this migration, so there is no excuse to reproduce the bug class
+§18 spent two rounds fixing). Append-only by construction: `GRANT SELECT, INSERT`
+only, same `audit_log`/`shipment_tracking_events` discipline. `shipments` gained a
+new nullable `manifest_id` FK column (no `ON DELETE` — `carrier_manifests` rows are
+never deleted, same precedent every other carrier-layer FK in this schema already
+follows).
+
+**Connector** (`ParcelforceConnector.generateManifest()`, `connector.ts`'s new
+`ManifestResult` type and optional `generateManifest?()` method on
+`CarrierConnector`): calls `createManifest` then, only if a manifest number actually
+came back, `printManifest` — deliberately a single, no-argument, close-of-day call,
+not a per-shipment selection, since no source found anywhere in this codebase's own
+carrier-layer research describes a manifest step that takes a shipment-id list (see
+that method's own doc comment for the full reasoning). A "nothing pending to
+manifest" outcome (no manifest number in the `createManifest` response) is treated
+as a real, non-error result — the same "an empty result is not an error" reasoning a
+zero-row discovery query anywhere else in this codebase already follows — not
+fabricated into a thrown error. `generateManifest?()` is optional on
+`CarrierConnector`, same reasoning as `voidShipment?()`: not every carrier's own API
+needs or exposes a distinct manifest step (none of the other 6 carriers in this
+layer do, per their own research), so only Parcelforce implements it.
+
+**App layer** (`POST /api/carriers/parcelforce/manifest`,
+`packages/web/src/app/api/carriers/parcelforce/manifest/route.ts`): same
+"auth → rate-limit → carrier-flag gate → wrapped live connector call →
+recordCarrierFailure/recordCarrierSuccess → redirect with result" shape every other
+real, live carrier call in this app already follows (`ship-via-carrier`,
+`carrier-rate-estimate`) — rate-limited under its own `carriers.parcelforce.manifest`
+key, gated by the same ongoing-use `isCarrierEnabledForTenant` check those two routes
+already apply (§19.8's own "Carrier Feature Flags" section). On a real manifest
+(`manifestNumber` present): within one `withTenant` transaction, inserts a
+`carrier_manifests` row and flips every one of the tenant's own `status = 'created'`
+Parcelforce shipments to `'manifested'` (stamping `manifest_id` on each), and records
+`carrier_manifest.generated` in the audit log (§17) in the same transaction, so a
+rolled-back manifest never leaves a committed audit row behind. On "nothing pending"
+(`manifestNumber` null): no DB writes at all — redirected via an informational,
+non-error `manifestInfo=` query param, never `error=`, since there's nothing real to
+record and nothing went wrong. Same cross-run circuit-breaker discipline as every
+other real carrier call in this app (§19.11): only the real
+`connector.generateManifest()` call itself is wrapped, never the credential load,
+which already fails on its own separate "not connected" condition.
+
+**`/settings/carriers`**: the Parcelforce card gained a live count of shipments
+still awaiting a manifest (`SELECT count(*) FROM shipments WHERE tenant_id = $1 AND
+carrier = 'parcelforce' AND status = 'created'`, queried inside the page's own
+existing `withTenant` block) plus a "Generate manifest" button POSTing to the new
+route, shown only once Parcelforce is actually connected — mirroring every other
+carrier control on this page's own "only render what the tenant has an active
+connection for" discipline. Renders the manifest number and shipment count on
+success, or the "nothing pending" notice, via the redirect's own query params.
+
+**Tests**: `packages/carrier-connectors/test/parcelforce-connector.test.ts` gained
+three new cases for `generateManifest()` — the success path (asserting the
+`createManifest`→`printManifest` call sequence, the `ContractNumber`/`DepartmentId`
+body content, and the manifest number threaded into `printManifest`'s own request);
+the "nothing pending" path (no manifest number → nulls returned without throwing,
+and `printManifest` is never called); and confirming `parcelforceRequest()`'s
+existing SOAP-fault detection still propagates as a real thrown error for this new
+method too. No new test file for the route itself — same reasoning every other
+real-carrier-call route in this layer already carries (§19.10's own "Tests"
+paragraph): it makes a real network call to Parcelforce before ever reaching its own
+DB writes, and `ParcelforceConnector` is already documented elsewhere in this
+codebase as UNVERIFIED IN PRACTICE against real infrastructure, so an e2e test
+through the real route would either need to fake that network call or would never
+get past it. Verified: `npm run db:migrate` (migration 0042's first real
+application), `npm run typecheck --workspaces` clean across all twelve workspaces
+(after rebuilding `@alltix/carrier-connectors`'s own `dist/` output so
+`packages/web` could see the new `generateManifest`/`ManifestResult` exports, same
+"packages/web consumes dist, not source" precedent §19.4's own verification note
+already established), `next build` clean (the new route and the updated
+`/settings/carriers` page both compile), and `bash scripts/run-tests.sh` — all 64
+test files pass (63 previous + the 3 new `generateManifest()` cases in the existing
+`parcelforce-connector.test.ts` file, not a new file, so the SAFE_TESTS list itself
+didn't need an entry added).
+
+**UNVERIFIED IN PRACTICE, same status every other Parcelforce feature in this
+codebase carries (§19.4)**: no real Parcelforce expressLink credentials exist
+anywhere in this codebase or Arif's account yet, so this feature's own real
+`createManifest`/`printManifest` calls have never round-tripped against real
+infrastructure — complete and typechecked, not proven. `generateManifest()`'s own
+request/response shape carries the identical "single least-confirmed piece" caveat
+its own doc comment already states: no literal example of either operation's
+request or response fields was found anywhere this codebase's own research passes
+could reach.
+
+**With this pass built, every carrier-layer item that was buildable without an
+external blocker is now built** — real credentials for any of the 7 carriers, and a
+real Sapient account to actually configure and test the tracking webhook against
+(§19.9), are the only things left open in this entire layer, and both are
+exclusively Arif's own next vendor-facing step, not more of this codebase's own
+code.
 
 ---
 

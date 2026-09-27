@@ -308,3 +308,80 @@ test("getRateEstimate returns an empty list -- no live rate-shopping operation e
     globalThis.fetch = originalFetch;
   }
 });
+
+test("generateManifest calls createManifest then printManifest when a manifest number is returned", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: { url: string; soapAction: string; body: string }[] = [];
+  globalThis.fetch = (async (input, init) => {
+    const soapAction = (init?.headers as Record<string, string>)?.SOAPAction ?? "";
+    const body = String(init?.body);
+    calls.push({ url: String(input), soapAction, body });
+    if (soapAction === "createManifest") {
+      return xmlResponse(
+        200,
+        `<ns:createManifestReply><ns:ManifestNumber>MANIFEST-001</ns:ManifestNumber></ns:createManifestReply>`,
+      );
+    }
+    if (soapAction === "printManifest") {
+      return xmlResponse(200, `<ns:printManifestReply><ns:Document>base64-manifest-doc</ns:Document></ns:printManifestReply>`);
+    }
+    throw new Error(`unexpected SOAPAction: ${soapAction}`);
+  }) as typeof fetch;
+
+  try {
+    const connector = new ParcelforceConnector(CREDENTIALS);
+    const result = await connector.generateManifest();
+
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0]!.soapAction, "createManifest");
+    assert.match(calls[0]!.body, /<ns:ContractNumber>1234567<\/ns:ContractNumber>/);
+    assert.match(calls[0]!.body, /<ns:DepartmentId>1<\/ns:DepartmentId>/);
+    assert.equal(calls[1]!.soapAction, "printManifest");
+    assert.match(calls[1]!.body, /<ns:ManifestNumber>MANIFEST-001<\/ns:ManifestNumber>/);
+
+    assert.equal(result.manifestNumber, "MANIFEST-001");
+    assert.equal(result.documentBase64, "base64-manifest-doc");
+    assert.ok(result.raw && typeof result.raw === "object");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("generateManifest returns nulls without throwing, and never calls printManifest, when nothing is pending to manifest", async () => {
+  const originalFetch = globalThis.fetch;
+  let printManifestCalled = false;
+  globalThis.fetch = (async (_input, init) => {
+    const soapAction = (init?.headers as Record<string, string>)?.SOAPAction ?? "";
+    if (soapAction === "printManifest") {
+      printManifestCalled = true;
+    }
+    return xmlResponse(200, `<ns:createManifestReply></ns:createManifestReply>`);
+  }) as typeof fetch;
+
+  try {
+    const connector = new ParcelforceConnector(CREDENTIALS);
+    const result = await connector.generateManifest();
+    assert.equal(result.manifestNumber, null);
+    assert.equal(result.documentBase64, null);
+    assert.match(String(result.raw), /createManifestReply/);
+    assert.equal(printManifestCalled, false, "printManifest must never be called when createManifest returned no manifest number");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("generateManifest still propagates a SOAP fault from createManifest as a real error", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    xmlResponse(
+      200,
+      `<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"><soapenv:Body><soapenv:Fault><faultstring>Contract not authorised for manifesting</faultstring></soapenv:Fault></soapenv:Body></soapenv:Envelope>`,
+    )) as typeof fetch;
+
+  try {
+    const connector = new ParcelforceConnector(CREDENTIALS);
+    await assert.rejects(() => connector.generateManifest(), /Contract not authorised for manifesting/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

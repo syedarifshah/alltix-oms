@@ -33,7 +33,14 @@ interface CarrierConnectionRow {
 }
 
 interface CarrierSettingsPageProps {
-  searchParams: Promise<{ connected?: string; error?: string }>;
+  searchParams: Promise<{
+    connected?: string;
+    error?: string;
+    manifestGenerated?: string;
+    manifestNumber?: string;
+    manifestShipmentsCovered?: string;
+    manifestInfo?: string;
+  }>;
 }
 
 /**
@@ -65,7 +72,8 @@ export default async function CarrierSettingsPage({
     redirect("/sign-in");
   }
 
-  const { connected, error } = await searchParams;
+  const { connected, error, manifestGenerated, manifestNumber, manifestShipmentsCovered, manifestInfo } =
+    await searchParams;
 
   const {
     royalMailConnection,
@@ -76,6 +84,7 @@ export default async function CarrierSettingsPage({
     dhlConnection,
     dpdConnection,
     enabledCarriers,
+    parcelforcePendingManifestCount,
   } = await withTenant(pool, tenantId, async (client) => {
     const result = await client.query<CarrierConnectionRow>(
       `SELECT id, carrier, external_account_id, status, consecutive_failures, last_failure_at, last_failure_message, created_at
@@ -84,6 +93,15 @@ export default async function CarrierSettingsPage({
         ORDER BY created_at DESC`,
     );
     const enabledCarriers = await getEnabledCarriers(client, tenantId);
+    // Real Parcelforce manifest generation (CLAUDE.md §19.4/§19.10/§19.11's
+    // own standing "Deliberately not built this pass" line, closed out this
+    // pass) -- how many of this tenant's own Parcelforce shipments are still
+    // waiting to be swept into a manifest, shown on the Parcelforce card
+    // right next to the "Generate manifest" button below.
+    const pendingManifestResult = await client.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM shipments WHERE tenant_id = $1 AND carrier = 'parcelforce' AND status = 'created'`,
+      [tenantId],
+    );
     return {
       royalMailConnection: result.rows.find((r) => r.carrier === "royal_mail") ?? null,
       evriConnection: result.rows.find((r) => r.carrier === "evri") ?? null,
@@ -93,6 +111,7 @@ export default async function CarrierSettingsPage({
       dhlConnection: result.rows.find((r) => r.carrier === "dhl") ?? null,
       dpdConnection: result.rows.find((r) => r.carrier === "dpd") ?? null,
       enabledCarriers,
+      parcelforcePendingManifestCount: Number(pendingManifestResult.rows[0]?.count ?? "0"),
     };
   });
 
@@ -188,6 +207,25 @@ export default async function CarrierSettingsPage({
       {error?.startsWith("parcelforce_save_failed") && (
         <div className="alert alert-danger">
           Couldn&apos;t save this connection ({error.slice("parcelforce_save_failed:".length)}).
+        </div>
+      )}
+      {error === "parcelforce_carrier_not_enabled" && (
+        <div className="alert alert-danger">Parcelforce is not enabled for your account.</div>
+      )}
+      {error?.startsWith("parcelforce_manifest_failed") && (
+        <div className="alert alert-danger">
+          Couldn&apos;t generate a Parcelforce manifest ({error.slice("parcelforce_manifest_failed:".length)}).
+        </div>
+      )}
+      {manifestGenerated === "parcelforce" && (
+        <div className="alert alert-success">
+          Parcelforce manifest {manifestNumber} generated, covering {manifestShipmentsCovered ?? "0"} shipment(s).
+        </div>
+      )}
+      {manifestInfo === "parcelforce_nothing_pending" && (
+        <div className="alert alert-info">
+          Nothing was pending to manifest for Parcelforce -- every shipment is already covered by an earlier
+          manifest.
         </div>
       )}
       {error?.startsWith("ups_missing_fields") && (
@@ -347,7 +385,9 @@ export default async function CarrierSettingsPage({
           only be obtained by contacting Parcelforce&apos;s own Customer Solutions Team directly. No real
           username/password/contract number has round-tripped against it yet. Also worth knowing: unlike Royal Mail,
           Parcelforce <strong>does</strong> expose a confirmed cancel-shipment operation, but — like Royal Mail and
-          Evri — no live rate-shopping endpoint was found, so rate estimates return empty.
+          Evri — no live rate-shopping endpoint was found, so rate estimates return empty. Manifest generation
+          (<code>createManifest</code>/<code>printManifest</code>) is now built too — ShipEngine&apos;s own docs
+          confirm a manifest is required before a Parcelforce collection.
         </div>
         {parcelforceConnection ? (
           <div className="stack">
@@ -362,6 +402,16 @@ export default async function CarrierSettingsPage({
                 {parcelforceConnection.consecutive_failures} consecutive failure(s)
                 {parcelforceConnection.last_failure_message && `: ${parcelforceConnection.last_failure_message}`}.
                 Reconnect below once the underlying issue is fixed.
+              </div>
+            )}
+            {isParcelforceConnected && (
+              <div className="row" style={{ alignItems: "center", gap: 12 }}>
+                <span className="muted">
+                  {parcelforcePendingManifestCount} shipment(s) awaiting manifest.
+                </span>
+                <form action="/api/carriers/parcelforce/manifest" method="POST">
+                  <button type="submit">Generate manifest</button>
+                </form>
               </div>
             )}
             <ParcelforceConnectForm buttonLabel="Reconnect Parcelforce" />

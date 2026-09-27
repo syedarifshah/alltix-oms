@@ -123,6 +123,21 @@ export interface RateEstimate {
   surchargesApplied: boolean;
 }
 
+/** The result of a real close-of-day manifest call -- see
+ *  {@link CarrierConnector.generateManifest}'s own doc comment for why this
+ *  is a batch/no-filter operation, not a per-shipment one.
+ *  `manifestNumber`/`documentBase64` are both nullable: a real "nothing was
+ *  pending to manifest" outcome (every carrier's own manifest step this
+ *  codebase's research found describes it as covering whatever has
+ *  accumulated since the last one) returns both null rather than throwing,
+ *  same "an empty result is not an error" reasoning a zero-row discovery
+ *  query anywhere else in this codebase already follows. */
+export interface ManifestResult {
+  manifestNumber: string | null;
+  documentBase64: string | null;
+  raw: unknown;
+}
+
 export interface CarrierConnector {
   authenticate(tenantCredentials: CarrierTenantCredentials): Promise<CarrierAuthToken>;
   /** Creates a real order + generates a real label with the carrier.
@@ -162,4 +177,24 @@ export interface CarrierConnector {
     destinationCountryCode: string;
     shipDate: string;
   }): Promise<RateEstimate[]>;
+  /** Closes out a batch of already-created shipments into a single manifest
+   *  document handed to the carrier's driver at collection -- a REAL,
+   *  confirmed-required step for some carriers (Parcelforce: ShipEngine's
+   *  own documented integration guide states plainly, "Manifests are
+   *  required for Parcelforce Worldwide shipments and must be printed")
+   *  that this interface had no method for until now (CLAUDE.md §19.4's own
+   *  standing "Deliberately not built this pass" line, closed out this
+   *  pass). Optional, same reasoning as {@link voidShipment} -- not every
+   *  carrier's own API needs or exposes a distinct manifest step (Royal
+   *  Mail's/Evri's/DPD's own research never surfaced one; UPS/DHL/FedEx's
+   *  own confirmed request/response shapes never named one either), so only
+   *  a carrier whose research actually confirmed one implements it.
+   *  Deliberately takes no shipment-specific filter/id list -- the real-
+   *  world convention every source this codebase's own research could
+   *  confirm even generally describes (a single end-of-day manifest per
+   *  contract/department covering everything shipped since the last one),
+   *  not a per-shipment selection call -- so a caller wanting to know what
+   *  got covered reads it back off whichever shipments rows this call
+   *  updates, not off the request it sent. */
+  generateManifest?(): Promise<ManifestResult>;
 }
