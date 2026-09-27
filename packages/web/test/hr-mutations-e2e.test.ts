@@ -128,16 +128,22 @@ function killServerTree(): void {
 
 after(async () => {
   killServerTree();
+  // Wrapped in try/finally so a cleanup-query failure can never skip the
+  // admin.end()/pool.end() calls below and leak open Postgres connections
+  // (CLAUDE.md §12).
   const { Client } = await import("pg");
   const admin = new Client({ connectionString: process.env.DATABASE_URL });
   await admin.connect();
-  await admin.query("DELETE FROM audit_log WHERE tenant_id = $1", [tenant.tenantId]);
-  await admin.query("DELETE FROM time_entries WHERE tenant_id = $1", [tenant.tenantId]);
-  await admin.query("DELETE FROM employees WHERE tenant_id = $1", [tenant.tenantId]);
-  await admin.query("DELETE FROM users WHERE tenant_id = $1", [tenant.tenantId]);
-  await admin.query("DELETE FROM tenants WHERE id = $1", [tenant.tenantId]);
-  await admin.end();
-  await pool.end();
+  try {
+    await admin.query("DELETE FROM audit_log WHERE tenant_id = $1", [tenant.tenantId]);
+    await admin.query("DELETE FROM time_entries WHERE tenant_id = $1", [tenant.tenantId]);
+    await admin.query("DELETE FROM employees WHERE tenant_id = $1", [tenant.tenantId]);
+    await admin.query("DELETE FROM users WHERE tenant_id = $1", [tenant.tenantId]);
+    await admin.query("DELETE FROM tenants WHERE id = $1", [tenant.tenantId]);
+  } finally {
+    await admin.end();
+    await pool.end();
+  }
 });
 
 test("an unauthenticated request to a protected HR route is rejected, not applied", async () => {

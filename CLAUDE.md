@@ -2443,21 +2443,43 @@ from there.
   `taskkill /IM node.exe` or `pkill node` — it can kill unrelated Node processes on the
   same machine (other dev servers, editor extensions, etc.), not just the one the test
   started.
-- **e2e test `after()` hooks have no `try`/`finally` around their own cleanup queries**
-  — found while closing §17's products/locations audit-log gap: a cleanup query that
-  throws partway through (e.g. a `DELETE` hitting a foreign-key violation, see §17's
-  own "products and locations" paragraph for the specific instance that surfaced this)
-  skips every statement after it in the same `after()` block, including the
-  `admin.end()`/`pool.end()` calls that would otherwise release the test's Postgres
-  connections. With those connections leaked, the `node --test` process never exits on
-  its own, so the whole `run-tests.sh` run hangs indefinitely instead of failing fast
-  with a visible error — checked across the suite, none of the ~7 e2e test files' own
-  `after()` hooks are protected against this. Fixing the one instance that actually
-  surfaced (a `DELETE FROM users` running before a `DELETE FROM audit_log` that
-  referenced it) was in scope for that pass; wrapping every e2e file's `after()` body in
-  `try { ... } finally { await admin.end(); await pool.end(); }` so a *future* cleanup
-  failure fails loud instead of hanging silently is real, separate hardening work, not
-  done here.
+- **e2e test `after()` hooks have no `try`/`finally` around their own cleanup
+  queries — closed.** This was found while closing §17's products/locations
+  audit-log gap: a cleanup query that throws partway through (e.g. a `DELETE`
+  hitting a foreign-key violation, see §17's own "products and locations"
+  paragraph for the specific instance that surfaced this) skipped every statement
+  after it in the same `after()` block, including the `admin.end()`/`pool.end()`
+  calls that would otherwise release the test's Postgres connections — with those
+  connections leaked, the `node --test` process never exited on its own, so the
+  whole `run-tests.sh` run hung indefinitely instead of failing fast with a
+  visible error. Only the one instance that had actually surfaced (a `DELETE FROM
+  users` running before a `DELETE FROM audit_log` that referenced it) was fixed at
+  the time; sweeping the fix across the rest of the suite was explicitly deferred
+  as separate hardening work. **Now done**: every one of the 8 e2e test files in
+  this codebase (`packages/web/test/{tenant-isolation,new-rate-limited-routes,
+  demo-request-rate-limit,hr-mutations,locations-mutations}-e2e.test.ts`,
+  `packages/scheduler/test/amazon-order-sync-e2e.test.ts`,
+  `packages/warehouse-service/test/confirm-shipment-e2e.test.ts`,
+  `packages/order-service/test/pull-and-allocate-e2e.test.ts`) now wraps its
+  `after()` hook's cleanup queries in `try { ... } finally { await admin.end();
+  [await pool.end();] }` — `killServerTree()` (where present) stays first and
+  unwrapped, since it's synchronous and already internally safe (its own POSIX
+  branch already wraps `process.kill()` in try/catch). Every existing query,
+  comment, and delete-ordering fix already in place (e.g. `locations-mutations-
+  e2e.test.ts`'s own audit_log-before-users ordering, §17) was preserved exactly
+  as-is — this pass only added the `try`/`finally` structure around them, no
+  cleanup logic changed. The 3 Amazon-sandbox files
+  (`amazon-order-sync-e2e`/`confirm-shipment-e2e`/`pull-and-allocate-e2e`, none in
+  `scripts/run-tests.sh`'s `SAFE_TESTS` — they need real sandbox credentials) were
+  verified directly with `npx tsx --test <file>` in this environment (no
+  `AMAZON_SANDBOX_*` credentials configured here either): each fails cleanly on
+  the expected `LWA token exchange failed: 403 Forbidden`/`sync must succeed`
+  error and exits promptly, with no hang — proving the `finally` block's own
+  `admin.end()`/`pool.end()`/`appPool.end()`/`adminPool.end()` calls run
+  regardless of how the test body itself concludes. Verified: `npm run
+  db:migrate` clean (no pending migration — no schema change), `npm run
+  typecheck --workspaces` clean across all twelve workspaces, `next build`
+  clean, `bash scripts/run-tests.sh` — all 64 test files pass.
 - **No operator UI for channel flags** — `tenants.enabled_channels` (§15) has no
   multi-tenant admin surface, only a CLI script (`npm run platform:set-channel-flags`).
   Deliberate, not an oversight — see §15's own "No operator UI" paragraph for the

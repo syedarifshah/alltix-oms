@@ -120,6 +120,9 @@ function killServerTree(): void {
 
 after(async () => {
   killServerTree();
+  // Wrapped in try/finally so a cleanup-query failure can never skip the
+  // admin.end() call below and leak an open Postgres connection (CLAUDE.md
+  // §12).
   // demo_requests has no SELECT/DELETE grant for app_user (migrations/
   // 0017_demo_requests.sql's own doc comment -- deliberately unreadable by
   // the app itself), and public_ip_rate_limit_windows has no DELETE grant
@@ -129,11 +132,14 @@ after(async () => {
   // cleanup.
   const admin = new Client({ connectionString: process.env.DATABASE_URL });
   await admin.connect();
-  await admin.query("DELETE FROM demo_requests WHERE email LIKE $1", [`rate-limit-e2e-${RUN_ID}-%`]);
-  await admin.query("DELETE FROM public_ip_rate_limit_windows WHERE ip_address = ANY($1)", [
-    [RATE_LIMITED_IP, UNAFFECTED_IP],
-  ]);
-  await admin.end();
+  try {
+    await admin.query("DELETE FROM demo_requests WHERE email LIKE $1", [`rate-limit-e2e-${RUN_ID}-%`]);
+    await admin.query("DELETE FROM public_ip_rate_limit_windows WHERE ip_address = ANY($1)", [
+      [RATE_LIMITED_IP, UNAFFECTED_IP],
+    ]);
+  } finally {
+    await admin.end();
+  }
 });
 
 test("the first DEFAULT_PUBLIC_RATE_LIMIT_PER_MINUTE requests from one IP all succeed", async () => {

@@ -58,23 +58,29 @@ before(async () => {
 });
 
 after(async () => {
+  // Wrapped in try/finally so a cleanup-query failure can never skip the
+  // admin.end()/pool.end() calls below and leak open Postgres connections
+  // (CLAUDE.md §12).
   const admin = new Client({ connectionString: process.env.DATABASE_URL });
   await admin.connect();
-  await admin.query("DELETE FROM audit_log WHERE tenant_id = $1", [tenantId]);
-  await admin.query("DELETE FROM inventory_events WHERE tenant_id = $1", [tenantId]);
-  await admin.query("DELETE FROM orders WHERE tenant_id = $1", [tenantId]); // cascades order_lines
-  await admin.query("DELETE FROM inventory_levels WHERE tenant_id = $1", [tenantId]);
-  await admin.end();
+  try {
+    await admin.query("DELETE FROM audit_log WHERE tenant_id = $1", [tenantId]);
+    await admin.query("DELETE FROM inventory_events WHERE tenant_id = $1", [tenantId]);
+    await admin.query("DELETE FROM orders WHERE tenant_id = $1", [tenantId]); // cascades order_lines
+    await admin.query("DELETE FROM inventory_levels WHERE tenant_id = $1", [tenantId]);
 
-  await withTenant(pool, tenantId, (client) =>
-    client.query("DELETE FROM channel_listings WHERE tenant_id = $1", [tenantId]),
-  );
-  await withTenant(pool, tenantId, (client) => client.query("DELETE FROM locations WHERE tenant_id = $1", [tenantId]));
-  await withTenant(pool, tenantId, (client) => client.query("DELETE FROM products WHERE tenant_id = $1", [tenantId]));
-  await withTenant(pool, tenantId, (client) =>
-    client.query("DELETE FROM channel_connections WHERE tenant_id = $1", [tenantId]),
-  );
-  await pool.end();
+    await withTenant(pool, tenantId, (client) =>
+      client.query("DELETE FROM channel_listings WHERE tenant_id = $1", [tenantId]),
+    );
+    await withTenant(pool, tenantId, (client) => client.query("DELETE FROM locations WHERE tenant_id = $1", [tenantId]));
+    await withTenant(pool, tenantId, (client) => client.query("DELETE FROM products WHERE tenant_id = $1", [tenantId]));
+    await withTenant(pool, tenantId, (client) =>
+      client.query("DELETE FROM channel_connections WHERE tenant_id = $1", [tenantId]),
+    );
+  } finally {
+    await admin.end();
+    await pool.end();
+  }
 });
 
 test("a real sandbox pull persists with real lines and allocates real inventory", async () => {

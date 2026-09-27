@@ -123,23 +123,29 @@ function killServerTree(): void {
 
 after(async () => {
   killServerTree();
-  await withTenant(pool, tenant.tenantId, (client) => client.query("DELETE FROM locations WHERE tenant_id = $1", [tenant.tenantId]));
+  // Wrapped in try/finally so a cleanup-query failure can never skip the
+  // admin.end()/pool.end() calls below and leak open Postgres connections
+  // (CLAUDE.md §12).
   const { Client } = await import("pg");
   const admin = new Client({ connectionString: process.env.DATABASE_URL });
   await admin.connect();
-  // Every mutation this file exercises (create/rename/set-postal-code) now
-  // writes a real audit_log row as a side effect (see CLAUDE.md §17's own
-  // "Coverage" section on locations) -- audit_log.user_id has a real FK to
-  // users, so this delete must run before the users delete below, or the
-  // users delete fails with a foreign-key violation. Same class of gap
-  // CLAUDE.md §17 already documents fixing in 17 other test files' own
-  // after() hooks the first time their own mutations started writing
-  // audit_log rows -- this file just hadn't needed it until now.
-  await admin.query("DELETE FROM audit_log WHERE tenant_id = $1", [tenant.tenantId]);
-  await admin.query("DELETE FROM users WHERE tenant_id = $1", [tenant.tenantId]);
-  await admin.query("DELETE FROM tenants WHERE id = $1", [tenant.tenantId]);
-  await admin.end();
-  await pool.end();
+  try {
+    await withTenant(pool, tenant.tenantId, (client) => client.query("DELETE FROM locations WHERE tenant_id = $1", [tenant.tenantId]));
+    // Every mutation this file exercises (create/rename/set-postal-code) now
+    // writes a real audit_log row as a side effect (see CLAUDE.md §17's own
+    // "Coverage" section on locations) -- audit_log.user_id has a real FK to
+    // users, so this delete must run before the users delete below, or the
+    // users delete fails with a foreign-key violation. Same class of gap
+    // CLAUDE.md §17 already documents fixing in 17 other test files' own
+    // after() hooks the first time their own mutations started writing
+    // audit_log rows -- this file just hadn't needed it until now.
+    await admin.query("DELETE FROM audit_log WHERE tenant_id = $1", [tenant.tenantId]);
+    await admin.query("DELETE FROM users WHERE tenant_id = $1", [tenant.tenantId]);
+    await admin.query("DELETE FROM tenants WHERE id = $1", [tenant.tenantId]);
+  } finally {
+    await admin.end();
+    await pool.end();
+  }
 });
 
 test("an unauthenticated request to /api/locations/create is rejected, not applied", async () => {

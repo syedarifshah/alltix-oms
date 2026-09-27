@@ -199,6 +199,9 @@ function killServerTree(): void {
 
 after(async () => {
   killServerTree();
+  // Wrapped in try/finally so a cleanup-query failure can never skip the
+  // admin.end()/pool.end() calls below and leak open Postgres connections
+  // (CLAUDE.md §12).
   // api_rate_limit_windows deliberately has no DELETE grant for app_user
   // (migrations/0033_api_rate_limit_windows.sql's own doc comment -- this
   // pass never deletes a row through the app, only the scheduler's own
@@ -208,11 +211,14 @@ after(async () => {
   const { Client } = await import("pg");
   const admin = new Client({ connectionString: process.env.DATABASE_URL });
   await admin.connect();
-  await admin.query("DELETE FROM api_rate_limit_windows WHERE tenant_id = $1", [tenant.tenantId]);
-  await admin.query("DELETE FROM users WHERE tenant_id = $1", [tenant.tenantId]);
-  await admin.query("DELETE FROM tenants WHERE id = $1", [tenant.tenantId]);
-  await admin.end();
-  await pool.end();
+  try {
+    await admin.query("DELETE FROM api_rate_limit_windows WHERE tenant_id = $1", [tenant.tenantId]);
+    await admin.query("DELETE FROM users WHERE tenant_id = $1", [tenant.tenantId]);
+    await admin.query("DELETE FROM tenants WHERE id = $1", [tenant.tenantId]);
+  } finally {
+    await admin.end();
+    await pool.end();
+  }
 });
 
 /**

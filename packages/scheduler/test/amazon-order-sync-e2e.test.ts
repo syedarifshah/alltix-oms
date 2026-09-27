@@ -129,25 +129,31 @@ before(async () => {
 });
 
 after(async () => {
+  // Wrapped in try/finally so a cleanup-query failure can never skip the
+  // admin.end()/appPool.end()/adminPool.end() calls below and leak open
+  // Postgres connections (CLAUDE.md §12).
   const admin = new Client({ connectionString: process.env.DATABASE_URL });
   await admin.connect();
-  await admin.query("DELETE FROM audit_log WHERE tenant_id = $1", [tenantId]);
-  await admin.query("DELETE FROM rule_executions WHERE tenant_id = $1", [tenantId]);
-  await admin.query("DELETE FROM automation_rules WHERE tenant_id = $1", [tenantId]);
-  await admin.query("DELETE FROM inventory_events WHERE tenant_id = $1", [tenantId]);
-  await admin.query("DELETE FROM orders WHERE tenant_id = $1", [tenantId]); // cascades order_lines
-  await admin.query("DELETE FROM inventory_levels WHERE tenant_id = $1", [tenantId]);
-  await admin.query("DELETE FROM tenants WHERE id = $1", [tenantId]);
-  await admin.end();
+  try {
+    await admin.query("DELETE FROM audit_log WHERE tenant_id = $1", [tenantId]);
+    await admin.query("DELETE FROM rule_executions WHERE tenant_id = $1", [tenantId]);
+    await admin.query("DELETE FROM automation_rules WHERE tenant_id = $1", [tenantId]);
+    await admin.query("DELETE FROM inventory_events WHERE tenant_id = $1", [tenantId]);
+    await admin.query("DELETE FROM orders WHERE tenant_id = $1", [tenantId]); // cascades order_lines
+    await admin.query("DELETE FROM inventory_levels WHERE tenant_id = $1", [tenantId]);
+    await admin.query("DELETE FROM tenants WHERE id = $1", [tenantId]);
 
-  await withTenant(appPool, tenantId, (client) => client.query("DELETE FROM channel_listings WHERE tenant_id = $1", [tenantId]));
-  await withTenant(appPool, tenantId, (client) => client.query("DELETE FROM locations WHERE tenant_id = $1", [tenantId]));
-  await withTenant(appPool, tenantId, (client) => client.query("DELETE FROM products WHERE tenant_id = $1", [tenantId]));
-  await withTenant(appPool, tenantId, (client) =>
-    client.query("DELETE FROM channel_connections WHERE tenant_id = $1", [tenantId]),
-  );
-  await appPool.end();
-  await adminPool.end();
+    await withTenant(appPool, tenantId, (client) => client.query("DELETE FROM channel_listings WHERE tenant_id = $1", [tenantId]));
+    await withTenant(appPool, tenantId, (client) => client.query("DELETE FROM locations WHERE tenant_id = $1", [tenantId]));
+    await withTenant(appPool, tenantId, (client) => client.query("DELETE FROM products WHERE tenant_id = $1", [tenantId]));
+    await withTenant(appPool, tenantId, (client) =>
+      client.query("DELETE FROM channel_connections WHERE tenant_id = $1", [tenantId]),
+    );
+  } finally {
+    await admin.end();
+    await appPool.end();
+    await adminPool.end();
+  }
 });
 
 test("syncAmazonOrders discovers the sandbox tenant, pulls real orders, and routes+allocates them through the real job path", async () => {

@@ -161,21 +161,29 @@ function killServerTree(): void {
 
 after(async () => {
   killServerTree();
-  await withTenant(pool, tenantA.tenantId, (client) =>
-    client.query("DELETE FROM products WHERE tenant_id = $1", [tenantA.tenantId]),
-  );
-  await withTenant(pool, tenantB.tenantId, (client) =>
-    client.query("DELETE FROM products WHERE tenant_id = $1", [tenantB.tenantId]),
-  );
-  // users/tenants have no DELETE grant for app_user by design (see
-  // migrations/0010) -- clean those up via the schema-owning connection.
+  // Wrapped in try/finally so a cleanup-query failure can never skip the
+  // admin.end()/pool.end() calls below and leak open Postgres connections --
+  // that's what makes the whole `node --test` process hang indefinitely
+  // instead of failing fast (CLAUDE.md §12: "e2e test after() hooks have no
+  // try/finally around their own cleanup queries").
   const { Client } = await import("pg");
   const admin = new Client({ connectionString: process.env.DATABASE_URL });
   await admin.connect();
-  await admin.query("DELETE FROM users WHERE tenant_id IN ($1, $2)", [tenantA.tenantId, tenantB.tenantId]);
-  await admin.query("DELETE FROM tenants WHERE id IN ($1, $2)", [tenantA.tenantId, tenantB.tenantId]);
-  await admin.end();
-  await pool.end();
+  try {
+    await withTenant(pool, tenantA.tenantId, (client) =>
+      client.query("DELETE FROM products WHERE tenant_id = $1", [tenantA.tenantId]),
+    );
+    await withTenant(pool, tenantB.tenantId, (client) =>
+      client.query("DELETE FROM products WHERE tenant_id = $1", [tenantB.tenantId]),
+    );
+    // users/tenants have no DELETE grant for app_user by design (see
+    // migrations/0010) -- clean those up via the schema-owning connection.
+    await admin.query("DELETE FROM users WHERE tenant_id IN ($1, $2)", [tenantA.tenantId, tenantB.tenantId]);
+    await admin.query("DELETE FROM tenants WHERE id IN ($1, $2)", [tenantA.tenantId, tenantB.tenantId]);
+  } finally {
+    await admin.end();
+    await pool.end();
+  }
 });
 
 test("a single authenticated request only sees its own tenant's products", async () => {
