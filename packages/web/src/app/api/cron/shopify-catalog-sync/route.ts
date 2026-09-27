@@ -27,7 +27,9 @@ export const maxDuration = 60;
  * Safe to invoke more than once concurrently or in quick succession: the
  * product/channel_listings upserts key on their own UNIQUE constraints,
  * and the baseline-stock receipt is idempotent on (tenant, channel, sku) --
- * see syncShopifyCatalogForTenant's doc comment.
+ * see syncShopifyCatalogForConnection's doc comment (also documenting a
+ * real, deliberately open cross-store SKU-collision risk now that a tenant
+ * can connect more than one Shopify store).
  */
 export async function GET(req: NextRequest): Promise<Response> {
   const authHeader = req.headers.get("authorization");

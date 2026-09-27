@@ -137,7 +137,7 @@ export const RATE_LIMIT_COOLDOWN_MS = 15 * 60 * 1000;
  * against a real local Postgres, the same "exported for testability"
  * treatment walmart-connector.ts already gives its own pure mapping
  * functions -- callers inside this file should keep going through
- * syncTenant()/syncShopifyTenant()/syncWalmartTenant(), not call this
+ * syncTenant()/syncShopifyConnection()/syncWalmartTenant(), not call this
  * directly.
  */
 
@@ -286,7 +286,7 @@ export async function recordSyncSuccess(
 
 /**
  * The cross-run half of CLAUDE.md §4.4's circuit breaker: called from a
- * syncXTenant()/syncShopifyCatalogForTenant() catch block specifically when
+ * syncXTenant()/syncShopifyCatalogForConnection() catch block specifically when
  * `err instanceof RateLimitExhaustedError` (i.e. fetchWithBackoff itself
  * already retried in-process and gave up -- this is not called for every
  * failure, only a confirmed-sustained one), it stamps
@@ -512,8 +512,8 @@ async function syncTenant(appPool: Pool, orderService: OrderService, tenantId: s
 
 /**
  * Shopify's channel #3 counterpart to {@link syncAmazonOrders} -- same
- * shape (discover every tenant with an active connection of this channel,
- * sync each sequentially, never let one tenant's failure stop the rest),
+ * shape (discover every active connection of this channel, sync each
+ * sequentially, never let one tenant's/store's failure stop the rest),
  * kept as a parallel function rather than a generic
  * "syncChannelOrders(channel)" abstraction: AmazonConnector's `isSandbox()`
  * lookback special-case (see syncTenant below) has no Shopify equivalent
@@ -522,6 +522,11 @@ async function syncTenant(appPool: Pool, orderService: OrderService, tenantId: s
  * shared function would need a channel-specific branch inside it anyway.
  * Revisit this duplication if/when a fourth channel makes the shared shape
  * actually pay for itself.
+ *
+ * Per-connection discovery, not per-tenant, mirroring TikTok Shop's own
+ * true multi-shop CONNECT support (CLAUDE.md §4.8.1's "Update" paragraph):
+ * a tenant with two active Shopify stores now gets two independent sync
+ * attempts, each with its own cursor/failure count/rate-limit cooldown.
  */
 export async function syncShopifyOrders(params: SyncAmazonOrdersParams): Promise<TenantSyncResult[]> {
   const { appPool, adminPool, eventBus } = params;
@@ -532,8 +537,8 @@ export async function syncShopifyOrders(params: SyncAmazonOrdersParams): Promise
   const usageReporter = new UsageReporter(appPool);
   usageReporter.attach(eventBus);
 
-  const tenants = await adminPool.query<{ tenant_id: string }>(
-    `SELECT DISTINCT cc.tenant_id FROM channel_connections cc
+  const connections = await adminPool.query<{ id: string; tenant_id: string }>(
+    `SELECT cc.id, cc.tenant_id FROM channel_connections cc
       JOIN tenants t ON t.id = cc.tenant_id
       WHERE cc.channel = 'shopify' AND cc.status = 'active'
         AND (cc.rate_limited_until IS NULL OR cc.rate_limited_until <= now())
@@ -541,8 +546,8 @@ export async function syncShopifyOrders(params: SyncAmazonOrdersParams): Promise
   );
 
   const results: TenantSyncResult[] = [];
-  for (const { tenant_id: tenantId } of tenants.rows) {
-    results.push(await syncShopifyTenant(appPool, orderService, tenantId));
+  for (const { id: connectionId, tenant_id: tenantId } of connections.rows) {
+    results.push(await syncShopifyConnection(appPool, orderService, tenantId, connectionId));
   }
   return results;
 }
@@ -552,55 +557,77 @@ export async function runShopifyOrderSyncJob(appPool: Pool, adminPool: Pool): Pr
   return syncShopifyOrders({ appPool, adminPool, eventBus: new InProcessEventBus() });
 }
 
-/** Shopify counterpart to {@link syncTenant} -- identical error-isolation
- *  contract (never throws; a bad token/connector error becomes a failed
- *  result, not a stopped loop). No isSandbox()/canned-lookback branch here
- *  -- ShopifyConnector has no sandbox concept to special-case (see
- *  syncShopifyOrders's doc comment) -- `since` is always the real computed
- *  value. */
-async function syncShopifyTenant(appPool: Pool, orderService: OrderService, tenantId: string): Promise<TenantSyncResult> {
+/**
+ * Shopify counterpart to {@link syncTenant} -- identical error-isolation
+ * contract (never throws; a bad token/connector error becomes a failed
+ * result, not a stopped loop). No isSandbox()/canned-lookback branch here
+ * -- ShopifyConnector has no sandbox concept to special-case (see
+ * syncShopifyOrders's doc comment) -- `since` is always the real computed
+ * value.
+ *
+ * Renamed from syncShopifyTenant (which it was until this pass) and given a
+ * mandatory `connectionId`, the identical change TikTok's own
+ * syncTikTokConnection already made (CLAUDE.md §4.8.1): every DB operation
+ * below -- the last-sync-cursor read, credential loading, order persistence
+ * (which now stamps `orders.channel_connection_id`, migration 0037), the
+ * cursor UPDATE, and success/failure/rate-limit recording -- is scoped to
+ * this ONE connection row, not "every active shopify row for this tenant"
+ * the way it used to be. Two stores for the same tenant now genuinely sync
+ * independently: each gets its own cursor, its own failure count, its own
+ * rate-limit cooldown, and its own set of persisted orders correctly
+ * attributed back to the store they actually came from.
+ */
+async function syncShopifyConnection(
+  appPool: Pool,
+  orderService: OrderService,
+  tenantId: string,
+  connectionId: string,
+): Promise<TenantSyncResult> {
   const syncStartedAt = new Date();
 
   try {
     const lastSync = await withTenant(appPool, tenantId, (client) =>
       client.query<{ last_order_sync_at: string | null }>(
         `SELECT last_order_sync_at FROM channel_connections
-          WHERE tenant_id = $1 AND channel = 'shopify' AND status = 'active'
-          ORDER BY created_at DESC LIMIT 1`,
-        [tenantId],
+          WHERE id = $1 AND tenant_id = $2 AND channel = 'shopify' AND status = 'active'`,
+        [connectionId, tenantId],
       ),
     );
     const lastOrderSyncAt = lastSync.rows[0]?.last_order_sync_at;
     const since = lastOrderSyncAt ? new Date(lastOrderSyncAt) : new Date(syncStartedAt.getTime() - DEFAULT_LOOKBACK_MS);
 
-    const connector = await createShopifyConnectorFromChannelConnection(appPool, tenantId);
+    const connector = await createShopifyConnectorFromChannelConnection(appPool, tenantId, connectionId);
     const pulled = await connector.pullOrders(since);
-    const persisted = await orderService.persistPulledOrders(tenantId, pulled);
+    const persisted = await orderService.persistPulledOrders(tenantId, pulled, connectionId);
 
     // Same start-time-not-now reasoning as syncTenant() -- migration 0015's
     // comment applies identically here.
     await withTenant(appPool, tenantId, (client) =>
       client.query(
         `UPDATE channel_connections SET last_order_sync_at = $1, updated_at = now()
-          WHERE tenant_id = $2 AND channel = 'shopify' AND status = 'active'`,
-        [syncStartedAt.toISOString(), tenantId],
+          WHERE id = $2 AND tenant_id = $3 AND channel = 'shopify' AND status = 'active'`,
+        [syncStartedAt.toISOString(), connectionId, tenantId],
       ),
     );
-    await recordSyncSuccess(appPool, tenantId, "shopify");
+    await recordSyncSuccess(appPool, tenantId, "shopify", connectionId);
 
-    return { tenantId, success: true, ...persisted, error: null };
+    return { tenantId, connectionId, success: true, ...persisted, error: null };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`Shopify order sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
+    console.error(
+      `Shopify order sync failed for tenant ${tenantId}, connection ${connectionId}, continuing with remaining stores/tenants:`,
+      message,
+    );
     // Same cross-run failure tracking as syncTenant() -- see
-    // recordSyncFailure()'s doc comment.
-    await recordSyncFailure(appPool, tenantId, "shopify", message);
+    // recordSyncFailure()'s doc comment. Scoped to this one connectionId, so
+    // it can never flip a different, healthy store's status to 'error'.
+    await recordSyncFailure(appPool, tenantId, "shopify", message, connectionId);
     // Same cross-run circuit breaker as syncTenant() -- see
-    // recordRateLimitTrip()'s doc comment.
+    // recordRateLimitTrip()'s doc comment. Also scoped to this connectionId.
     if (err instanceof RateLimitExhaustedError) {
-      await recordRateLimitTrip(appPool, tenantId, "shopify", err.retryAfterMs);
+      await recordRateLimitTrip(appPool, tenantId, "shopify", err.retryAfterMs, connectionId);
     }
-    return { tenantId, success: false, insertedOrderIds: [], skippedExternalOrderIds: [], error: message };
+    return { tenantId, connectionId, success: false, insertedOrderIds: [], skippedExternalOrderIds: [], error: message };
   }
 }
 
@@ -652,11 +679,15 @@ export async function runWalmartOrderSyncJob(appPool: Pool, adminPool: Pool): Pr
   return syncWalmartOrders({ appPool, adminPool, eventBus: new InProcessEventBus() });
 }
 
-/** Walmart counterpart to {@link syncShopifyTenant} -- identical
- *  error-isolation contract (never throws; a bad clientId/clientSecret pair
- *  or connector error becomes a failed result, not a stopped loop). No
- *  isSandbox()/canned-lookback branch here either -- like Shopify,
- *  WalmartConnector always talks to the real computed `since` (see
+/** Walmart counterpart to {@link syncTenant} (Shopify's own single-tenant
+ *  equivalent, syncShopifyTenant, was renamed to the per-connection
+ *  syncShopifyConnection when Shopify gained true multi-store support --
+ *  Walmart itself has no multi-store concept, so this function's own shape
+ *  is unchanged) -- identical error-isolation contract (never throws; a bad
+ *  clientId/clientSecret pair or connector error becomes a failed result,
+ *  not a stopped loop). No isSandbox()/canned-lookback branch here either --
+ *  like Shopify, WalmartConnector always talks to the real computed `since`
+ *  (see
  *  createWalmartConnectorFromChannelConnection's own comment: it's always
  *  constructed against WALMART_PRODUCTION_BASE_URL, a real tenant connecting
  *  their real seller account, never this repo's internal sandbox). */
@@ -679,7 +710,7 @@ async function syncWalmartTenant(appPool: Pool, orderService: OrderService, tena
     const pulled = await connector.pullOrders(since);
     const persisted = await orderService.persistPulledOrders(tenantId, pulled);
 
-    // Same start-time-not-now reasoning as syncShopifyTenant()/syncTenant()
+    // Same start-time-not-now reasoning as syncShopifyConnection()/syncTenant()
     // -- migration 0015's comment applies identically here.
     await withTenant(appPool, tenantId, (client) =>
       client.query(
@@ -694,7 +725,7 @@ async function syncWalmartTenant(appPool: Pool, orderService: OrderService, tena
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Walmart order sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
-    // Same cross-run failure tracking as syncTenant()/syncShopifyTenant()
+    // Same cross-run failure tracking as syncTenant()/syncShopifyConnection()
     // -- see recordSyncFailure()'s doc comment. Doubly expected to fire
     // (and to flip status to 'error' within CONSECUTIVE_FAILURE_ERROR_THRESHOLD
     // runs) for every Walmart-connected tenant right now, given the
@@ -1050,7 +1081,7 @@ async function syncTikTokConnection(
 }
 
 /** Every product/channel_listings row this catalog-sync job maintains uses
- *  this same location for its baseline stock -- see syncShopifyCatalogForTenant's
+ *  this same location for its baseline stock -- see syncShopifyCatalogForConnection's
  *  doc comment. Deliberately the exact string
  *  scripts/add-channel-listing.ts's own LOCATION_NAME default already uses,
  *  so a SKU onboarded manually and a SKU picked up later by this automatic
@@ -1064,6 +1095,10 @@ export interface CatalogSyncResult {
   success: boolean;
   variantsUpserted: number;
   error: string | null;
+  /** Which specific channel_connections row this result is for -- populated
+   *  now that catalog sync discovers per-connection, mirroring
+   *  TenantSyncResult's own optional field (see its doc comment). */
+  connectionId?: string;
 }
 
 export interface SyncShopifyCatalogParams {
@@ -1074,23 +1109,31 @@ export interface SyncShopifyCatalogParams {
 
 /**
  * Closes the gap scripts/add-channel-listing.ts is a manual, one-SKU-at-a-time
- * stopgap for: pulls every tenant's connected Shopify store's full product
- * catalog (ShopifyConnector.pullProductCatalog) and upserts a
- * products/channel_listings row per SKU'd variant, exactly the shape that
- * script already creates by hand. Same discovery/per-tenant-isolation shape
- * as syncShopifyOrders (enumerate active 'shopify' channel_connections via
- * adminPool, sync each tenant via appPool, one tenant's failure never stops
- * the rest) -- kept as its own function rather than folded into
+ * stopgap for: pulls every connected Shopify store's full product catalog
+ * (ShopifyConnector.pullProductCatalog) and upserts a products/
+ * channel_listings row per SKU'd variant, exactly the shape that script
+ * already creates by hand. Same discovery/per-connection-isolation shape as
+ * syncShopifyOrders (enumerate active 'shopify' channel_connections rows via
+ * adminPool, sync each one via appPool, one store's failure never stops the
+ * rest) -- kept as its own function rather than folded into
  * syncShopifyOrders since catalog sync and order sync are genuinely
  * different operations with different failure/idempotency shapes, not just
  * a parameter away from each other.
+ *
+ * Per-connection discovery, not per-tenant, mirroring syncShopifyOrders' own
+ * multi-store update above: a tenant with two active Shopify stores now gets
+ * two independent catalog-sync attempts instead of only ever syncing
+ * whichever store happens to be "most recent." See
+ * syncShopifyCatalogForConnection's own doc comment for a real, deliberately
+ * NOT closed gap this surfaces (a SKU string collision across two different
+ * stores).
  */
 export async function syncShopifyCatalog(params: SyncShopifyCatalogParams): Promise<CatalogSyncResult[]> {
   const { appPool, adminPool } = params;
   const inventoryService = new InventoryService(appPool);
 
-  const tenants = await adminPool.query<{ tenant_id: string }>(
-    `SELECT DISTINCT cc.tenant_id FROM channel_connections cc
+  const connections = await adminPool.query<{ id: string; tenant_id: string }>(
+    `SELECT cc.id, cc.tenant_id FROM channel_connections cc
       JOIN tenants t ON t.id = cc.tenant_id
       WHERE cc.channel = 'shopify' AND cc.status = 'active'
         AND (cc.rate_limited_until IS NULL OR cc.rate_limited_until <= now())
@@ -1098,8 +1141,8 @@ export async function syncShopifyCatalog(params: SyncShopifyCatalogParams): Prom
   );
 
   const results: CatalogSyncResult[] = [];
-  for (const { tenant_id: tenantId } of tenants.rows) {
-    results.push(await syncShopifyCatalogForTenant(appPool, inventoryService, tenantId));
+  for (const { id: connectionId, tenant_id: tenantId } of connections.rows) {
+    results.push(await syncShopifyCatalogForConnection(appPool, inventoryService, tenantId, connectionId));
   }
   return results;
 }
@@ -1110,8 +1153,16 @@ export async function runShopifyCatalogSyncJob(appPool: Pool, adminPool: Pool): 
 }
 
 /**
- * Syncs one tenant's catalog. Never throws -- same per-tenant error
- * isolation as syncShopifyTenant/syncTenant.
+ * Syncs one Shopify store's catalog. Never throws -- same per-connection
+ * error isolation as syncShopifyConnection/syncTenant.
+ *
+ * Renamed from syncShopifyCatalogForTenant (which it was until this pass,
+ * taking only a tenantId) and given a mandatory `connectionId`, the same
+ * change syncShopifyOrders' own per-tenant sync function went through when
+ * Shopify gained true multi-store support (see syncShopifyConnection's own
+ * doc comment) -- `createShopifyConnectorFromChannelConnection` and
+ * `recordRateLimitTrip` are now both scoped to this ONE connection, not
+ * "whichever shopify row is most recent for this tenant."
  *
  * For each SKU'd variant: upsert `products` (keyed on its own
  * (tenant_id, internal_sku) UNIQUE constraint, internal_sku defaulting to
@@ -1121,6 +1172,27 @@ export async function runShopifyCatalogSyncJob(appPool: Pool, adminPool: Pool): 
  * (tenant_id, channel, channel_marketplace, external_id) UNIQUE constraint,
  * external_id = the variant's InventoryItem gid -- distinct per variant, so
  * two different SKUs never collide the way two empty external_ids would).
+ *
+ * **A real, deliberately NOT closed gap this pass's own multi-store support
+ * surfaces for the first time**: `internal_sku` is still "shopify-<sku>",
+ * keyed by tenant + SKU string only, NOT by which store the SKU came from --
+ * unchanged from before this pass, on purpose, since namespacing it by
+ * connection would change the internal_sku (and therefore the
+ * already-allocated inventory mapping) for every existing single-store
+ * tenant, the overwhelming common case, to fix a collision that can only
+ * happen once a tenant has genuinely connected a SECOND Shopify store. If a
+ * tenant's two stores happen to share a literal SKU string for two actually
+ * DIFFERENT products, this will incorrectly merge them into one
+ * products/inventory row instead of two -- a real bug, not a theoretical
+ * one, left open here the same "flag it, don't hide it" way this codebase
+ * flags every other unconfirmed/risky shortcut (e.g. Temu's
+ * skuStockTargetList, DHL's request shape). A tenant in that situation needs
+ * to rename one store's conflicting SKU before connecting a second store to
+ * this app, or this needs a real compound-key redesign (a bigger, separate
+ * piece of work, not attempted here) -- `channel_listings` rows themselves
+ * never collide (external_id is the variant's own globally-unique gid), so
+ * this is specifically a `products.internal_sku` risk, not a
+ * `channel_listings` one.
  *
  * Baseline stock is seeded via InventoryService.recordInventoryEvent with
  * idempotency_key = "catalog-onboarding:<tenantId>:shopify:<sku>" --
@@ -1136,47 +1208,55 @@ export async function runShopifyCatalogSyncJob(appPool: Pool, adminPool: Pool): 
  * cheap and idempotent on their own UNIQUE constraints -- without touching
  * inventory again: this tenant's own ledger (orders, allocations, manual
  * pushInventory) is the ongoing source of truth after the first baseline,
- * not Shopify's currently-reported quantity.
+ * not Shopify's currently-reported quantity. This same tenant+SKU-only key
+ * shape carries the identical cross-store collision risk described above --
+ * a second store's own catalog sync for a colliding SKU is treated as
+ * "already baselined," not a second, genuinely distinct product.
  */
-async function syncShopifyCatalogForTenant(
+async function syncShopifyCatalogForConnection(
   appPool: Pool,
   inventoryService: InventoryService,
   tenantId: string,
+  connectionId: string,
 ): Promise<CatalogSyncResult> {
   let variants: NormalizedShopifyProductVariant[];
   try {
-    const connector = await createShopifyConnectorFromChannelConnection(appPool, tenantId);
+    const connector = await createShopifyConnectorFromChannelConnection(appPool, tenantId, connectionId);
     variants = await connector.pullProductCatalog();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`Shopify catalog sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
+    console.error(
+      `Shopify catalog sync failed for tenant ${tenantId}, connection ${connectionId}, continuing with remaining stores/tenants:`,
+      message,
+    );
     // Unlike recordSyncFailure() (deliberately skipped here, see below),
     // recordRateLimitTrip() IS called for a catalog-sync rate limit --
     // rate_limited_until lives on the same channel_connections row
-    // syncShopifyOrders' discovery query also filters on, and a shop
+    // syncShopifyOrders' discovery query also filters on, and a store
     // that's actively throttling this tenant's GraphQL calls is throttling
     // the same underlying API order sync also calls, regardless of which
     // job tripped it first. Skipping this would mean a sustained catalog
     // rate-limit gets silently retried every run forever, the exact
     // "no cross-run signal anywhere" gap recordSyncFailure() itself was
-    // built to close.
+    // built to close. Scoped to this one connectionId, same as
+    // syncShopifyConnection's own call.
     if (err instanceof RateLimitExhaustedError) {
-      await recordRateLimitTrip(appPool, tenantId, "shopify", err.retryAfterMs);
+      await recordRateLimitTrip(appPool, tenantId, "shopify", err.retryAfterMs, connectionId);
     }
     // Deliberately NOT wired into recordSyncFailure()/the shared
-    // consecutive_failures counter that syncTenant()/syncShopifyTenant()/
+    // consecutive_failures counter that syncTenant()/syncShopifyConnection()/
     // syncWalmartTenant() now use (see recordSyncFailure()'s doc comment)
     // -- catalog sync and order sync are genuinely different operations
     // sharing the same channel_connections row (this function's own doc
     // comment above already makes that "different failure/idempotency
     // shapes" point), and pullProductCatalog() failing for reasons that
     // have nothing to do with pullOrders() (e.g. a GraphQL-only schema
-    // quirk) should never flip a tenant's connection to 'error' and cut
-    // off order sync, which may be working perfectly. This still logs
-    // every failure, same as before -- it's cross-run tracking/alerting
-    // specifically that's still an open gap here, deliberately, not
-    // fixed by this change.
-    return { tenantId, success: false, variantsUpserted: 0, error: message };
+    // quirk) should never flip a store's connection to 'error' and cut off
+    // order sync, which may be working perfectly. This still logs every
+    // failure, same as before -- it's cross-run tracking/alerting
+    // specifically that's still an open gap here, deliberately, not fixed
+    // by this change.
+    return { tenantId, connectionId, success: false, variantsUpserted: 0, error: message };
   }
 
   let variantsUpserted = 0;
@@ -1248,6 +1328,7 @@ async function syncShopifyCatalogForTenant(
 
   return {
     tenantId,
+    connectionId,
     success: true,
     variantsUpserted,
     error: null,

@@ -1140,6 +1140,106 @@ eBay/Temu v1" scope decision.
     `write_products` after already connecting will hit this exact confusing error and
     need to reconnect with a fresh token.
 
+### 4.5.1 Shopify true multi-store CONNECT — built, mirroring TikTok Shop's own §4.8.1 pattern
+
+- **Why**: Shopify's connector and its whole application-layer wiring (§4.5 above) were
+  complete and verified against a real dev store, but — unlike TikTok Shop, which
+  gained real multi-shop CONNECT support in §4.8.1 — Shopify still assumed exactly one
+  connected store per tenant. Any seller running multiple Shopify storefronts under one
+  AlltixOMS account couldn't onboard both; only whichever `channel_connections` row was
+  most recently created was ever loaded, synced, or dispatched to. Arif's own explicit
+  instruction, after this was proposed as the most concrete, externally-unblocked
+  Shopify-specific gap left in this codebase (no new vendor credential or research
+  needed — the exact pattern was already proven for TikTok Shop): **"Please Go
+  Ahead."**
+- **`loadShopifyCredentialsFromChannelConnection`/`createShopifyConnectorFromChannelConnection`**
+  (`shopify-connector.ts`) gained the identical optional trailing
+  `connectionId?: string | null` parameter TikTok's own functions already have,
+  appending `AND ($1::uuid IS NULL OR id = $1)` to the existing WHERE clause — omitted,
+  behaves exactly as before (most recently created active row for the tenant); passed,
+  scopes to exactly that one connection and does NOT fall back to "most recent" if that
+  row is missing/inactive, so a specific store's credentials failing loudly beats
+  silently using a different store's.
+- **Scheduler order sync**: `syncShopifyTenant` (renamed `syncShopifyConnection`, now
+  takes a mandatory `connectionId: string`) is driven by a discovery query that's now
+  per-connection, not per-tenant (`syncShopifyOrders`) — a tenant with two active
+  Shopify stores gets two independent sync attempts, each with its own cursor/failure
+  count/rate-limit cooldown, and each `TenantSyncResult` carries its own
+  `connectionId`. `recordSyncFailure`/`recordSyncSuccess`/`recordRateLimitTrip` (already
+  channel-agnostic, built for TikTok's own pass) are now called with Shopify's real
+  connection id too.
+- **Scheduler catalog sync**: `syncShopifyCatalogForTenant` (renamed
+  `syncShopifyCatalogForConnection`, now takes a mandatory `connectionId: string`) is
+  likewise discovered per-connection now (`syncShopifyCatalog`), not per-tenant — a
+  second store's catalog now actually gets pulled at all, instead of only ever the most
+  recent store's. **A real, deliberately open gap this surfaces for the first time**:
+  `products.internal_sku` is still `"shopify-<sku>"`, keyed by tenant + SKU string only
+  — not by which store the SKU came from, unchanged on purpose (namespacing it by
+  connection would change the internal_sku, and therefore the inventory mapping, for
+  every existing single-store tenant to fix a collision that only exists once a second
+  store is connected). If a tenant's two stores happen to share a literal SKU string
+  for two actually different products, this will incorrectly merge them into one
+  product/inventory row — flagged in `syncShopifyCatalogForConnection`'s own doc
+  comment, not solved here; a tenant in that situation needs to avoid the collision at
+  the source (rename one store's SKU) until a real compound-key redesign is done as its
+  own separate piece of work. `channel_listings` rows themselves never collide
+  (`external_id` is the variant's own globally-unique gid).
+- **`orders.channel_connection_id`** (already added generically by migration 0037 for
+  TikTok's own pass, no new migration needed here): now also stamped by Shopify's own
+  per-connection cron sync path (via `persistPulledOrders`'s existing optional third
+  parameter) — and, better than TikTok's own cron-only case, by the **real-time webhook
+  handler too**: `resolveShopifyWebhookTenant` (`/api/webhooks/shopify`) now also
+  `SELECT`s the matching `channel_connections.id` (it always could — `X-Shopify-Shop-
+  Domain` already identifies exactly one store, `external_account_id` being unique per
+  row — it just wasn't being captured before this pass) and `handleOrderCreate` passes
+  it straight into `persistPulledOrders`, so a webhook-delivered order is correctly
+  attributed to its real store from the moment it's created, with no separate
+  discovery step needed the way the cron job needs one.
+- **`WarehouseService.confirmShipment()`**: its Shopify branch now reads
+  `order.channel_connection_id` (the shared order-lookup SELECT already reads this
+  column for every channel) and passes it into
+  `createShopifyConnectorFromChannelConnection`, so a shipment for an order that came
+  in from store B gets confirmed against store B's own credentials, not whichever
+  store happens to be "most recent" at confirm time — identical to TikTok's own branch.
+- **`/settings/channels`**: the Shopify card's own query lost its `LIMIT 1` and now
+  renders one block per connected store (`.map()`, mirroring TikTok Shop's card
+  exactly), each with its own status/last-sync/webhook-secret/failure-banner, instead
+  of silently showing only the most recently connected one. The connect form's label
+  changed to "Reconnect or connect another Shopify store" — submitting a new, distinct
+  shop domain adds a store alongside the existing one(s) (the underlying
+  `(tenant_id, channel, marketplace, external_account_id)` UNIQUE constraint already
+  supported this — that side of the gap was already closed, exactly like TikTok's own
+  OAuth upsert route per §4.8.1's own "Multi-shop picker" paragraph), while resubmitting
+  an existing domain rotates that one store's credentials.
+- **Deliberately NOT touched**: `/api/channels/shopify/connect` itself (no code change
+  needed — see above); `/api/channels/shopify/listings` (creating a new outbound
+  listing) still omits `connectionId` and falls back to "most recently connected
+  store," since there's no order/webhook-header signal to resolve a specific store from
+  for a brand-new listing — a real store-picker for that flow is separate, additive UI
+  work, flagged in that route's own doc comment, not attempted here; no other channel
+  gained multi-connection support; `WarehouseService`'s other five channel branches are
+  untouched.
+- **Tested**: `packages/scheduler/test/shopify-multi-store.test.ts` (5 tests, mirroring
+  `tiktok-multi-shop.test.ts` exactly — both stores discovered and synced independently
+  with distinct `connectionId`s; one store flipping to `status='error'` leaves a
+  sibling untouched and stops being discovered while the healthy one still is;
+  `recordSyncSuccess`/`recordRateLimitTrip` scoped to one connection don't touch a
+  sibling's; omitting `connectionId` still applies to every active row, proving the
+  parameter is additive/opt-in). `persistPulledOrders`'s own
+  `channel-connection-id.test.ts` (already generic/channel-agnostic from TikTok's own
+  pass) already covers the exact code path Shopify's webhook handler now exercises too,
+  needing no Shopify-specific duplicate. Added to `scripts/run-tests.sh`'s
+  `SAFE_TESTS`. Verified: `npm run db:migrate` clean (no pending migration — reuses
+  0037 exactly as TikTok's own pass did), `npm run typecheck --workspaces` clean across
+  all twelve workspaces, `next build` clean, `bash scripts/run-tests.sh` — all 64 test
+  files pass.
+- **Still unverified in practice, same status every other multi-connection claim in
+  this codebase carries**: Shopify's underlying connector (`ShopifyConnector` itself)
+  remains confirmed against a real dev store (§4.5) — that doesn't change here. What
+  this pass adds (multi-store discovery/sync/shipment-routing/webhook-attribution) has
+  been proven against seeded Postgres rows with deterministic credential-missing
+  failures, not against two real connected Shopify stores under one tenant.
+
 ### 4.6 eBay Sell APIs (channel #4 — built once the connector abstraction had proven itself)
 
 - **Why now**: CLAUDE.md §8 Phase 5's roadmap lists eBay/TikTok Shop/additional channels

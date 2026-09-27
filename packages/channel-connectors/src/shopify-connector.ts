@@ -121,23 +121,42 @@ export function loadShopifyCredentialsFromEnv(): ShopifyCredentials {
  * lwa_client_id/encrypted_client_secret/encrypted_refresh_token, all
  * Amazon-OAuth concepts, are irrelevant to a Shopify row). Never logs the
  * decrypted token -- only returns it.
+ *
+ * `connectionId` (optional, mirrors TikTok Shop's own true multi-shop
+ * CONNECT support -- CLAUDE.md §4.8.1's "Update" paragraph, the exact
+ * template this is copied from): omitted, this behaves identically to
+ * before -- most recently created active 'shopify' row for the tenant, the
+ * same query shape every other single-store channel in this codebase still
+ * uses. Passed, it scopes the lookup to exactly that one connection via
+ * `AND ($2::uuid IS NULL OR id = $2)` and does NOT fall back to "most
+ * recent" if that specific row is missing or inactive -- a specific store's
+ * credentials failing loudly beats silently using a different store's,
+ * especially for a shipment confirmation (see
+ * WarehouseService.confirmShipment's own Shopify branch). `$1::uuid IS NULL
+ * OR id = $1` is the actual guard in the query below.
  */
 export async function loadShopifyCredentialsFromChannelConnection(
   pool: Pool,
   tenantId: string,
+  connectionId?: string | null,
 ): Promise<ShopifyCredentials> {
   return withTenant(pool, tenantId, async (client) => {
     const result = await client.query<{ external_account_id: string; encrypted_access_token: Buffer | null }>(
       `SELECT external_account_id, encrypted_access_token
          FROM channel_connections
         WHERE channel = 'shopify' AND status = 'active'
+          AND ($1::uuid IS NULL OR id = $1)
         ORDER BY created_at DESC
         LIMIT 1`,
+      [connectionId ?? null],
     );
 
     const row = result.rows[0];
     if (!row || !row.encrypted_access_token) {
-      throw new Error(`No active 'shopify' channel_connections row found for tenant ${tenantId}`);
+      throw new Error(
+        `No active 'shopify' channel_connections row found for tenant ${tenantId}` +
+          (connectionId ? ` (connection ${connectionId})` : ""),
+      );
     }
 
     const accessToken = await decryptChannelSecret(client, row.encrypted_access_token);
@@ -145,9 +164,15 @@ export async function loadShopifyCredentialsFromChannelConnection(
   });
 }
 
-/** Builds a {@link ShopifyConnector} from a tenant's channel_connections row instead of process.env. */
-export async function createShopifyConnectorFromChannelConnection(pool: Pool, tenantId: string): Promise<ShopifyConnector> {
-  const credentials = await loadShopifyCredentialsFromChannelConnection(pool, tenantId);
+/** Builds a {@link ShopifyConnector} from a tenant's channel_connections row instead
+ *  of process.env. `connectionId` is optional -- see
+ *  {@link loadShopifyCredentialsFromChannelConnection}'s own doc comment. */
+export async function createShopifyConnectorFromChannelConnection(
+  pool: Pool,
+  tenantId: string,
+  connectionId?: string | null,
+): Promise<ShopifyConnector> {
+  const credentials = await loadShopifyCredentialsFromChannelConnection(pool, tenantId, connectionId);
   return new ShopifyConnector(credentials);
 }
 

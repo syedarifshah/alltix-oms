@@ -950,7 +950,14 @@ export class WarehouseService {
       const connector = await createAmazonConnectorFromChannelConnection(this.pool, tenantId);
       await connector.confirmShipment(order.external_order_id, tracking);
     } else if (order.channel === "shopify") {
-      const connector = await createShopifyConnectorFromChannelConnection(this.pool, tenantId);
+      // channel_connection_id (migration 0037) resolves the correct STORE's
+      // credentials -- same true multi-shop CONNECT support TikTok's own
+      // branch already established below (CLAUDE.md §4.8.1), now built for
+      // Shopify too. NULL here (an order persisted before a tenant's first
+      // real second store existed, or by some path that doesn't set it)
+      // falls back to createShopifyConnectorFromChannelConnection's own
+      // "most recent active connection" behavior, unchanged from before.
+      const connector = await createShopifyConnectorFromChannelConnection(this.pool, tenantId, order.channel_connection_id);
       await connector.confirmShipment(order.external_order_id, tracking);
     } else if (order.channel === "walmart") {
       const connector = await createWalmartConnectorFromChannelConnection(this.pool, tenantId);

@@ -66,7 +66,7 @@ export async function POST(req: NextRequest): Promise<Response> {
     console.warn(`Shopify webhook received for unrecognized/inactive shop domain '${shopDomain}' (topic ${topic}) -- ignoring.`);
     return NextResponse.json({ error: "unrecognized shop" }, { status: 404 });
   }
-  const { tenantId, clientSecret } = resolved;
+  const { tenantId, connectionId, clientSecret } = resolved;
 
   if (!clientSecret) {
     console.error(
@@ -85,7 +85,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   try {
     switch (topic) {
       case "orders/create":
-        return await handleOrderCreate(appPool, tenantId, rawBody);
+        return await handleOrderCreate(appPool, tenantId, connectionId, rawBody);
       case "orders/cancelled":
         return await handleOrderCancelled(appPool, tenantId, rawBody);
       case "app/uninstalled":
@@ -109,6 +109,15 @@ export async function POST(req: NextRequest): Promise<Response> {
 
 interface ResolvedShopifyWebhookTenant {
   tenantId: string;
+  /** The specific channel_connections row this shop domain resolved to --
+   *  now that a tenant can have more than one active 'shopify' connection
+   *  (true multi-store CONNECT, mirroring TikTok Shop's own §4.8.1), this is
+   *  what lets handleOrderCreate stamp orders.channel_connection_id
+   *  correctly instead of leaving it NULL. X-Shopify-Shop-Domain already
+   *  identifies exactly one store (external_account_id is unique per row),
+   *  so this was always resolvable here -- it just wasn't being captured
+   *  and threaded through until this pass. */
+  connectionId: string;
   /** null means a connection row was found but no signing secret is on
    *  file -- distinct from "no connection at all" (resolveShopifyWebhookTenant
    *  returns null itself for that case), since the caller needs to log/
@@ -126,8 +135,8 @@ interface ResolvedShopifyWebhookTenant {
 async function resolveShopifyWebhookTenant(adminPool: Pool, shopDomain: string): Promise<ResolvedShopifyWebhookTenant | null> {
   const client = await adminPool.connect();
   try {
-    const result = await client.query<{ tenant_id: string; encrypted_client_secret: Buffer | null }>(
-      `SELECT tenant_id, encrypted_client_secret
+    const result = await client.query<{ id: string; tenant_id: string; encrypted_client_secret: Buffer | null }>(
+      `SELECT id, tenant_id, encrypted_client_secret
          FROM channel_connections
         WHERE channel = 'shopify' AND external_account_id = $1 AND status = 'active'
         ORDER BY created_at DESC
@@ -138,7 +147,7 @@ async function resolveShopifyWebhookTenant(adminPool: Pool, shopDomain: string):
     if (!row) return null;
 
     const clientSecret = row.encrypted_client_secret ? await decryptChannelSecret(client, row.encrypted_client_secret) : null;
-    return { tenantId: row.tenant_id, clientSecret };
+    return { tenantId: row.tenant_id, connectionId: row.id, clientSecret };
   } finally {
     client.release();
   }
@@ -156,8 +165,16 @@ async function resolveShopifyWebhookTenant(adminPool: Pool, shopDomain: string):
  * packages/scheduler's syncShopifyOrders -- both are stateless
  * orchestrators whose real work is already tenant-scoped internally, so
  * building them per call is cheap and avoids any cross-request state.
+ *
+ * `connectionId` (the specific channel_connections row resolveShopifyWebhookTenant
+ * already resolved from X-Shopify-Shop-Domain) is passed straight into
+ * persistPulledOrders()'s own optional third parameter -- unlike the cron
+ * job (which has to look this up separately per sync run, see
+ * syncShopifyConnection), a webhook delivery gets this for free from its own
+ * header, so there's no reason for this path to ever leave
+ * orders.channel_connection_id NULL the way it used to.
  */
-async function handleOrderCreate(appPool: Pool, tenantId: string, rawBody: string): Promise<Response> {
+async function handleOrderCreate(appPool: Pool, tenantId: string, connectionId: string, rawBody: string): Promise<Response> {
   const payload = JSON.parse(rawBody) as ShopifyOrderWebhookPayload;
   const normalized = normalizeShopifyOrderWebhookPayload(payload);
 
@@ -166,7 +183,7 @@ async function handleOrderCreate(appPool: Pool, tenantId: string, rawBody: strin
   const rulesEngine = new RulesEngine(appPool);
   rulesEngine.attach(eventBus);
 
-  const persisted = await orderService.persistPulledOrders(tenantId, [normalized]);
+  const persisted = await orderService.persistPulledOrders(tenantId, [normalized], connectionId);
   return NextResponse.json({
     status: "ok",
     inserted: persisted.insertedOrderIds.length,

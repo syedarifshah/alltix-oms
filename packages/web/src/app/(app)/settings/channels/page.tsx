@@ -36,7 +36,13 @@ interface ChannelConnectionRow extends FailureTrackingColumns {
  *  has_webhook_secret reflects whether encrypted_client_secret is set --
  *  never the decrypted value itself, just whether real-time webhooks
  *  (see /api/webhooks/shopify) can possibly be verified for this
- *  connection or whether it's cron-only for now. */
+ *  connection or whether it's cron-only for now.
+ *
+ *  A tenant can now have more than one active 'shopify' row (one per
+ *  connected store, true multi-store CONNECT mirroring TikTok Shop's own
+ *  §4.8.1) -- see this file's shopifyResult query below, which dropped its
+ *  own LIMIT 1 for the identical reason tiktokResult's own query already
+ *  did. */
 interface ShopifyConnectionRow extends FailureTrackingColumns {
   external_account_id: string;
   status: string;
@@ -214,7 +220,7 @@ export default async function ChannelsSettingsPage({
     );
   }
 
-  const { connection, shopifyConnection, walmartConnection, ebayConnection, temuConnection, tiktokConnections, enabledChannels } = await withTenant(
+  const { connection, shopifyConnections, walmartConnection, ebayConnection, temuConnection, tiktokConnections, enabledChannels } = await withTenant(
     pool,
     tenantId,
     async (client) => {
@@ -232,14 +238,18 @@ export default async function ChannelsSettingsPage({
           ORDER BY created_at DESC
           LIMIT 1`,
       );
+      // No LIMIT 1 here, deliberately unlike this used to be -- a tenant can
+      // now have more than one active 'shopify' row (one per connected
+      // store, true multi-store CONNECT mirroring TikTok Shop's own
+      // §4.8.1's own tiktokResult query below), and this page now shows
+      // every one of them, not just the newest.
       const shopifyResult = await client.query<ShopifyConnectionRow>(
         `SELECT external_account_id, status, created_at, last_order_sync_at,
                 (encrypted_client_secret IS NOT NULL) AS has_webhook_secret,
                 consecutive_failures, last_failure_at, last_failure_message
            FROM channel_connections
           WHERE channel = 'shopify'
-          ORDER BY created_at DESC
-          LIMIT 1`,
+          ORDER BY created_at DESC`,
       );
       const walmartResult = await client.query<WalmartConnectionRow>(
         `SELECT external_account_id, status, created_at, last_order_sync_at,
@@ -280,7 +290,7 @@ export default async function ChannelsSettingsPage({
       );
       return {
         connection: amazonResult.rows[0] ?? null,
-        shopifyConnection: shopifyResult.rows[0] ?? null,
+        shopifyConnections: shopifyResult.rows,
         walmartConnection: walmartResult.rows[0] ?? null,
         ebayConnection: ebayResult.rows[0] ?? null,
         temuConnection: temuResult.rows[0] ?? null,
@@ -292,7 +302,7 @@ export default async function ChannelsSettingsPage({
 
   const isConnected = connection?.status === "active";
   const environment = connection ? classifyEnvironment(connection.lwa_client_id) : null;
-  const isShopifyConnected = shopifyConnection?.status === "active";
+  const isShopifyConnected = shopifyConnections.some((c) => c.status === "active");
   const isWalmartConnected = walmartConnection?.status === "active";
   const isEbayConnected = ebayConnection?.status === "active";
   const isTemuConnected = temuConnection?.status === "active";
@@ -435,37 +445,55 @@ export default async function ChannelsSettingsPage({
 
       <h2>Shopify</h2>
       <div className="card">
-        {shopifyConnection ? (
+        {shopifyConnections.length > 0 ? (
           <div className="stack">
-            <div className="row">
-              <span className={isShopifyConnected ? "badge badge-success" : "badge badge-danger"}>
-                {shopifyConnection.status}
-              </span>
-              <span className="muted">store {shopifyConnection.external_account_id}</span>
+            {/* One block per connected store -- previously this page only
+                ever showed the most-recently-connected store (a hardcoded
+                LIMIT 1), which made a second store invisible here even
+                though (before the scheduler fix) it also silently was never
+                being synced either. See ShopifyConnectionRow's own doc
+                comment, mirroring TikTokConnectionRow's identical one. */}
+            {shopifyConnections.map((conn) => (
+              <div
+                key={conn.external_account_id}
+                className="stack"
+                style={{ borderTop: "1px solid var(--border)", paddingTop: 8, marginTop: 8 }}
+              >
+                <div className="row">
+                  <span className={conn.status === "active" ? "badge badge-success" : "badge badge-danger"}>
+                    {conn.status}
+                  </span>
+                  <span className="muted">store {conn.external_account_id}</span>
+                </div>
+                <div className="muted">Connected since {new Date(conn.created_at).toISOString()}</div>
+                <div className="muted">
+                  Last order sync:{" "}
+                  {conn.last_order_sync_at ? new Date(conn.last_order_sync_at).toISOString() : "never synced yet"}
+                </div>
+                <div className="muted">
+                  {conn.has_webhook_secret
+                    ? "Real-time webhooks: signing secret on file (see /api/webhooks/shopify) -- orders/create, orders/cancelled, and app/uninstalled sync near-instantly; the daily cron still runs as a fallback."
+                    : "Real-time webhooks: not enabled -- no signing secret on file yet, syncing via the daily cron only. Enter this store's custom app API secret key below to enable them."}
+                </div>
+                <SyncFailureBanner
+                  status={conn.status}
+                  consecutive_failures={conn.consecutive_failures}
+                  last_failure_at={conn.last_failure_at}
+                  last_failure_message={conn.last_failure_message}
+                />
+              </div>
+            ))}
+            <div className="muted" style={{ marginTop: 8 }}>
+              Each store above now syncs independently -- connecting another store below adds it alongside the
+              one(s) already here (a different shop domain), it does not replace them. Re-submitting the same shop
+              domain rotates that store&apos;s own credentials instead of creating a duplicate.
             </div>
-            <div className="muted">Connected since {new Date(shopifyConnection.created_at).toISOString()}</div>
-            <div className="muted">
-              Last order sync:{" "}
-              {shopifyConnection.last_order_sync_at
-                ? new Date(shopifyConnection.last_order_sync_at).toISOString()
-                : "never synced yet"}
-            </div>
-            <div className="muted">
-              {shopifyConnection.has_webhook_secret
-                ? "Real-time webhooks: signing secret on file (see /api/webhooks/shopify) -- orders/create, orders/cancelled, and app/uninstalled sync near-instantly; the daily cron still runs as a fallback."
-                : "Real-time webhooks: not enabled -- no signing secret on file yet, syncing via the daily cron only. Enter the custom app's API secret key below to enable them."}
-            </div>
-            <SyncFailureBanner
-              status={shopifyConnection.status}
-              consecutive_failures={shopifyConnection.consecutive_failures}
-              last_failure_at={shopifyConnection.last_failure_at}
-              last_failure_message={shopifyConnection.last_failure_message}
-            />
             {/* No OAuth reconnect redirect for Shopify (see the connect
-                route's own doc comment) -- reconnecting means re-submitting
-                the form below with a fresh token, so it's always shown
-                rather than only when disconnected. */}
-            <ShopifyConnectForm buttonLabel="Reconnect Shopify" />
+                route's own doc comment) -- reconnecting or adding a store
+                means submitting this same form with the relevant shop
+                domain and a token, so it's always shown rather than only
+                when disconnected. */}
+            <ShopifyConnectForm buttonLabel="Reconnect or connect another Shopify store" />
           </div>
         ) : isShopifyEnabled ? (
           <ShopifyConnectForm buttonLabel="Connect Shopify" />
