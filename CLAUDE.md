@@ -1046,6 +1046,16 @@ eBay/Temu v1" scope decision.
     it was actually hit in practice. Still unverified: whether a *repeat* registration
     for an already-subscribed topic+uri is a no-op or a rejected `userError` — the live
     test above only ever registered once per tenant.
+  - **Update — repeat-registration confirmed a real rejected `userError`, not a no-op;
+    fixed (§4.5.2 below)**: the "still unverified" line directly above is now resolved
+    — not by re-running the live test (no Shopify dev-store credentials exist in the
+    environment this fix was built in), but by cross-referencing consistent, independent
+    reports on Shopify's own developer community forum of the exact real userError text,
+    `"Address for this topic has already been taken"`, returned by `webhookSubscriptionCreate`
+    for a topic that already has a subscription — regardless of whether the URI matches,
+    consistent with Shopify's documented one-subscription-per-topic-per-app model. See
+    §4.5.2 for the fix and its own honest "built from research, not re-verified live"
+    caveat.
   - **Update — real production incident, batch-wide rollback bug (found diagnosing a
     live "No channel_listings match ... cannot resolve product_id for order_lines"
     failure banner on `/settings/channels`)**: the SKU-less/unmapped-order case one
@@ -1240,6 +1250,70 @@ eBay/Temu v1" scope decision.
   this pass adds (multi-store discovery/sync/shipment-routing/webhook-attribution) has
   been proven against seeded Postgres rows with deterministic credential-missing
   failures, not against two real connected Shopify stores under one tenant.
+
+### 4.5.2 Shopify webhook re-registration idempotency — built, closing §4.5's own "still unverified" line
+
+- **Why**: with the full 7-carrier build (§19) closed out and Shopify's own multi-store
+  work (§4.5.1) done and merged, the next-most-buildable, well-scoped, no-external-
+  dependency gap left on the Shopify connector was picked from its own architectural
+  record: `registerWebhooks()`'s doc comment had carried an honest "still genuinely
+  unknown" line since §4.5 was first built — whether Shopify treats a *repeat*
+  registration for an already-subscribed topic as a harmless no-op (fine) or a rejected
+  `userError` (meaning every tenant who reconnects Shopify without changing anything,
+  e.g. re-submitting the connect form to rotate a token, would suddenly start seeing
+  webhook registration "fail" on every topic after the first time).
+- **Now confirmed, not guessed**: Shopify's own docs (`shopify.dev`'s webhook-subscribe
+  pages, fetched directly for this pass) don't state the behavior either. But it's a
+  real, independently-and-repeatedly reported userError across multiple threads on
+  Shopify's own developer community forum — different developers, different topics
+  (`PRODUCTS_UPDATE`, `appsubscriptions/update`, others), all hitting the identical
+  message: `webhookSubscriptionCreate` rejects a topic that already has a subscription
+  with `"Address for this topic has already been taken"` — regardless of whether the
+  new URI matches the existing one. Consistent with Shopify's own documented
+  one-subscription-per-topic-per-app model (the migration note on that same doc page:
+  switching subscription scope requires removing the old subscription first "to avoid
+  potential conflicts"). So: confirmed NOT a no-op — this was a real, live bug waiting
+  for the first tenant to ever reconnect.
+- **Fix** (`ShopifyConnector.registerWebhooks()`, `shopify-connector.ts`): same "check
+  existing state before mutating" discipline `pushInventory()` already uses (reads
+  current `inventoryLevels` before calling `inventorySetQuantities`, never guesses) —
+  before creating, a new `findExistingWebhookSubscription()` queries
+  `webhookSubscriptions(first: 1, topics: [...])` for that topic. Three real, named
+  outcomes now live on `ShopifyWebhookRegistrationResult.outcome`:
+  - nothing found → `webhookSubscriptionCreate` as before (`"created"`).
+  - one exists and already points at the target callback URL → skip the mutation
+    entirely, report success against the existing subscription id (`"unchanged"`) —
+    this is the actual "reconnected without changing anything" case that used to fail.
+  - one exists but points elsewhere (a stale local-dev URL, a hosting migration) →
+    `webhookSubscriptionUpdate` against that id instead of `webhookSubscriptionCreate`
+    (confirmed to hit the identical "already taken" wall) — (`"repointed"`).
+  A defensive fallback still catches the literal "already been taken" userError text if
+  the create call is attempted anyway (a race between two concurrent registration
+  attempts for the same topic, or the lookup query itself returning stale data) and
+  re-resolves it via a fresh lookup rather than surfacing a false failure for a topic
+  that's actually correctly subscribed.
+- **`/api/channels/shopify/connect`**: gained one added log line (`console.info`, not a
+  behavior change) when a result's `outcome` is `"unchanged"`/`"repointed"`, so this
+  fix visibly taking effect in production is distinguishable from a fresh registration
+  in the logs, not just inferred from the absence of an error.
+- **UNVERIFIED IN PRACTICE, and said so directly in the connector's own doc comment**:
+  built from Shopify's own documented subscription model plus cross-referenced,
+  consistent community reports of the exact error text — not from actually re-running
+  the create-then-reconnect sequence against a real Shopify dev store this pass (no
+  live Shopify credentials exist in the environment this fix was built in). Same
+  disclosure standard this file already applies to every less-than-fully-confirmed
+  field on Amazon's/Walmart's own connectors.
+- **Tested**: 4 new tests in `packages/channel-connectors/test/shopify-connector.test.ts`
+  (fetch stubbed per the same "stub globalThis.fetch, restore in finally" discipline
+  `packages/carrier-connectors`' own test files already use) — fresh creation when
+  nothing exists; skips the create call entirely and reports `"unchanged"` when a
+  matching subscription already exists; calls `webhookSubscriptionUpdate` (never
+  create) and reports `"repointed"` when an existing subscription points elsewhere; the
+  create-time-race defensive fallback resolves to `"unchanged"` via a re-query rather
+  than a false failure. All exercise the real 3-topic loop `registerWebhooks()` runs,
+  not a single topic in isolation. Verified: `npm run typecheck --workspaces` clean
+  across all twelve workspaces, `next build` clean, `bash scripts/run-tests.sh` — all 64
+  test files pass (30/30 in the Shopify connector's own file, up from 26).
 
 ### 4.6 eBay Sell APIs (channel #4 — built once the connector abstraction had proven itself)
 

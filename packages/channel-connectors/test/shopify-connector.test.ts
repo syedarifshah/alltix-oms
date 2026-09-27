@@ -16,10 +16,23 @@ import {
   normalizeShopifyOrderWebhookPayload,
   normalizeShopifyProductVariant,
   verifyShopifyWebhookHmac,
+  ShopifyConnector,
   type RawProductVariantNode,
   type ShopifyOrder,
   type ShopifyOrderWebhookPayload,
 } from "../src/shopify-connector.js";
+
+// registerWebhooks()'s idempotency fix (see its own doc comment) needs a
+// real connector instance and a stubbed fetch -- "stub globalThis.fetch,
+// restore in finally" is the same discipline packages/carrier-connectors'
+// own test files already follow for their live network calls.
+function makeTestConnector(): ShopifyConnector {
+  return new ShopifyConnector({ shopDomain: "test-shop.myshopify.com", accessToken: "shpat_test" });
+}
+
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+}
 
 function makeShopifyOrder(overrides: Partial<ShopifyOrder> = {}): ShopifyOrder {
   return {
@@ -264,4 +277,154 @@ test("verifyShopifyWebhookHmac rejects a malformed/short header instead of throw
 test("verifyShopifyWebhookHmac rejects an empty header instead of throwing", () => {
   const rawBody = JSON.stringify({ id: 123 });
   assert.equal(verifyShopifyWebhookHmac(rawBody, "", "test-client-secret"), false);
+});
+
+// registerWebhooks()'s idempotency fix -- see that method's own doc comment
+// for the full "confirmed real userError, not a no-op" writeup this closes
+// out. Each scenario below exercises all 3 SHOPIFY_WEBHOOK_TOPICS (the
+// real loop registerWebhooks() runs), not just one, since the fix lives in
+// per-topic control flow that has to hold for every topic identically.
+
+test("registerWebhooks creates a fresh subscription when none exists yet for the topic (outcome: 'created')", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (_input, init) => {
+    const body = String(init?.body ?? "");
+    if (body.includes("webhookSubscriptions(first: 1")) {
+      return jsonResponse({ data: { webhookSubscriptions: { edges: [] } } });
+    }
+    if (body.includes("webhookSubscriptionCreate(")) {
+      return jsonResponse({
+        data: { webhookSubscriptionCreate: { webhookSubscription: { id: "gid://shopify/WebhookSubscription/1" }, userErrors: [] } },
+      });
+    }
+    throw new Error(`unexpected GraphQL call in test: ${body}`);
+  }) as typeof fetch;
+
+  try {
+    const results = await makeTestConnector().registerWebhooks("https://app.example.com/api/webhooks/shopify");
+    assert.equal(results.length, 3);
+    for (const result of results) {
+      assert.equal(result.success, true);
+      assert.equal(result.outcome, "created");
+      assert.equal(result.webhookSubscriptionId, "gid://shopify/WebhookSubscription/1");
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("registerWebhooks skips webhookSubscriptionCreate and reports 'unchanged' when a subscription already points at the same callbackUrl", async () => {
+  const originalFetch = globalThis.fetch;
+  let callCount = 0;
+  globalThis.fetch = (async (_input, init) => {
+    callCount++;
+    const body = String(init?.body ?? "");
+    if (body.includes("webhookSubscriptions(first: 1")) {
+      return jsonResponse({
+        data: {
+          webhookSubscriptions: {
+            edges: [{ node: { id: "gid://shopify/WebhookSubscription/existing", endpoint: { callbackUrl: "https://app.example.com/api/webhooks/shopify" } } }],
+          },
+        },
+      });
+    }
+    throw new Error(`registerWebhooks must not call create/update when the existing subscription already matches -- saw: ${body}`);
+  }) as typeof fetch;
+
+  try {
+    const results = await makeTestConnector().registerWebhooks("https://app.example.com/api/webhooks/shopify");
+    assert.equal(results.length, 3);
+    for (const result of results) {
+      assert.equal(result.success, true);
+      assert.equal(result.outcome, "unchanged");
+      assert.equal(result.webhookSubscriptionId, "gid://shopify/WebhookSubscription/existing");
+    }
+    // Exactly one lookup call per topic, no create/update calls at all.
+    assert.equal(callCount, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("registerWebhooks calls webhookSubscriptionUpdate (not create) and reports 'repointed' when the existing subscription's callbackUrl differs", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (_input, init) => {
+    const body = String(init?.body ?? "");
+    if (body.includes("webhookSubscriptions(first: 1")) {
+      return jsonResponse({
+        data: {
+          webhookSubscriptions: {
+            edges: [{ node: { id: "gid://shopify/WebhookSubscription/stale", endpoint: { callbackUrl: "https://old-ngrok-url.ngrok.io/webhooks" } } }],
+          },
+        },
+      });
+    }
+    if (body.includes("webhookSubscriptionUpdate(")) {
+      return jsonResponse({
+        data: { webhookSubscriptionUpdate: { webhookSubscription: { id: "gid://shopify/WebhookSubscription/stale" }, userErrors: [] } },
+      });
+    }
+    throw new Error(`registerWebhooks must repoint via update, never create, once an existing subscription is found -- saw: ${body}`);
+  }) as typeof fetch;
+
+  try {
+    const results = await makeTestConnector().registerWebhooks("https://app.example.com/api/webhooks/shopify");
+    assert.equal(results.length, 3);
+    for (const result of results) {
+      assert.equal(result.success, true);
+      assert.equal(result.outcome, "repointed");
+      assert.equal(result.webhookSubscriptionId, "gid://shopify/WebhookSubscription/stale");
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("registerWebhooks resolves a same-topic race defensively: a create-time 'already been taken' userError is re-queried and reported as 'unchanged', not a failure", async () => {
+  const originalFetch = globalThis.fetch;
+  // Per topic: lookup #1 finds nothing (simulating a race where another
+  // request registered the topic between this lookup and this create) ->
+  // create hits the real, confirmed "already been taken" userError ->
+  // lookup #2 now finds it. Same 3-call sequence repeats for each topic.
+  let callIndex = 0;
+  globalThis.fetch = (async (_input, init) => {
+    const body = String(init?.body ?? "");
+    const step = callIndex % 3;
+    callIndex++;
+    if (step === 0) {
+      assert.ok(body.includes("webhookSubscriptions(first: 1"), `expected first lookup, saw: ${body}`);
+      return jsonResponse({ data: { webhookSubscriptions: { edges: [] } } });
+    }
+    if (step === 1) {
+      assert.ok(body.includes("webhookSubscriptionCreate("), `expected create attempt, saw: ${body}`);
+      return jsonResponse({
+        data: {
+          webhookSubscriptionCreate: {
+            webhookSubscription: null,
+            userErrors: [{ field: ["webhookSubscription", "uri"], message: "Address for this topic has already been taken" }],
+          },
+        },
+      });
+    }
+    assert.ok(body.includes("webhookSubscriptions(first: 1"), `expected re-query lookup, saw: ${body}`);
+    return jsonResponse({
+      data: {
+        webhookSubscriptions: {
+          edges: [{ node: { id: "gid://shopify/WebhookSubscription/found-after-race", endpoint: { callbackUrl: "https://app.example.com/api/webhooks/shopify" } } }],
+        },
+      },
+    });
+  }) as typeof fetch;
+
+  try {
+    const results = await makeTestConnector().registerWebhooks("https://app.example.com/api/webhooks/shopify");
+    assert.equal(results.length, 3);
+    for (const result of results) {
+      assert.equal(result.success, true);
+      assert.equal(result.outcome, "unchanged");
+      assert.equal(result.webhookSubscriptionId, "gid://shopify/WebhookSubscription/found-after-race");
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

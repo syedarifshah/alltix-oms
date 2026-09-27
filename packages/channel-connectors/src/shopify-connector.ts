@@ -445,12 +445,38 @@ export interface ShopifyWebhookRegistrationResult {
   success: boolean;
   webhookSubscriptionId: string | null;
   error: string | null;
+  /** Only meaningful when `success` is true -- see registerWebhooks()'s own
+   *  doc comment for what each value means and why this distinction exists
+   *  (a repeat registration is a confirmed rejected userError, not a
+   *  no-op, so registerWebhooks() has to check first and repoint/skip
+   *  rather than blindly calling webhookSubscriptionCreate every time). */
+  outcome?: "created" | "unchanged" | "repointed";
 }
 
 interface WebhookSubscriptionCreateResponse {
   webhookSubscriptionCreate: {
     webhookSubscription: { id: string } | null;
     userErrors: GraphQLUserError[];
+  };
+}
+
+interface WebhookSubscriptionUpdateResponse {
+  webhookSubscriptionUpdate: {
+    webhookSubscription: { id: string } | null;
+    userErrors: GraphQLUserError[];
+  };
+}
+
+/** `endpoint` on a `WebhookSubscription` is a union
+ *  (WebhookHttpEndpoint | WebhookEventBridgeEndpoint | WebhookPubSubEndpoint)
+ *  -- this connector only ever registers HTTP endpoints (registerWebhooks()
+ *  always passes `format: "JSON"` with a plain `uri`), so the inline
+ *  fragment below is the only shape ever queried for; `callbackUrl` comes
+ *  back `null`/absent for the other two endpoint kinds, which is fine since
+ *  this connector never creates those. */
+interface WebhookSubscriptionsQueryResponse {
+  webhookSubscriptions: {
+    edges: { node: { id: string; endpoint: { callbackUrl?: string } } }[];
   };
 }
 
@@ -665,56 +691,77 @@ export class ShopifyConnector {
    * for a product with no channel_listings mapping correctly failed loudly
    * and rolled back rather than persisting a broken order).
    *
-   * Still genuinely unknown: whether Shopify treats a *repeat* registration
-   * for a topic+uri pair already subscribed (e.g. a tenant reconnecting
-   * without changing anything) as a harmless no-op or a rejected userError
-   * -- this method doesn't special-case a guess, it just surfaces whatever
-   * userErrors come back. Not exercised by the verification above, which
-   * only ever registered once per tenant.
+   * **Repeat-registration behavior -- now confirmed, not guessed.** This was
+   * previously flagged here as "genuinely unknown," since the dev-store
+   * verification above only ever registered once per tenant. Shopify's own
+   * docs don't state the behavior either (checked directly against
+   * shopify.dev's webhook-subscribe pages while researching this). But it's
+   * a widely and consistently reported real userError across Shopify's own
+   * developer community forum -- multiple independent threads hit the exact
+   * same message calling `webhookSubscriptionCreate` for a topic that
+   * already has a subscription: `"Address for this topic has already been
+   * taken"`. That's consistent with Shopify's well-documented one-active-
+   * subscription-per-topic-per-app model (see the migration note on
+   * shopify.dev's webhook-subscribe page: switching subscription scope
+   * requires removing the old one first "to avoid potential conflicts").
+   * So: NOT a no-op -- a tenant reconnecting without changing anything used
+   * to get a hard per-topic failure every time after the first, even though
+   * nothing was actually wrong.
+   *
+   * Fixed here with the same "check existing state before mutating" pattern
+   * pushInventory() already uses (read current inventoryLevels before
+   * calling inventorySetQuantities, rather than guessing): before creating,
+   * query for an existing subscription on that topic
+   * (`findExistingWebhookSubscription`). Three outcomes, all real and named
+   * on {@link ShopifyWebhookRegistrationResult.outcome}:
+   *  - none exists -> `webhookSubscriptionCreate` as before (`"created"`).
+   *  - one exists and already points at `callbackUrl` -> skip the mutation
+   *    entirely, report success against the existing id (`"unchanged"`) --
+   *    this is the actual reconnect-with-no-changes case that used to fail.
+   *  - one exists but points somewhere else (a stale ngrok URL from local
+   *    dev, a hostname migration) -> `webhookSubscriptionUpdate` against
+   *    that id rather than `webhookSubscriptionCreate`, which is confirmed
+   *    to hit the same "already taken" wall (`"repointed"`).
+   * A defensive fallback still catches the literal "already been taken"
+   * userError text on the create call itself (a same-topic race between two
+   * concurrent registration attempts, or the lookup query itself silently
+   * returning stale/incomplete data) and re-queries to resolve it as
+   * `"unchanged"`/`"repointed"` rather than surfacing a failure for a topic
+   * that is, in reality, correctly subscribed.
+   *
+   * UNVERIFIED IN PRACTICE: this fix is built from Shopify's own documented
+   * subscription model plus consistent, cross-referenced community reports
+   * of the exact error text, not from re-running the create-then-recreate
+   * sequence against a real store this pass (no live Shopify credentials in
+   * this environment) -- same disclosure discipline this file already
+   * applies to Amazon's/Walmart's own less-than-fully-confirmed fields.
+   *
+   * Still isolates one topic's failure from blocking the others, unchanged
+   * from before.
    */
   async registerWebhooks(callbackUrl: string): Promise<ShopifyWebhookRegistrationResult[]> {
     const results: ShopifyWebhookRegistrationResult[] = [];
 
     for (const topic of SHOPIFY_WEBHOOK_TOPICS) {
       try {
-        const response = await this.graphql<WebhookSubscriptionCreateResponse>(
-          `mutation ($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
-            webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
-              webhookSubscription { id }
-              userErrors { field message }
-            }
-          }`,
-          { topic, webhookSubscription: { uri: callbackUrl, format: "JSON" } },
-        );
+        const existing = await this.findExistingWebhookSubscription(topic);
 
-        if (response.errors) {
-          results.push({
-            topic,
-            success: false,
-            webhookSubscriptionId: null,
-            error: ShopifyConnector.formatGraphQLErrors(response.errors, "unknown error"),
-          });
+        if (existing && existing.callbackUrl === callbackUrl) {
+          results.push({ topic, success: true, webhookSubscriptionId: existing.id, error: null, outcome: "unchanged" });
           continue;
         }
 
-        const userErrors = response.data?.webhookSubscriptionCreate.userErrors ?? [];
-        if (userErrors.length > 0) {
-          results.push({
-            topic,
-            success: false,
-            webhookSubscriptionId: null,
-            error: ShopifyConnector.formatUserErrors(userErrors, "unknown error"),
-          });
+        if (existing) {
+          const updateResult = await this.updateWebhookSubscription(existing.id, callbackUrl);
+          results.push(
+            updateResult.success
+              ? { topic, success: true, webhookSubscriptionId: existing.id, error: null, outcome: "repointed" }
+              : { topic, success: false, webhookSubscriptionId: null, error: updateResult.error },
+          );
           continue;
         }
 
-        const webhookSubscriptionId = response.data?.webhookSubscriptionCreate.webhookSubscription?.id ?? null;
-        if (!webhookSubscriptionId) {
-          results.push({ topic, success: false, webhookSubscriptionId: null, error: "no webhookSubscription returned" });
-          continue;
-        }
-
-        results.push({ topic, success: true, webhookSubscriptionId, error: null });
+        results.push(await this.createWebhookSubscription(topic, callbackUrl));
       } catch (err) {
         results.push({
           topic,
@@ -726,6 +773,110 @@ export class ShopifyConnector {
     }
 
     return results;
+  }
+
+  /** Looks up whatever subscription (if any) this app already has for
+   *  `topic`, regardless of its current callbackUrl -- see
+   *  registerWebhooks()'s own doc comment for why this has to run before
+   *  every create attempt, not just on a detected failure. `first: 1` is
+   *  deliberate: Shopify's own one-subscription-per-topic-per-app model
+   *  (the same fact this lookup exists to work around) means there is never
+   *  more than one to find. Returns `null` -- not a thrown error -- when the
+   *  query itself comes back empty or with GraphQL-level errors, so a
+   *  lookup hiccup degrades to "attempt create" (registerWebhooks()'s
+   *  pre-existing behavior) rather than blocking registration outright. */
+  private async findExistingWebhookSubscription(topic: ShopifyWebhookTopic): Promise<{ id: string; callbackUrl: string | null } | null> {
+    const response = await this.graphql<WebhookSubscriptionsQueryResponse>(
+      `query ($topics: [WebhookSubscriptionTopic!]) {
+        webhookSubscriptions(first: 1, topics: $topics) {
+          edges { node { id endpoint { ... on WebhookHttpEndpoint { callbackUrl } } } }
+        }
+      }`,
+      { topics: [topic] },
+    );
+    const node = response.data?.webhookSubscriptions.edges[0]?.node;
+    if (!node) return null;
+    return { id: node.id, callbackUrl: node.endpoint.callbackUrl ?? null };
+  }
+
+  /** The original (pre-idempotency-fix) create path, used only once
+   *  {@link findExistingWebhookSubscription} has confirmed no subscription
+   *  exists yet for this topic. Includes the defensive "already taken"
+   *  fallback described in registerWebhooks()'s own doc comment: if the
+   *  create call itself still hits that userError (a race with another
+   *  concurrent registration, or a lookup that returned stale data),
+   *  re-resolves it as a real `"unchanged"`/`"repointed"` outcome via a
+   *  fresh lookup rather than reporting a false failure for a topic that is
+   *  actually subscribed correctly. */
+  private async createWebhookSubscription(topic: ShopifyWebhookTopic, callbackUrl: string): Promise<ShopifyWebhookRegistrationResult> {
+    const response = await this.graphql<WebhookSubscriptionCreateResponse>(
+      `mutation ($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
+        webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
+          webhookSubscription { id }
+          userErrors { field message }
+        }
+      }`,
+      { topic, webhookSubscription: { uri: callbackUrl, format: "JSON" } },
+    );
+
+    if (response.errors) {
+      return { topic, success: false, webhookSubscriptionId: null, error: ShopifyConnector.formatGraphQLErrors(response.errors, "unknown error") };
+    }
+
+    const userErrors = response.data?.webhookSubscriptionCreate.userErrors ?? [];
+    if (userErrors.length > 0) {
+      if (userErrors.some((e) => e.message.toLowerCase().includes("already been taken"))) {
+        const existing = await this.findExistingWebhookSubscription(topic);
+        if (existing && existing.callbackUrl === callbackUrl) {
+          return { topic, success: true, webhookSubscriptionId: existing.id, error: null, outcome: "unchanged" };
+        }
+        if (existing) {
+          const updateResult = await this.updateWebhookSubscription(existing.id, callbackUrl);
+          return updateResult.success
+            ? { topic, success: true, webhookSubscriptionId: existing.id, error: null, outcome: "repointed" }
+            : { topic, success: false, webhookSubscriptionId: null, error: updateResult.error };
+        }
+      }
+      return { topic, success: false, webhookSubscriptionId: null, error: ShopifyConnector.formatUserErrors(userErrors, "unknown error") };
+    }
+
+    const webhookSubscriptionId = response.data?.webhookSubscriptionCreate.webhookSubscription?.id ?? null;
+    if (!webhookSubscriptionId) {
+      return { topic, success: false, webhookSubscriptionId: null, error: "no webhookSubscription returned" };
+    }
+
+    return { topic, success: true, webhookSubscriptionId, error: null, outcome: "created" };
+  }
+
+  /** Repoints an existing subscription (found stale by
+   *  {@link findExistingWebhookSubscription}) at a new `callbackUrl`, used
+   *  instead of `webhookSubscriptionCreate` -- attempting create against a
+   *  topic that already has a subscription is confirmed to fail regardless
+   *  of whether the URI matches (see registerWebhooks()'s own doc comment),
+   *  so this is the only real path to change where an existing topic
+   *  delivers to. */
+  private async updateWebhookSubscription(id: string, callbackUrl: string): Promise<{ success: true } | { success: false; error: string }> {
+    const response = await this.graphql<WebhookSubscriptionUpdateResponse>(
+      `mutation ($id: ID!, $webhookSubscription: WebhookSubscriptionInput!) {
+        webhookSubscriptionUpdate(id: $id, webhookSubscription: $webhookSubscription) {
+          webhookSubscription { id }
+          userErrors { field message }
+        }
+      }`,
+      { id, webhookSubscription: { uri: callbackUrl, format: "JSON" } },
+    );
+
+    if (response.errors) {
+      return { success: false, error: ShopifyConnector.formatGraphQLErrors(response.errors, "unknown error") };
+    }
+    const userErrors = response.data?.webhookSubscriptionUpdate.userErrors ?? [];
+    if (userErrors.length > 0) {
+      return { success: false, error: ShopifyConnector.formatUserErrors(userErrors, "unknown error") };
+    }
+    if (!response.data?.webhookSubscriptionUpdate.webhookSubscription?.id) {
+      return { success: false, error: "no webhookSubscription returned" };
+    }
+    return { success: true };
   }
 
   /**

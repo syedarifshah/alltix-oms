@@ -169,6 +169,15 @@ export async function POST(req: NextRequest): Promise<Response> {
           console.error(
             `Shopify webhook registration failed for tenant ${user.tenantId}, topic ${result.topic}: ${result.error}`,
           );
+        } else if (result.outcome && result.outcome !== "created") {
+          // Worth its own log line, not just a bare success: this is the
+          // exact "tenant reconnected without changing anything" case
+          // registerWebhooks() used to hard-fail on every time after the
+          // first (see that method's own doc comment) -- confirms the fix
+          // is actually taking this path in production, not just in tests.
+          console.info(
+            `Shopify webhook registration for tenant ${user.tenantId}, topic ${result.topic}: ${result.outcome} (no new subscription created)`,
+          );
         }
       }
     } catch (err) {
