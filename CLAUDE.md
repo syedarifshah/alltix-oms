@@ -1466,6 +1466,123 @@ eBay/Temu v1" scope decision.
   and `/api/channels/shopify/listings` route both compile), `bash scripts/run-tests.sh`
   — all 65 test files pass, unchanged.
 
+### 4.5.5 Multi-store listings per product — built, closing §4.5.4's own "What this does NOT solve" gap
+
+- **Why**: §4.5.4's own store-picker closed choosing WHICH connected store a
+  product's first Shopify listing goes to, but explicitly left a second gap open —
+  a product could still only ever have ONE `channel_listings` row per (tenant,
+  product, 'shopify'), full stop, even across different stores. Once that was
+  confirmed still open, Arif was asked (AskUserQuestion) which of the two remaining
+  Shopify items to pick up next; his explicit pick was **"Multi-store listings per
+  product (Recommended)"** — described in that question's own option text as
+  letting one product be listed on more than one connected Shopify store at once,
+  needing a new `channel_connection_id` column on `channel_listings`, a scoped
+  duplicate-guard, and a `/products` display update.
+- **The real blocker was never the schema's own uniqueness constraint**: reading
+  migration `0004_channel_listings.sql` directly shows `channel_listings`' real
+  UNIQUE constraint is `(tenant_id, channel, channel_marketplace, external_id)` —
+  not `(tenant_id, product_id, channel)`. Since `external_id` (a store-specific
+  Shopify GID) already differs per store, the schema itself never actually
+  prevented one product from having listings on two different Shopify stores. The
+  real blocker was purely application-level: every outbound listing-creation
+  route's own duplicate-create guard checked only `(tenant_id, product_id,
+  channel)`, rejecting a SECOND store's listing for the same product outright,
+  regardless of which store it would have gone to.
+- **`channel_listings.channel_connection_id`** (migration
+  `0043_channel_listings_connection_id.sql`, nullable UUID FK to
+  `channel_connections`, no `ON DELETE` — same precedent `orders.
+  channel_connection_id` (migration 0037), `orders.preferred_location_id`
+  (migration 0014), and `orders.split_from_order_id` (migration 0023) all already
+  set, since this codebase never DELETEs a `channel_connections` row, only
+  flips its `status`): the mechanism that lets code tell "already listed on THIS
+  store" apart from "already listed on a DIFFERENT store" for the first time.
+  Expand-only and backward-compatible per CLAUDE.md §9 — nullable, no backfill for
+  existing rows (this codebase never recorded which specific `channel_connections`
+  row an existing `channel_listings` row came from), zero behavior change for any
+  row this migration doesn't touch. Shopify-only for now, same as §4.5.1's own true
+  multi-store CONNECT — Amazon/Walmart/eBay each still support only one connection
+  per tenant, so a second listing on a second connection isn't a scenario those
+  three channels' own routes can even reach yet, but the column lives on the
+  shared `channel_listings` table (not a Shopify-only table) so any channel that
+  later gains multi-connection support can adopt the identical pattern without
+  another migration.
+- **"Legacy NULL row blocks conservatively" — a deliberate design choice, not an
+  oversight**: a pre-migration `channel_listings` row (or any future row inserted
+  without a known connection) has `channel_connection_id IS NULL`. The new
+  duplicate-create guard treats a NULL-connection row as blocking ANY new listing
+  attempt for that product, on any store — conservative on purpose, to avoid
+  risking an undetected duplicate when store provenance is genuinely unknown,
+  rather than allowing an unconstrained second listing. `/products`' own display
+  (below) mirrors this exactly: a legacy row falls back to the old single
+  generic-status-badge display and offers no new listing-creation form at all for
+  that product.
+- **Catalog sync also had to be updated, not just the outbound route — a real,
+  non-obvious consequence caught during design, before it could become a live
+  bug**: if `channel_connection_id` were only stamped on OUTBOUND-created listings,
+  every product pulled in by catalog sync (`syncShopifyCatalogForConnection` in
+  `packages/scheduler/src/index.ts` — the common case, since most products in this
+  app arrive via catalog sync, not manual outbound creation) would read as a
+  store-unknown "legacy" row under the conservative guard above, incorrectly
+  blocking new outbound multi-store listing creation for essentially every
+  existing product — defeating the feature's own purpose except for brand-new,
+  outbound-only products. Fixed by also stamping `channel_connection_id` (using
+  the function's own already-in-scope `connectionId` parameter) in that INSERT and
+  its `ON CONFLICT ... DO UPDATE` clause — a re-synced or originally-
+  `add-channel-listing.ts`-seeded variant now gets a correct, current
+  `connectionId` on every sync, not just insert.
+- **`/api/channels/shopify/listings` route**: resolves the actual connection ONCE,
+  up front, into `resolvedConnectionId` — not left to
+  `createShopifyConnectorFromChannelConnection`'s own internal fallback — since the
+  route now needs that concrete id for two things: which store's credentials to
+  call Shopify with, and which store to stamp on the new `channel_listings.
+  channel_connection_id`. The duplicate-create guard is now scoped by
+  `channel_connection_id`, not just `(tenant_id, product_id, channel)`: `WHERE
+  tenant_id = $1 AND product_id = $2 AND channel = 'shopify' AND
+  (channel_connection_id = $3 OR channel_connection_id IS NULL)` — a product CAN
+  now have a real listing on one store and still be creatable on a different one,
+  while a legacy NULL row still blocks any store (see above). The `channel_listings`
+  INSERT and the `channel_listing.created` audit event's own `details` (§17) both
+  now carry the resolved connection id.
+- **`/products` display**: the product query's Shopify half changed from a plain
+  single-row `LEFT JOIN` to a `LEFT JOIN LATERAL` with `json_agg`, aggregating
+  every one of a product's `'shopify'` `channel_listings` rows
+  (`channelConnectionId`/`listingStatus`/`listPrice`/`externalSku` each,
+  `COALESCE`d to `'[]'::json` for a product with none) instead of assuming exactly
+  one row. The Shopify column (`ShopifyCell`, replacing §4.5.4's own
+  single-status-or-`<select>`-form cell) renders one row per connected store:
+  that store's own listing badge if a matching `channelConnectionId` entry exists,
+  or an inline "List on `<store>`" form (`CreateListingFormForConnection`, a hidden
+  `connectionId` field, no `<select>` needed since each row is already scoped to
+  one specific store) if it doesn't — retiring §4.5.4's own `<select>`-based
+  `CreateListingForm` entirely, since per-store inline forms make a dropdown
+  redundant. A legacy (`channelConnectionId === null`) entry falls back to the old
+  single generic-status-badge display and offers no creation form at all, matching
+  the route's own conservative guard exactly.
+- **What this does NOT solve, still deliberately out of scope**: the
+  SKU-namespace-collision risk §4.5.1 itself already flagged (two stores under one
+  tenant sharing a literal SKU string) — unchanged, a genuinely separate, larger
+  redesign of `products.internal_sku` keying, not attempted here either.
+- **Tested**: no new dedicated test file, same reasoning §4.5.4's own "Tested"
+  paragraph already gives for a route-plus-page-level UI change with no new pure
+  decision logic to extract — the catalog-sync stamping fix and the route's own
+  connection-resolution/duplicate-guard logic reuse
+  `loadShopifyCredentialsFromChannelConnection`'s/
+  `createShopifyConnectorFromChannelConnection`'s already-tested `connectionId`
+  parameter (`shopify-multi-store.test.ts`, §4.5.1), and the `/products` page's own
+  `json_agg` query and `ShopifyCell`/`CreateListingFormForConnection` rendering
+  logic have no test file at all, same as every other read-only/display page in
+  this app (`/inventory`, `/reports` — see §8's own "no test file at all" note for
+  those). Verified: `npm run db:migrate` (migration 0043's first real
+  application), `npm run typecheck --workspaces` clean across all twelve
+  workspaces, `next build` clean (the updated `/products` page and `/api/channels/
+  shopify/listings` route both compile), `bash scripts/run-tests.sh` — all 65 test
+  files pass, unchanged (two individually-verified transient failures during a
+  full-suite run — `demo-request-rate-limit-e2e.test.ts` and
+  `new-rate-limited-routes-e2e.test.ts`, neither touched by this pass — were
+  confirmed as the same known resource-contention-under-full-parallel-load pattern
+  §16/§19.4 already document, via a clean isolated re-run of each (3/3, 10/10) and
+  a subsequent clean full-suite run).
+
 ### 4.6 eBay Sell APIs (channel #4 — built once the connector abstraction had proven itself)
 
 - **Why now**: CLAUDE.md §8 Phase 5's roadmap lists eBay/TikTok Shop/additional channels

@@ -13,13 +13,25 @@ interface ShopifyConnectionOption {
   external_account_id: string;
 }
 
+/** One row from `channel_listings` for the 'shopify' channel, shaped for
+ *  json_agg -- see the page's own query doc comment for why this is now an
+ *  array per product instead of a handful of scalar columns (CLAUDE.md
+ *  §4.5.5). `channelConnectionId: null` means a "legacy" row from before
+ *  migration 0043 (or any row inserted without a known connection) -- store
+ *  attribution is unknown for it, so it's rendered/guarded differently, see
+ *  ShopifyCell below. */
+interface ShopifyListingInfo {
+  channelConnectionId: string | null;
+  listingStatus: string;
+  listPrice: string | null;
+  externalSku: string | null;
+}
+
 interface ProductRow {
   id: string;
   internal_sku: string;
   name: string;
-  shopify_listing_status: string | null;
-  shopify_list_price: string | null;
-  shopify_external_sku: string | null;
+  shopify_listings: ShopifyListingInfo[];
   walmart_listing_id: string | null;
   walmart_listing_status: string | null;
   walmart_list_price: string | null;
@@ -59,15 +71,22 @@ interface ProductsPageProps {
  * Same auth/tenant pattern as every other page in this app -- see
  * src/app/orders/page.tsx's doc comment.
  *
- * **Shopify store-picker -- closes the "falls back to most recently
- * connected store" gap CLAUDE.md §4.5.1 flagged as deliberately not
- * touched**: a tenant with more than one active Shopify connection
- * (§4.5.1's own true multi-store CONNECT) now gets a real `<select>` on
- * CreateListingForm to choose which connected store a brand-new listing
- * goes to, instead of the route silently defaulting to "most recently
- * connected." With exactly one (or zero) active connections the picker
- * is omitted entirely -- nothing to choose between, and the route's own
- * connectionId-omitted default behavior is already correct.
+ * **Multi-store Shopify listings per product -- closes the "one Shopify
+ * listing per product, total" gap CLAUDE.md §4.5.4 flagged as out of scope
+ * (CLAUDE.md §4.5.5)**: a product can now be listed on more than one of a
+ * tenant's connected Shopify stores at once. The Shopify column no longer
+ * shows a single status badge or a single-select "List on Shopify" form --
+ * it shows one row per connected store, either that store's own listing
+ * badge (if `channel_listings` already has a row scoped to that
+ * `channel_connection_id`) or an inline "List on <store>" form carrying a
+ * hidden `connectionId` for that one specific store (no `<select>` needed
+ * per row, since each row is already scoped to one store -- this
+ * supersedes §4.5.4's own `<select>`-based CreateListingForm). A "legacy"
+ * row with no recorded `channel_connection_id` (any row from before
+ * migration 0043) falls back to the old single generic-status-badge
+ * display instead, and blocks creating a new listing for that product
+ * entirely -- store attribution is unknown for it, matching the
+ * conservative duplicate-guard the listings route itself applies.
  */
 export default async function ProductsPage({ searchParams }: ProductsPageProps): Promise<ReactElement> {
   const authContext = await getAuthContext(await headers());
@@ -104,11 +123,16 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
     hasActiveAmazonConnection,
     hasEbaySellingSetup,
   } = await withTenant(pool, tenantId, async (client) => {
+      // Shopify listings are aggregated via a LATERAL json_agg, not a plain
+      // LEFT JOIN -- a product can now legitimately have more than one
+      // 'shopify' channel_listings row (one per connected store, CLAUDE.md
+      // §4.5.5), and a plain join would either duplicate the product row per
+      // listing or silently drop to one. COALESCE to '[]' so a product with
+      // no Shopify listings at all still gets a real (empty) array, not
+      // NULL, matching ShopifyListingInfo[]'s own non-nullable shape.
       const productsResult = await client.query<ProductRow>(
         `SELECT p.id, p.internal_sku, p.name,
-                cl.listing_status AS shopify_listing_status,
-                cl.list_price AS shopify_list_price,
-                cl.external_sku AS shopify_external_sku,
+                COALESCE(shopify_agg.listings, '[]'::json) AS shopify_listings,
                 cw.id AS walmart_listing_id,
                 cw.listing_status AS walmart_listing_status,
                 cw.list_price AS walmart_list_price,
@@ -120,8 +144,18 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
                 ce.external_id AS ebay_listing_id,
                 ce.list_price AS ebay_list_price
            FROM products p
-           LEFT JOIN channel_listings cl
-             ON cl.product_id = p.id AND cl.tenant_id = p.tenant_id AND cl.channel = 'shopify'
+           LEFT JOIN LATERAL (
+             SELECT json_agg(
+                      json_build_object(
+                        'channelConnectionId', cl.channel_connection_id,
+                        'listingStatus', cl.listing_status,
+                        'listPrice', cl.list_price,
+                        'externalSku', cl.external_sku
+                      ) ORDER BY cl.created_at
+                    ) AS listings
+               FROM channel_listings cl
+              WHERE cl.product_id = p.id AND cl.tenant_id = p.tenant_id AND cl.channel = 'shopify'
+           ) shopify_agg ON true
            LEFT JOIN channel_listings cw
              ON cw.product_id = p.id AND cw.tenant_id = p.tenant_id AND cw.channel = 'walmart'
            LEFT JOIN channel_listings ca
@@ -271,21 +305,11 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
                   <td className="mono">{product.internal_sku}</td>
                   <td>{product.name}</td>
                   <td>
-                    {product.shopify_listing_status ? (
-                      <div className="stack">
-                        <span className={product.shopify_listing_status === "active" ? "badge badge-success" : "badge"}>
-                          {product.shopify_listing_status}
-                        </span>
-                        <span className="muted">
-                          sku {product.shopify_external_sku}
-                          {product.shopify_list_price ? ` · $${product.shopify_list_price}` : ""}
-                        </span>
-                      </div>
-                    ) : shopifyConnections.length > 0 ? (
-                      <CreateListingForm productId={product.id} connections={shopifyConnections} />
-                    ) : (
-                      <span className="muted">not listed</span>
-                    )}
+                    <ShopifyCell
+                      productId={product.id}
+                      listings={product.shopify_listings}
+                      connections={shopifyConnections}
+                    />
                   </td>
                   <td>
                     {product.walmart_listing_status ? (
@@ -369,34 +393,105 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
   );
 }
 
+/** Renders the whole Shopify column for one product -- CLAUDE.md §4.5.5's
+ *  own per-store breakdown, replacing §4.5.4's single-status-or-single-form
+ *  cell now that a product can have more than one Shopify listing at once.
+ *
+ *  A "legacy" entry (`channelConnectionId === null` -- any row from before
+ *  migration 0043) falls back to the old single generic-status-badge
+ *  display and blocks any new listing creation for this product entirely --
+ *  store attribution is unknown for it, matching the listings route's own
+ *  conservative `(channel_connection_id = $x OR channel_connection_id IS
+ *  NULL)` duplicate-guard exactly, so this cell never offers a creation
+ *  path the route would just reject anyway.
+ *
+ *  Otherwise, one row is rendered per connected store: that store's own
+ *  listing badge if `listings` already has an entry scoped to it, or an
+ *  inline "List on <store>" form (hidden connectionId, no `<select>` --
+ *  each row is already scoped to one specific store) if it doesn't. */
+function ShopifyCell({
+  productId,
+  listings,
+  connections,
+}: {
+  productId: string;
+  listings: ShopifyListingInfo[];
+  connections: ShopifyConnectionOption[];
+}): ReactElement {
+  const legacy = listings.find((listing) => listing.channelConnectionId === null);
+  if (legacy) {
+    return (
+      <div className="stack">
+        <span className={legacy.listingStatus === "active" ? "badge badge-success" : "badge"}>
+          {legacy.listingStatus}
+        </span>
+        <span className="muted">
+          sku {legacy.externalSku}
+          {legacy.listPrice ? ` · $${legacy.listPrice}` : ""}
+        </span>
+      </div>
+    );
+  }
+
+  if (connections.length === 0) {
+    return <span className="muted">not listed</span>;
+  }
+
+  return (
+    <div className="stack">
+      {connections.map((connection) => {
+        const listing = listings.find((entry) => entry.channelConnectionId === connection.id);
+        if (listing) {
+          return (
+            <div key={connection.id} className="stack" style={{ marginBottom: 4 }}>
+              <span className="muted">{connection.external_account_id}</span>
+              <span className={listing.listingStatus === "active" ? "badge badge-success" : "badge"}>
+                {listing.listingStatus}
+              </span>
+              <span className="muted">
+                sku {listing.externalSku}
+                {listing.listPrice ? ` · $${listing.listPrice}` : ""}
+              </span>
+            </div>
+          );
+        }
+        return (
+          <CreateListingFormForConnection
+            key={connection.id}
+            productId={productId}
+            connectionId={connection.id}
+            storeLabel={connection.external_account_id}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
 /** Plain HTML form, no client JS -- CLAUDE.md's Next.js conventions call for
  *  <form action method="POST"> submissions, same pattern as every other
  *  mutation form in this app (e.g. /settings/channels' ShopifyConnectForm,
  *  /rules' "New rule" form).
  *
- *  Store picker: with exactly one active Shopify connection (the common
- *  case), no `connectionId` field is rendered at all -- there's nothing to
- *  choose between, and the route's own "omitted means most recently
- *  connected" default is already correct and unambiguous. With more than
- *  one, a real `<select>` lets the tenant choose which connected store
- *  this listing gets created on, closing the gap CLAUDE.md §4.5.1 flagged
- *  ("falls back to most recently connected store, a real store-picker ...
- *  not attempted here"). */
-function CreateListingForm({ productId, connections }: { productId: string; connections: ShopifyConnectionOption[] }): ReactElement {
+ *  Store picker: unlike §4.5.4's old CreateListingForm, there is never a
+ *  `<select>` here -- this form is always rendered once per specific
+ *  connected store (see ShopifyCell above), so `connectionId` is always a
+ *  known hidden value, not a choice the tenant makes on this form. */
+function CreateListingFormForConnection({
+  productId,
+  connectionId,
+  storeLabel,
+}: {
+  productId: string;
+  connectionId: string;
+  storeLabel: string;
+}): ReactElement {
   return (
     <form action="/api/channels/shopify/listings" method="POST" className="row" style={{ gap: 6 }}>
       <input type="hidden" name="productId" value={productId} />
-      {connections.length > 1 && (
-        <select name="connectionId" required style={{ maxWidth: 160 }}>
-          {connections.map((connection) => (
-            <option key={connection.id} value={connection.id}>
-              {connection.external_account_id}
-            </option>
-          ))}
-        </select>
-      )}
+      <input type="hidden" name="connectionId" value={connectionId} />
       <input type="text" name="price" placeholder="19.99" required style={{ width: 80 }} />
-      <button type="submit">List on Shopify</button>
+      <button type="submit">List on {storeLabel}</button>
     </form>
   );
 }

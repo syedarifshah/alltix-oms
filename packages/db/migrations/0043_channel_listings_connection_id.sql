@@ -1,0 +1,35 @@
+-- Expand-only, backward-compatible (CLAUDE.md §9): nullable, no backfill
+-- possible for existing rows (this codebase has never recorded which
+-- specific channel_connections row an existing channel_listings row came
+-- from), zero behavior change for any row this migration doesn't touch.
+--
+-- Closes CLAUDE.md §4.5.4's own "Deliberately NOT touched" follow-on gap:
+-- channel_listings' real uniqueness (migration 0004,
+-- (tenant_id, channel, channel_marketplace, external_id)) never actually
+-- blocked one product from having listings on two different Shopify
+-- stores -- external_id (a store-specific Shopify GID) already differs per
+-- store. The real blocker was purely application-level: every outbound
+-- listing-creation route's own duplicate-create guard checked only
+-- (tenant_id, product_id, channel), so it rejected a SECOND store's listing
+-- for the same product outright, regardless of which store it would have
+-- gone to. This column is what lets that guard (and catalog sync, and
+-- /products' own display) tell "already listed on THIS store" apart from
+-- "already listed on a DIFFERENT store" for the first time.
+--
+-- Shopify-only for now: Amazon/Walmart/eBay each still support only one
+-- connection per tenant (CLAUDE.md §4.1/§4.2/§4.6 -- none of them gained
+-- Shopify's/TikTok's own true multi-store CONNECT, §4.5.1/§4.8.1), so a
+-- second listing on a second connection isn't a scenario those three
+-- channels' own routes can even reach yet. The column itself is on the
+-- shared channel_listings table (not a Shopify-only table) so any channel
+-- that later gains multi-connection support can adopt the identical
+-- pattern without another migration.
+--
+-- No ON DELETE behavior chosen deliberately, same precedent
+-- orders.channel_connection_id (migration 0037), orders.preferred_location_id
+-- (migration 0014), and orders.split_from_order_id (migration 0023) all
+-- already set: this codebase never DELETEs a channel_connections row, only
+-- flips its status (§4.4's cross-run failure tracking, §15's channel
+-- flags) -- there is nothing for an ON DELETE clause to ever actually run
+-- against.
+ALTER TABLE channel_listings ADD COLUMN channel_connection_id UUID REFERENCES channel_connections (id);

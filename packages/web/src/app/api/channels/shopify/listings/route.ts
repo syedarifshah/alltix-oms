@@ -26,25 +26,32 @@ export const dynamic = "force-dynamic";
  * requireCurrentUser resolves auth/tenant without opening one; each DB read/
  * write below opens its own short-lived withTenant() block instead.
  *
- * **Now extended for Shopify's own multi-store support, closing the gap
- * this doc comment used to flag as deliberately not attempted**: unlike the
- * order-lookup path in WarehouseService.confirmShipment or a scheduler sync
- * tick, this route has no *implicit* signal (no order, no webhook header)
- * for which of a tenant's several connected stores a brand-new outbound
- * listing should be created on -- so instead of inferring one, /products'
- * own CreateListingForm now asks the tenant directly: a real `<select>`
- * appears whenever a tenant has more than one active Shopify connection,
- * and its chosen value is read here as an optional `connectionId` form
- * field. With zero or exactly one active connection, the form renders no
- * such field at all (nothing to choose between), `connectionId` comes
- * through empty, and `createShopifyConnectorFromChannelConnection` falls
- * back to its own pre-existing "most recently connected active Shopify
- * store" default -- identical behavior to before this pass, for the common
- * single-store case. A `connectionId` that doesn't resolve to an active
- * Shopify connection for this tenant (stale/tampered value, or a
+ * **Now extended for Shopify's own multi-store support** (CLAUDE.md
+ * §4.5.5): a product can be listed on more than one of a tenant's
+ * connected Shopify stores now, not just one total across all of them --
+ * closing the gap §4.5.4's own store-picker left open (choosing which
+ * store a listing went to, but still only ever letting a product have ONE
+ * Shopify listing, period). /products' own per-connection rendering (see
+ * that page's doc comment) means this route is always POSTed an explicit
+ * `connectionId` whenever the tenant has more than one active Shopify
+ * connection -- there's no longer a `<select>` here, since each connected
+ * store gets its own inline "List on <store>" form instead of a dropdown.
+ * `connectionId` is still read defensively as optional, though: with
+ * exactly one active connection there's nothing to choose from, and an
+ * empty/missing value resolves (below) to that one store, identical to
+ * this route's original single-store behavior.
+ *
+ * The actual connection is resolved ONCE, up front, into `resolvedConnectionId`
+ * -- not left to `createShopifyConnectorFromChannelConnection`'s own internal
+ * fallback -- because this route now needs that concrete id for two things,
+ * not one: which store's credentials to call Shopify with, AND which store
+ * to stamp on the new `channel_listings.channel_connection_id` (migration
+ * 0043) so a *second* store's own later listing attempt for the same
+ * product can tell "already listed on THIS store" apart from "already
+ * listed on a DIFFERENT store." A `connectionId` that doesn't resolve to an
+ * active Shopify connection for this tenant (stale/tampered value, or a
  * connection that got disconnected between page load and submit) fails
- * loudly via the same `shopify_listing_no_connection:` error path already
- * in place below, rather than silently falling back to a different store.
+ * loudly via `shopify_listing_no_connection:`, same as before.
  */
 export async function POST(req: NextRequest): Promise<Response> {
   const pool = getAppPool();
@@ -60,10 +67,10 @@ export async function POST(req: NextRequest): Promise<Response> {
   const formData = await req.formData();
   const productId = String(formData.get("productId") ?? "").trim();
   const price = String(formData.get("price") ?? "").trim();
-  // Optional -- see this route's own doc comment above. Empty/absent means
-  // "let createShopifyConnectorFromChannelConnection pick the most recently
-  // connected active store," the pre-existing single-store default.
-  const connectionId = String(formData.get("connectionId") ?? "").trim() || null;
+  // Optional -- see this route's own doc comment above. Empty/absent
+  // resolves (below) to "the tenant's one active Shopify connection," the
+  // pre-existing single-store default.
+  const requestedConnectionId = String(formData.get("connectionId") ?? "").trim() || null;
 
   if (!productId || !price) {
     return redirectWithError(req, "/products", "shopify_listing_missing_fields");
@@ -83,17 +90,51 @@ export async function POST(req: NextRequest): Promise<Response> {
     return redirectWithError(req, "/products", "shopify_listing_product_not_found");
   }
 
+  // Resolve the actual connection ONCE, up front -- see this route's own
+  // doc comment for why this can't just be left to
+  // createShopifyConnectorFromChannelConnection's own internal fallback.
+  // Mirrors loadShopifyCredentialsFromChannelConnection's own
+  // "$1::uuid IS NULL OR id = $1" resolution exactly, so "omitted" behaves
+  // identically here and there.
+  const connectionResult = await withTenant(pool, user.tenantId, (client) =>
+    client.query<{ id: string }>(
+      `SELECT id FROM channel_connections
+        WHERE tenant_id = $1 AND channel = 'shopify' AND status = 'active'
+          AND ($2::uuid IS NULL OR id = $2)
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [user.tenantId, requestedConnectionId],
+    ),
+  );
+  const resolvedConnectionId = connectionResult.rows[0]?.id;
+  if (!resolvedConnectionId) {
+    return redirectWithError(req, "/products", `shopify_listing_no_connection:No active 'shopify' channel_connections row found for tenant ${user.tenantId}`);
+  }
+
   // Guard against double-submitting this form and creating two separate
-  // products on Shopify for the same internal product -- productSet with no
-  // `identifier` always creates new, it doesn't upsert by SKU the way
-  // channel_listings' own (tenant_id, channel, channel_marketplace,
-  // external_id) UNIQUE constraint would otherwise make this idempotent for
-  // a *pulled-in* listing (add-channel-listing.ts, catalog sync). An
-  // outbound creation has no such natural dedupe key before it's created.
+  // products on Shopify for the same internal product on the same store --
+  // productSet with no `identifier` always creates new, it doesn't upsert
+  // by SKU the way channel_listings' own (tenant_id, channel,
+  // channel_marketplace, external_id) UNIQUE constraint would otherwise
+  // make this idempotent for a *pulled-in* listing (add-channel-listing.ts,
+  // catalog sync). An outbound creation has no such natural dedupe key
+  // before it's created.
+  //
+  // Scoped by channel_connection_id (migration 0043), not just
+  // (tenant_id, product_id, channel) -- CLAUDE.md §4.5.5's whole point is
+  // that a product CAN now have a real listing on one store and still be
+  // creatable on a different one. `channel_connection_id IS NULL` also
+  // blocks, deliberately conservative: a legacy row from before this
+  // column existed has no recorded store, so there's no way to prove it
+  // ISN'T already the listing this exact store would create -- same
+  // "fail loud rather than risk a silent duplicate" reasoning this route
+  // already applied to the create-vs-upsert distinction above.
   const existing = await withTenant(pool, user.tenantId, (client) =>
     client.query(
-      `SELECT id FROM channel_listings WHERE tenant_id = $1 AND product_id = $2 AND channel = 'shopify'`,
-      [user.tenantId, productId],
+      `SELECT id FROM channel_listings
+        WHERE tenant_id = $1 AND product_id = $2 AND channel = 'shopify'
+          AND (channel_connection_id = $3 OR channel_connection_id IS NULL)`,
+      [user.tenantId, productId, resolvedConnectionId],
     ),
   );
   if (existing.rows.length > 0) {
@@ -102,7 +143,7 @@ export async function POST(req: NextRequest): Promise<Response> {
 
   let connector;
   try {
-    connector = await createShopifyConnectorFromChannelConnection(pool, user.tenantId, connectionId);
+    connector = await createShopifyConnectorFromChannelConnection(pool, user.tenantId, resolvedConnectionId);
   } catch (err) {
     return redirectWithError(req, "/products", `shopify_listing_no_connection:${errorMessage(err)}`);
   }
@@ -121,10 +162,10 @@ export async function POST(req: NextRequest): Promise<Response> {
       // Shopify admin.
       const inserted = await client.query<{ id: string }>(
         `INSERT INTO channel_listings
-           (tenant_id, product_id, channel, channel_marketplace, external_id, external_sku, listing_status, list_price, last_synced_at)
-         VALUES ($1, $2, 'shopify', '', $3, $4, 'draft', $5, now())
+           (tenant_id, product_id, channel, channel_marketplace, external_id, external_sku, listing_status, list_price, last_synced_at, channel_connection_id)
+         VALUES ($1, $2, 'shopify', '', $3, $4, 'draft', $5, now(), $6)
          RETURNING id`,
-        [user.tenantId, productId, result.inventoryItemGid, productRow.internal_sku, price],
+        [user.tenantId, productId, result.inventoryItemGid, productRow.internal_sku, price, resolvedConnectionId],
       );
       // Same CLAUDE.md §17 "channel_listing.created" instrumentation as the
       // Amazon/eBay/Walmart listings routes -- see Amazon's own comment.
@@ -134,7 +175,7 @@ export async function POST(req: NextRequest): Promise<Response> {
         action: "channel_listing.created",
         entityType: "channel_listing",
         entityId: inserted.rows[0]!.id,
-        details: { channel: "shopify", productId, sellerSku: productRow.internal_sku, status: "draft", connectionId },
+        details: { channel: "shopify", productId, sellerSku: productRow.internal_sku, status: "draft", connectionId: resolvedConnectionId },
       });
     });
   } catch (err) {

@@ -1353,16 +1353,27 @@ async function syncShopifyCatalogForConnection(
         );
         const productId = product.rows[0]!.id;
 
+        // channel_connection_id (migration 0043) -- stamped here so a
+        // product pulled in by ONE store's catalog sync doesn't read as a
+        // store-unknown "legacy" row to the outbound listings route's own
+        // duplicate-create guard (CLAUDE.md §4.5.5), which would otherwise
+        // block that product from ever being listed on a SECOND store via
+        // /products. Also updated on conflict, not just insert -- a variant
+        // that already exists (a re-sync, or one originally seeded by
+        // scripts/add-channel-listing.ts before this column existed) still
+        // gets a correct, current connectionId rather than staying NULL
+        // forever.
         await client.query(
           `INSERT INTO channel_listings
-             (tenant_id, product_id, channel, channel_marketplace, external_id, external_sku, listing_status)
-           VALUES ($1, $2, 'shopify', '', $3, $4, 'active')
+             (tenant_id, product_id, channel, channel_marketplace, external_id, external_sku, listing_status, channel_connection_id)
+           VALUES ($1, $2, 'shopify', '', $3, $4, 'active', $5)
            ON CONFLICT (tenant_id, channel, channel_marketplace, external_id) DO UPDATE SET
              product_id = EXCLUDED.product_id,
              external_sku = EXCLUDED.external_sku,
              listing_status = 'active',
+             channel_connection_id = EXCLUDED.channel_connection_id,
              updated_at = now()`,
-          [tenantId, productId, variant.inventoryItemId, variant.externalSku],
+          [tenantId, productId, variant.inventoryItemId, variant.externalSku, connectionId],
         );
 
         const existingLocation = await client.query<{ id: string }>(
