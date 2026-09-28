@@ -1,0 +1,45 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "installCommand": "npm install",
+  "buildCommand": "npm run build && npm run build:web",
+  "outputDirectory": "packages/web/.next",
+  "crons": [
+    {
+      "path": "/api/cron/inventory-partition-maintenance",
+      "schedule": "0 2 * * *"
+    },
+    {
+      "path": "/api/cron/rate-limit-window-cleanup",
+      "schedule": "0 3 * * *"
+    },
+    {
+      "path": "/api/cron/amazon-order-sync",
+      "schedule": "1,11,21,31,41,51 * * * *"
+    },
+    {
+      "path": "/api/cron/shopify-catalog-sync",
+      "schedule": "2,12,22,32,42,52 * * * *"
+    },
+    {
+      "path": "/api/cron/shopify-order-sync",
+      "schedule": "3,13,23,33,43,53 * * * *"
+    },
+    {
+      "path": "/api/cron/walmart-order-sync",
+      "schedule": "4,14,24,34,44,54 * * * *"
+    },
+    {
+      "path": "/api/cron/ebay-order-sync",
+      "schedule": "5,15,25,35,45,55 * * * *"
+    },
+    {
+      "path": "/api/cron/temu-order-sync",
+      "schedule": "6,16,26,36,46,56 * * * *"
+    },
+    {
+      "path": "/api/cron/tiktok-order-sync",
+      "schedule": "7,17,27,37,47,57 * * * *"
+    }
+  ]
+}
