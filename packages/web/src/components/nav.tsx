@@ -1,7 +1,6 @@
 import { Show, UserButton } from "@clerk/nextjs";
 import { headers } from "next/headers";
 import type { ReactElement } from "react";
-import { ThemeToggle } from "@/components/theme-toggle";
 import {
   DashboardIcon,
   InventoryIcon,
@@ -84,14 +83,17 @@ export async function Nav(): Promise<ReactElement> {
 }
 
 /**
- * Theme toggle + auth control, rendered in the top bar (see
- * app/(app)/layout.tsx) rather than the sidebar -- kept as its own small
- * async Server Component (same test-auth-bypass reasoning as Nav above,
- * duplicated rather than shared since the two live in different parts of
- * the tree and each `headers()` call is just a context read, not I/O) so
- * the sidebar itself stays purely navigational, matching where a real SaaS
- * product usually puts account controls (top-right) rather than the
- * previous single-row nav's trailing-edge placement.
+ * Auth control, rendered in the top bar (see app/(app)/layout.tsx) rather
+ * than the sidebar -- kept as its own small async Server Component (same
+ * test-auth-bypass reasoning as Nav above, duplicated rather than shared
+ * since the two live in different parts of the tree and each `headers()`
+ * call is just a context read, not I/O) so the sidebar itself stays purely
+ * navigational, matching where a real SaaS product usually puts account
+ * controls (top-right) rather than the previous single-row nav's
+ * trailing-edge placement. Used to also render a light/dark theme toggle
+ * here (components/theme-toggle.tsx) -- removed as part of the gold/plum/
+ * cream palette pass (CLAUDE.md §20's own follow-up), which fixed the app
+ * to a single look with no toggle, per Arif's own explicit choice.
  */
 export async function TopBarControls(): Promise<ReactElement> {
   const requestHeaders = await headers();
@@ -102,7 +104,6 @@ export async function TopBarControls(): Promise<ReactElement> {
 
   return (
     <div className="row" style={{ gap: 12 }}>
-      <ThemeToggle />
       {isTestBypass ? (
         <span className="muted">test session</span>
       ) : (

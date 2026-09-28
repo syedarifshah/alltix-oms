@@ -6555,6 +6555,133 @@ touches no logic any of these tests exercise). No new test file was needed or
 added — this pass has no new pure decision logic, query, or service-layer
 behavior to extract and test, only markup/CSS.
 
+### 20.1 Gold/plum/cream palette pass (v2) — Arif's own reference photo, colors-only
+
+**Why**: Arif sent a reference color palette read off a photo — 8 roles with
+approximate hex values, explicitly caveated by Arif himself as "a nudge to taste,"
+not exact — and asked for the app's existing color scheme to be replaced 1-for-1 by
+semantic role everywhere colors appear (buttons, active/selected states,
+backgrounds, borders, text), with the same governing constraint §20's own v1 pass
+was held to: **colors only** — no layout, spacing, font, or functionality changes.
+The 8 roles: deep plum/black `#1E0F1F` (header/sidebar), rich purple `#3E1F45`
+(progress/active accents), gold/mustard `#C9A227` (primary accent — checkmarks,
+buttons, selected borders), cream `#F7F1E1` (page background), a lighter gold
+`#F3E7B8` (selected-item fill), near-black `#1A1614` (headings/body text), muted
+gray `#8C8578` (secondary/helper text), and a light gold-tinted border `#E4DCC7`
+(dividers, unselected borders).
+
+**Research first, then 4 clarifying questions before any code was touched**: a
+direct read of `globals.css`/`marketing.module.css` plus a subagent sweep for every
+other place a color could be hardcoded (inline styles, other CSS files, Clerk
+appearance config, SVG/favicon assets, chart color logic) found only one other file
+with independently hardcoded colors — the marketing site's own separate token
+block, `(marketing)/marketing.module.css` — everything else in the app already
+resolves through `globals.css`'s own CSS-custom-property system and follows the
+swap automatically. The given 8-color palette didn't resolve four real
+ambiguities on its own, so — per Arif's own standing "ask me anything important
+that I may have missed, in plain language" instruction — 4 questions were asked
+before implementation, each with a recommended default:
+
+- **Marketplace channel badges** (Amazon/Shopify/Walmart/eBay/Temu/TikTok, §4)
+  — keep their own brand colors, or fold them into the new palette? Arif's answer:
+  **keep brand colors** (recommended). Left byte-for-byte unchanged in
+  `globals.css`; only their now-unneeded dark-mode override blocks were removed
+  (see below).
+- **Red/amber/green status colors** (`--danger`/`--warning`/`--success` and their
+  `-bg` variants) — the given palette has no equivalent of any of the three. Arif's
+  answer: **keep red/amber/green** (recommended). Left byte-for-byte unchanged in
+  `globals.css`.
+- **Light/dark mode** (the pre-existing `theme-toggle.tsx`/`data-theme` mechanism,
+  §20's own explicit "stays a toggle" decision for the v1 redesign) — does the new
+  palette become a third theme option, or does it replace the whole light/dark
+  concept? Arif's answer: **one fixed look, no toggle** (recommended) — a real,
+  explicit reversal of §20's own earlier decision to keep the toggle, made because
+  Arif himself asked for it this time, not an oversight.
+- **The public marketing site** (`(marketing)/marketing.module.css`, its own
+  separate, previously dark-only/cyan-accented token block, explicitly OUT of
+  scope for §20's v1 dashboard redesign) — restyle it too, or leave it as-is? Arif
+  went WITH restyling it (not the recommended "leave as-is" default) — the only one
+  of the 4 answers that overrode its own recommendation.
+
+**`globals.css` — collapsed from a three-tier theme cascade to one fixed `:root`
+block**: the previous `:root` (light default) →
+`@media (prefers-color-scheme: dark)` guarded by `:root:not([data-theme="light"])`
+(OS dark mode) → `:root[data-theme="dark"]` (explicit toggle choice) cascade is
+gone entirely — both dark-mode blocks were deleted outright, `color-scheme` is now
+a fixed `light` (was `light dark`), and there is exactly one token block now. Key
+new values: `--bg: #f7f1e1`, `--surface: #ffffff`, `--text: #1a1614`,
+`--text-muted: #8c8578`, `--accent: #c9a227`, `--accent-contrast: #1a1614`,
+`--accent-soft: #f3e7b8`, `--border: #e4dcc7`, `--neutral-bg: #efe8d5`;
+`--danger`/`--warning`/`--success` and their `-bg` variants untouched, per Arif's
+own answer above. App-shell tokens: `--sidebar-bg: #1e0f1f` (Arif's own literal
+"header" role, reused for the sidebar §20's v1 redesign introduced),
+`--sidebar-link-active-bg: #3e1f45`, `--sidebar-link-active-text: #c9a227`,
+`--chart-1..5` mapped across the new gold/plum/gray/plum-black/darker-gold family,
+`--kpi-icon-bg: #f3e7b8`. The 4 channel-badges' own dark-mode override blocks were
+removed (their light-mode declarations, i.e. the brand colors themselves per Arif's
+own answer above, are untouched).
+
+**A real bug found and fixed during implementation, not just a value swap**:
+`.sidebar-brand`/`.sidebar-link:hover` both used `color: var(--text)`. Under the
+old theme this was safe — in dark mode both the sidebar and `--text` were
+dark-mode-appropriate together. Under the new single fixed theme, `--text` is
+near-black for the light page, but the sidebar itself is deliberately kept as the
+deep-plum/black "header" surface — reusing `var(--text)` there would render
+near-invisible near-black text on a near-black sidebar. Fixed by adding a new
+dedicated token, `--sidebar-text: #f7f1e1`, and pointing both rules at it instead.
+
+**Theme toggle removed entirely**, per Arif's own answer above: `theme-toggle.tsx`
+deleted outright; its import/usage removed from `nav.tsx`'s `TopBarControls()`;
+`layout.tsx`'s pre-hydration `<script>` (previously set `documentElement`'s
+`[data-theme]` from `localStorage` before first paint, to avoid a flash of the
+wrong theme) removed along with the now-empty `<head>` element it lived in — the
+root layout's `<html>` now contains only `<body>`. A stale doc-comment reference to
+the deleted file, found via a `theme-toggle|data-theme|alltix-theme|ThemeToggle`
+sweep across `packages/web/src`, was fixed in `donut-chart.tsx` (it now cites the
+marketing site's own mobile-menu hamburger, `marketing-header.tsx`, as this app's
+real "needs client JS" exception instead).
+
+**`marketing.module.css` — restyled to match, with its own judgment calls
+documented in its own header comment**: this file has its own separate `.mkt`
+token block, entirely disconnected from `globals.css`'s system, so it needed its
+own mapping, not a copy of the app's:
+
+- The marketing page's own text hierarchy needs three tiers (headings/body/
+  helper) where the given palette only has two (near-black, muted gray) — a
+  blended intermediate gray (`--body-text`) was introduced as a judgment call, not
+  specified by Arif's own palette.
+- Marketing's pre-existing decorative `--amber` is now aliased directly to the new
+  gold `--accent` — but its one genuinely semantic use (the demo-request form's
+  success/error messages) was rerouted onto two brand-new tokens,
+  `--success: #1e7a34`/`--danger: #b3261e` (matching the app's own exact values,
+  per Arif's own "keep red/amber/green" answer above), rather than staying gold.
+- Three elements are deliberately kept as dark plum/purple panels sitting on the
+  otherwise light/cream page — the sticky nav header, the hero mockup card, and
+  the CTA band — needing their own light-on-dark token family
+  (`--panel-ink`/`--panel-text`/`--panel-muted`/`--panel-line`/
+  `--panel-hover-bg`), the marketing-site analog of `globals.css`'s own new
+  `--sidebar-text` fix above, for the identical underlying reason: a dark
+  decorative surface on an otherwise light page needs its own text tokens, not the
+  page's normal dark-on-light ones.
+
+**The identical dark-panel-on-light-page bug class, found and fixed a second
+time, in the demo-request form**: `.demo-form input/textarea` used `background:
+var(--panel-1); color: var(--ink);` — safe under the old dark theme (a dark input
+on a dark page), but under the new theme `--panel-1` becomes a deliberately-dark
+decorative panel color while `--ink` becomes near-black, which would pair into
+unreadable near-black-on-dark-purple text on an otherwise light page. Fixed by
+changing the input background to `var(--surface)` (white). A related case,
+`.btn-dark:hover`'s hardcoded `background: #fff` paired with the button's own
+`color: var(--bg)` (now cream instead of dark), was fixed by changing the hover
+background to a manually-chosen dark tone (`#332830`) instead of pure white, to
+keep the cream text readable on hover.
+
+**Tested/Verified**: `npm run typecheck --workspaces` clean across all twelve
+workspaces, `next build` clean, and `bash scripts/run-tests.sh` — all 68 test
+files pass, unchanged (expected: a pure CSS/markup-removal pass touches no logic
+any of these tests exercise — confirmed, not assumed). No new test file needed —
+same reasoning §20's own v1 pass gives for the identical situation.
+
 ---
 
 *This document reflects standard, well-documented patterns for multichannel OMS/IMS

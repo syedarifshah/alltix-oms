@@ -6,8 +6,12 @@ import type { ReactElement } from "react";
  * that's a deliberate choice, not an oversight, for a purely visual
  * redesign pass). A plain Server Component: takes already-aggregated
  * segments and renders static SVG server-side, same "no client JS needed"
- * posture every other page in this app already has (see nav.tsx's own doc
- * comment on why theme-toggle.tsx is the one deliberate exception).
+ * posture every other page in this app already has (the mobile-menu
+ * hamburger on components/marketing/marketing-header.tsx is one of the few
+ * real exceptions, needing real interactive state; a light/dark theme
+ * toggle used to be another, removed along with the toggle itself when the
+ * app moved to a single fixed palette -- see globals.css's own header
+ * comment).
  *
  * Used by /dashboard's "Order state distribution" -- segments are the
  * ALL_ORDER_STATUSES counts, already computed by the page itself; this

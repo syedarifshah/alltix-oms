@@ -6,168 +6,81 @@
    since class names below are already semantic (badge, card, nav) rather
    than one-off utility soup.
 
-   Palette: brought in line with the marketing site's brand (see
-   app/(marketing)/marketing.module.css) so /orders, /inventory, /settings
-   etc. read as the same product instead of a generic admin theme bolted on
-   next to a polished dark-cyan marketing site. Unlike marketing (which is
-   fixed-dark, no light variant), the dashboard keeps its automatic
-   light/dark behavior -- both palettes below use the same cyan accent
-   (#22d3ee family) and amber highlight as marketing, just tuned per-mode
-   for contrast (a light-mode surface needs a darker teal for readable
-   text/links than the bright cyan marketing uses on its dark background;
-   solid-fill elements like buttons/badges use the bright cyan directly,
-   same as marketing's own .btn-primary treatment). Radius/shadow values are
-   also pulled up to marketing's rounder, softly-elevated card language
-   (marketing: --radius 14px, --shadow on cards) instead of the previous
-   flat 5-8px chrome -- layout/structure is unchanged, this is chrome only.
-
-   Theme resolution order (see components/theme-toggle.tsx + the inline
-   pre-hydration script in app/layout.tsx for how [data-theme] gets set):
-     1. :root below -- light values, the unconditional fallback.
-     2. @media (prefers-color-scheme: dark), guarded by
-        :root:not([data-theme="light"]) -- OS-level dark applies
-        automatically UNLESS the user explicitly picked light in-app.
-     3. :root[data-theme="dark"] -- forces dark regardless of OS, once the
-        user explicitly picks it. An attribute selector on :root has higher
-        specificity than the plain :root the media query uses, so this
-        wins over (2) even though it comes first in the cascade -- no
-        !important needed. data-theme is only ever set to "light" or
-        "dark" by user action (see theme-toggle.tsx); an unset attribute
-        (nothing explicitly chosen yet) means "follow the OS," which (1)+(2)
-        already handle on their own. */
+   Palette (v2, gold/plum/cream): replaced the earlier cyan light/dark
+   redesign with a single, fixed palette Arif supplied from a reference
+   design -- deep plum/black for the persistent nav "header," a rich purple
+   for its active/current-item highlight, gold/mustard as the one primary
+   accent (buttons, links, active states, focus rings), a cream page
+   background, a soft-gold "selected" fill, near-black body text, a muted
+   warm gray for secondary text, and a light warm border/divider tone. Per
+   Arif's own explicit choices: marketplace badges (Amazon/Shopify/Walmart/
+   eBay/Temu/TikTok, further down this file) keep their real brand colors
+   rather than being folded into gold; red/amber/green status colors
+   (danger/warning/success) are UNCHANGED from before this pass, so errors/
+   warnings/success states stay instantly recognizable; and the app is now a
+   single fixed look, no light/dark toggle -- see the removed
+   components/theme-toggle.tsx and app/layout.tsx's own (now-removed) theme
+   pre-hydration script. The public marketing site
+   (app/(marketing)/marketing.module.css) was restyled to match this same
+   palette in the same pass, so the whole product reads as one consistent
+   look from the homepage through the app. */
 
 :root {
-  color-scheme: light dark;
-  --bg: #f5f8fa;
+  color-scheme: light;
+  --bg: #f7f1e1;
   --surface: #ffffff;
-  --surface-2: #f7fafb;
-  --border: #dde3e8;
-  --text: #12161c;
-  --text-muted: #5b6572;
-  --accent: #0e93ac;
-  --accent-contrast: #ffffff;
-  --accent-glow: rgba(14, 147, 172, 0.22);
-  --accent-soft: rgba(14, 147, 172, 0.1);
+  --surface-2: #fcf8ec;
+  --border: #e4dcc7;
+  --text: #1a1614;
+  --text-muted: #8c8578;
+  --accent: #c9a227;
+  --accent-contrast: #1a1614;
+  --accent-glow: rgba(201, 162, 39, 0.25);
+  --accent-soft: #f3e7b8;
   --danger: #b3261e;
   --danger-bg: #fdecea;
   --warning: #92600c;
   --warning-bg: #fdf1dc;
   --success: #1e7a34;
   --success-bg: #e8f6ea;
-  --neutral-bg: #eef1f4;
-  --shadow: 0 1px 3px rgba(16, 24, 40, 0.08), 0 1px 2px rgba(16, 24, 40, 0.04);
-  --shadow-lg: 0 8px 24px rgba(16, 24, 40, 0.1);
+  --neutral-bg: #efe8d5;
+  --shadow: 0 1px 3px rgba(26, 22, 20, 0.1), 0 1px 2px rgba(26, 22, 20, 0.05);
+  --shadow-lg: 0 8px 24px rgba(26, 22, 20, 0.14);
   --radius: 12px;
   --radius-sm: 8px;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 
-  /* --- App shell (sidebar + top bar), added for the v1 visual redesign ---
-     Kept as its own token group so the shell's own geometry/colors can be
-     tuned without touching the base tokens above (still used as-is by every
-     page's cards/tables/badges/forms). --chart-1..5 is a small fixed
-     categorical palette for the hand-rolled SVG charts (dashboard/analytics)
-     -- distinct hues at a glance, consistent across both themes. */
+  /* --- App shell (sidebar + top bar) --- kept as its own token group so
+     the shell's own geometry/colors can be tuned without touching the base
+     tokens above. The sidebar is this app's persistent "header" in the
+     reference's own vocabulary, so it gets the deep plum/black; its
+     active-link highlight gets the reference's rich purple (the same role
+     a step-indicator strip plays there: showing "where you are").
+     --sidebar-text is a dedicated light color for the brand mark/hover
+     state, since --text is now near-black and unreadable on this dark
+     surface -- reusing --text here the way the old theme could (its dark
+     sidebar had dark tokens too) would be a real bug now that there's only
+     one, light, theme. --chart-1..5 is a small fixed categorical palette
+     for the hand-rolled SVG charts (dashboard/analytics); only gold, rich
+     purple, muted gray, deep plum, and a darker gold stay legible against
+     the cream page background, so that's the full 5-color set. */
   --sidebar-width: 232px;
   --topbar-height: 60px;
-  --sidebar-bg: #ffffff;
-  --sidebar-border: #dde3e8;
-  --sidebar-link: #4b5563;
-  --sidebar-link-hover-bg: #f0f4f6;
-  --sidebar-link-active-bg: rgba(14, 147, 172, 0.1);
-  --sidebar-link-active-text: #0e93ac;
-  --sidebar-section-label: #8a94a3;
-  --chart-1: #0e93ac;
-  --chart-2: #7c5cff;
-  --chart-3: #2f7de1;
-  --chart-4: #e08a1e;
-  --chart-5: #1e9e5a;
-  --chart-grid: rgba(18, 22, 28, 0.08);
-  --kpi-icon-bg: rgba(14, 147, 172, 0.1);
-}
-
-/* Shared dark-mode token block -- identical values whether dark mode came
-   from the OS (@media below) or an explicit in-app choice ([data-theme]
-   further down); duplicated across both selectors rather than factored into
-   one (custom properties can't be composed via a mixin in plain CSS), kept
-   byte-for-byte in sync by hand. Darkened/re-tuned for the v1 visual
-   redesign to read closer to a near-black "real SaaS product" surface
-   instead of the previous flat dark-grey -- --bg/--surface/--surface-2 now
-   step from near-black up through two card tones, same cyan accent family
-   as before (unchanged, so nothing that already depended on --accent shifts
-   hue), plus the new sidebar, chart, and KPI-icon tokens the sidebar nav,
-   KPI tiles, and hand-rolled SVG charts use. */
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #0b0d11;
-    --surface: #14171d;
-    --surface-2: #191d24;
-    --border: rgba(255, 255, 255, 0.08);
-    --text: #f5f7fa;
-    --text-muted: #9aa4b2;
-    --accent: #22d3ee;
-    --accent-contrast: #0b0d11;
-    --accent-glow: rgba(34, 211, 238, 0.3);
-    --accent-soft: rgba(34, 211, 238, 0.12);
-    --danger: #ff6b64;
-    --danger-bg: rgba(255, 107, 100, 0.14);
-    --warning: #f5a524;
-    --warning-bg: rgba(245, 165, 36, 0.14);
-    --success: #4ade80;
-    --success-bg: rgba(74, 222, 128, 0.14);
-    --neutral-bg: #232832;
-    --shadow: 0 4px 24px rgba(0, 0, 0, 0.35);
-    --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.5);
-    --sidebar-bg: #0e1014;
-    --sidebar-border: rgba(255, 255, 255, 0.08);
-    --sidebar-link: #a3adba;
-    --sidebar-link-hover-bg: rgba(255, 255, 255, 0.04);
-    --sidebar-link-active-bg: rgba(34, 211, 238, 0.12);
-    --sidebar-link-active-text: #22d3ee;
-    --sidebar-section-label: #6b7484;
-    --chart-1: #22d3ee;
-    --chart-2: #a78bfa;
-    --chart-3: #5b9dff;
-    --chart-4: #f5a524;
-    --chart-5: #4ade80;
-    --chart-grid: rgba(255, 255, 255, 0.06);
-    --kpi-icon-bg: rgba(34, 211, 238, 0.12);
-  }
-}
-
-:root[data-theme="dark"] {
-  --bg: #0b0d11;
-  --surface: #14171d;
-  --surface-2: #191d24;
-  --border: rgba(255, 255, 255, 0.08);
-  --text: #f5f7fa;
-  --text-muted: #9aa4b2;
-  --accent: #22d3ee;
-  --accent-contrast: #0b0d11;
-  --accent-glow: rgba(34, 211, 238, 0.3);
-  --accent-soft: rgba(34, 211, 238, 0.12);
-  --danger: #ff6b64;
-  --danger-bg: rgba(255, 107, 100, 0.14);
-  --warning: #f5a524;
-  --warning-bg: rgba(245, 165, 36, 0.14);
-  --success: #4ade80;
-  --success-bg: rgba(74, 222, 128, 0.14);
-  --neutral-bg: #232832;
-  --shadow: 0 4px 24px rgba(0, 0, 0, 0.35);
-  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.5);
-  --sidebar-bg: #0e1014;
+  --sidebar-bg: #1e0f1f;
+  --sidebar-text: #f7f1e1;
   --sidebar-border: rgba(255, 255, 255, 0.08);
-  --sidebar-link: #a3adba;
-  --sidebar-link-hover-bg: rgba(255, 255, 255, 0.04);
-  --sidebar-link-active-bg: rgba(34, 211, 238, 0.12);
-  --sidebar-link-active-text: #22d3ee;
-  --sidebar-section-label: #6b7484;
-  --chart-1: #22d3ee;
-  --chart-2: #a78bfa;
-  --chart-3: #5b9dff;
-  --chart-4: #f5a524;
-  --chart-5: #4ade80;
-  --chart-grid: rgba(255, 255, 255, 0.06);
-  --kpi-icon-bg: rgba(34, 211, 238, 0.12);
+  --sidebar-link: rgba(247, 241, 225, 0.68);
+  --sidebar-link-hover-bg: rgba(255, 255, 255, 0.06);
+  --sidebar-link-active-bg: #3e1f45;
+  --sidebar-link-active-text: #c9a227;
+  --sidebar-section-label: rgba(247, 241, 225, 0.4);
+  --chart-1: #c9a227;
+  --chart-2: #3e1f45;
+  --chart-3: #8c8578;
+  --chart-4: #1e0f1f;
+  --chart-5: #a3841f;
+  --chart-grid: rgba(26, 22, 20, 0.08);
+  --kpi-icon-bg: #f3e7b8;
 }
 
 * {
@@ -238,7 +151,7 @@ h2 {
   padding: 18px 20px;
   font-weight: 700;
   font-size: 1rem;
-  color: var(--text);
+  color: var(--sidebar-text);
   text-decoration: none;
   border-bottom: 1px solid var(--sidebar-border);
   margin-bottom: 8px;
@@ -277,7 +190,7 @@ h2 {
 
 .sidebar-link:hover {
   background: var(--sidebar-link-hover-bg);
-  color: var(--text);
+  color: var(--sidebar-text);
 }
 
 .sidebar-link.active {
@@ -320,13 +233,6 @@ h2 {
 
 .topbar-spacer {
   flex: 1;
-}
-
-.theme-toggle {
-  padding: 4px 12px;
-  border-radius: 999px;
-  font-size: 0.8rem;
-  font-weight: 600;
 }
 
 /* --- card / surface --- */
@@ -674,39 +580,15 @@ details summary {
   background: rgba(245, 165, 36, 0.16);
   color: #d98a1a;
 }
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .channel-badge-amazon {
-    color: #f5a524;
-  }
-}
-:root[data-theme="dark"] .channel-badge-amazon {
-  color: #f5a524;
-}
 
 .channel-badge-shopify {
   background: rgba(74, 222, 128, 0.16);
   color: #1e9e5a;
 }
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .channel-badge-shopify {
-    color: #4ade80;
-  }
-}
-:root[data-theme="dark"] .channel-badge-shopify {
-  color: #4ade80;
-}
 
 .channel-badge-walmart {
   background: rgba(91, 157, 255, 0.16);
   color: #2f7de1;
-}
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .channel-badge-walmart {
-    color: #5b9dff;
-  }
-}
-:root[data-theme="dark"] .channel-badge-walmart {
-  color: #5b9dff;
 }
 
 .channel-badge-ebay,
@@ -714,18 +596,6 @@ details summary {
 .channel-badge-tiktok {
   background: rgba(167, 139, 250, 0.16);
   color: #7c5cff;
-}
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .channel-badge-ebay,
-  :root:not([data-theme="light"]) .channel-badge-temu,
-  :root:not([data-theme="light"]) .channel-badge-tiktok {
-    color: #a78bfa;
-  }
-}
-:root[data-theme="dark"] .channel-badge-ebay,
-:root[data-theme="dark"] .channel-badge-temu,
-:root[data-theme="dark"] .channel-badge-tiktok {
-  color: #a78bfa;
 }
 
 /* --- generic content card with a header row (title + optional right-side

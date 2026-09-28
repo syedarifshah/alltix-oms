@@ -1,45 +1,73 @@
 /*
- * Scoped port of the marketing site CSS supplied by Arif (alltixoms_site.html).
- * Values are unchanged -- every color, size, radius, and shadow below is
- * copy-pasted from that file. What changed is mechanical only: every rule is
- * nested under the local `.mkt` class (via :global() on the rest of each
- * selector) so this stylesheet can be imported into a nested layout
- * (app/(marketing)/layout.tsx) without its very generic tag selectors --
- * body, a, h1, h2, h3, p, section -- leaking into the rest of the app (the
- * dashboard at /orders, /inventory, etc., which has its own look via
- * globals.css). Per Next's own CSS docs (app/getting-started/css), a plain
- * global .css import doesn't get removed when navigating to another route
- * and "can lead to conflicts" -- a CSS Module avoids that entirely.
+ * Scoped port of the marketing site CSS originally supplied by Arif
+ * (alltixoms_site.html). Every rule stays nested under the local `.mkt`
+ * class (via :global() on the rest of each selector) so this stylesheet can
+ * be imported into a nested layout (app/(marketing)/layout.tsx) without its
+ * very generic tag selectors -- body, a, h1, h2, h3, p, section -- leaking
+ * into the rest of the app (the dashboard at /orders, /inventory, etc.,
+ * which has its own look via globals.css). Per Next's own CSS docs
+ * (app/getting-started/css), a plain global .css import doesn't get removed
+ * when navigating to another route and "can lead to conflicts" -- a CSS
+ * Module avoids that entirely.
  *
- * `.mkt` itself carries what the original file put on `body` (and the
- * `:root` custom properties) directly, since `body` can't be a descendant
- * of the wrapper div. Every other rule keeps its original class name
- * unscoped via :global(...) so the page components below can use the exact
- * className strings from the source file with no per-class styles.xxx
- * lookups.
+ * Palette (v2, gold/plum/cream): restyled in the same pass that gave the
+ * authenticated app (globals.css) its new fixed palette, per Arif's own
+ * explicit choice to make the whole product -- marketing site through app
+ * -- read as one consistent look. This site was previously fixed-dark
+ * (near-black bg, cyan accent); it's now fixed-light (cream bg, gold
+ * accent), matching the app. Three things needed real judgment calls, not a
+ * literal value swap, documented where they happen below:
+ *   1. This page has three text tiers (--ink/--body-text/--muted); Arif's
+ *      8-color palette supplies only one muted gray. --body-text is a
+ *      blended dark-warm-gray (between --ink and --muted) kept for
+ *      paragraph readability -- not one of Arif's named colors, an
+ *      implementation judgment call, easy to flatten to --muted if he'd
+ *      rather.
+ *   2. --amber was a secondary decorative highlight (star ratings, step
+ *      numbers, the hero mockup's small pill, the "Most Popular" pricing
+ *      ribbon) fully independent of any button/link. It's now an alias for
+ *      the one gold accent, same "one primary accent, used everywhere a
+ *      highlight is needed" reasoning Arif gave for the rest of this pass.
+ *      Its one genuinely semantic use -- the demo-request form's
+ *      success/error message -- was moved OFF --amber entirely, onto real
+ *      --success/--danger (added below), per Arif's own choice to keep
+ *      status colors recognizable.
+ *   3. Three elements (the sticky nav header, the hero mockup card, the CTA
+ *      band) are deliberately still dark panels sitting on the new light
+ *      page -- matching the reference's own dark plum header -- so they
+ *      need light text. --panel-ink/--panel-text/--panel-muted (added
+ *      below) exist for exactly that; reusing plain --ink/--body-text/
+ *      --muted there would be near-black-on-dark-plum text, unreadable.
  */
 
 .mkt {
   /* originally :root */
-  --bg: #14161a;
-  --surface: #1d2026;
-  --surface-alt: #262a33;
-  --line: rgba(255, 255, 255, 0.09);
-  --line-soft: rgba(255, 255, 255, 0.05);
-  --ink: #f5f7fa;
-  --body-text: #9fa9b6;
-  --muted: #727c89;
-  --accent: #22d3ee;
-  --accent-dim: #0e93ac;
-  --accent-soft: rgba(34, 211, 238, 0.12);
-  --accent-ink: #0f1216;
-  --amber: #f5a524;
-  --amber-soft: rgba(245, 165, 36, 0.14);
-  --panel-1: #10141b;
-  --panel-2: #0a0c10;
+  --bg: #f7f1e1;
+  --surface: #ffffff;
+  --surface-alt: #efe8d5;
+  --line: #e4dcc7;
+  --line-soft: rgba(26, 22, 20, 0.06);
+  --ink: #1a1614;
+  --body-text: #55504a;
+  --muted: #8c8578;
+  --accent: #c9a227;
+  --accent-dim: #9c7e1e;
+  --accent-soft: rgba(201, 162, 39, 0.14);
+  --accent-ink: #1a1614;
+  --amber: #c9a227;
+  --amber-soft: rgba(201, 162, 39, 0.14);
+  --success: #1e7a34;
+  --danger: #b3261e;
+  --panel-1: #3e1f45;
+  --panel-2: #1e0f1f;
+  --panel-ink: #f7f1e1;
+  --panel-text: rgba(247, 241, 225, 0.72);
+  --panel-muted: rgba(247, 241, 225, 0.48);
+  --panel-line: rgba(247, 241, 225, 0.18);
+  --panel-hover-bg: rgba(247, 241, 225, 0.08);
   --radius: 14px;
-  --shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
-  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.45);
+  --shadow: 0 4px 24px rgba(26, 22, 20, 0.16);
+  --shadow-lg: 0 16px 48px rgba(26, 22, 20, 0.22);
 
   /* originally body */
   margin: 0;
@@ -133,7 +161,7 @@
 .mkt :global(.btn-primary) {
   background: var(--accent);
   color: var(--accent-ink);
-  box-shadow: 0 8px 24px rgba(34, 211, 238, 0.3);
+  box-shadow: 0 8px 24px rgba(201, 162, 39, 0.3);
 }
 .mkt :global(.btn-primary):hover {
   background: var(--accent-dim);
@@ -144,7 +172,7 @@
   color: var(--bg);
 }
 .mkt :global(.btn-dark):hover {
-  background: #fff;
+  background: #332830;
   transform: translateY(-1px);
 }
 .mkt :global(.btn-outline) {
@@ -156,18 +184,21 @@
   border-color: var(--accent);
 }
 .mkt :global(.btn-light) {
-  background: #fff;
-  color: #14161a;
+  background: var(--surface);
+  color: var(--ink);
 }
 
-/* NAV */
+/* NAV -- a deliberately still-dark panel (the reference's own "deep plum
+   header" role) sitting on the new light page, so its own text/border/hover
+   tokens are the --panel-* set (light-on-dark), not the page's plain --ink/
+   --line/--muted (dark-on-light) -- see this file's own header comment. */
 .mkt :global(header.site-nav) {
   position: sticky;
   top: 0;
   z-index: 100;
-  background: rgba(20, 22, 26, 0.88);
+  background: rgba(30, 15, 31, 0.92);
   backdrop-filter: saturate(180%) blur(10px);
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--panel-line);
 }
 .mkt :global(.nav-inner) {
   max-width: 1140px;
@@ -183,7 +214,7 @@
   gap: 10px;
   font-weight: 800;
   font-size: 19px;
-  color: var(--ink);
+  color: var(--panel-ink);
 }
 .mkt :global(.logo-mark) {
   width: 36px;
@@ -201,11 +232,15 @@
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--muted);
+  color: var(--panel-muted);
   margin-top: 1px;
 }
 .mkt :global(footer) :global(.logo-sub) {
   color: var(--muted);
+}
+.mkt :global(header.site-nav) :global(.btn-outline) {
+  color: var(--panel-ink);
+  border-color: var(--panel-line);
 }
 
 .mkt :global(.hl) {
@@ -228,15 +263,15 @@
   border: none;
   font-size: 14.5px;
   font-weight: 600;
-  color: var(--body-text);
+  color: var(--panel-text);
   padding: 9px 14px;
   border-radius: 8px;
   cursor: pointer;
   display: inline-block;
 }
 .mkt :global(nav.links) :global(a.navlink):hover {
-  color: var(--ink);
-  background: var(--surface-alt);
+  color: var(--panel-ink);
+  background: var(--panel-hover-bg);
 }
 .mkt :global(nav.links) :global(a.navlink.active) {
   color: var(--accent);
@@ -254,7 +289,7 @@
 .mkt :global(.hamburger) {
   display: none;
   background: none;
-  border: 1.5px solid var(--line);
+  border: 1.5px solid var(--panel-line);
   border-radius: 8px;
   width: 40px;
   height: 40px;
@@ -262,14 +297,14 @@
   justify-content: center;
   cursor: pointer;
   font-size: 18px;
-  color: var(--ink);
+  color: var(--panel-ink);
 }
 .mkt :global(.mobile-nav) {
   display: none;
   flex-direction: column;
   padding: 8px 24px 16px;
   gap: 4px;
-  border-top: 1px solid var(--line);
+  border-top: 1px solid var(--panel-line);
 }
 .mkt :global(.mobile-nav.open) {
   display: flex;
@@ -340,9 +375,13 @@
   flex: none;
 }
 
+/* Hero mockup card -- kept as a dark plum/purple panel on purpose (the
+   product-screenshot-style card in the hero), matching the reference's own
+   dark header/progress-bar tones together in one visual -- see --panel-* in
+   this file's own header comment. */
 .mkt :global(.hero-visual) {
   background: linear-gradient(160deg, var(--panel-1), var(--panel-2));
-  border: 1px solid var(--line);
+  border: 1px solid var(--panel-line);
   border-radius: 20px;
   padding: 26px;
   box-shadow: var(--shadow-lg);
@@ -353,11 +392,11 @@
   content: "";
   position: absolute;
   inset: 0;
-  background: radial-gradient(circle at 80% 0%, rgba(34, 211, 238, 0.22), transparent 55%);
+  background: radial-gradient(circle at 80% 0%, rgba(201, 162, 39, 0.22), transparent 55%);
 }
 .mkt :global(.hv-card) {
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(247, 241, 225, 0.06);
+  border: 1px solid rgba(247, 241, 225, 0.12);
   border-radius: 12px;
   padding: 16px 18px;
   margin-bottom: 12px;
@@ -368,12 +407,12 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
-  color: #e7ecf3;
+  color: var(--panel-ink);
   font-size: 13px;
 }
 .mkt :global(.hv-badge) {
   background: var(--amber);
-  color: #1a1200;
+  color: var(--accent-ink);
   font-size: 11px;
   font-weight: 800;
   padding: 3px 9px;
@@ -382,7 +421,7 @@
 .mkt :global(.hv-bar) {
   height: 8px;
   border-radius: 5px;
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(247, 241, 225, 0.15);
   margin-top: 10px;
   overflow: hidden;
 }
@@ -393,12 +432,12 @@
   border-radius: 5px;
 }
 .mkt :global(.hv-stat) {
-  color: #fff;
+  color: var(--panel-ink);
   font-weight: 800;
   font-size: 26px;
 }
 .mkt :global(.hv-label) {
-  color: var(--muted);
+  color: var(--panel-muted);
   font-size: 12px;
 }
 
@@ -665,14 +704,16 @@
   color: var(--muted);
 }
 
-/* CTA BAND */
+/* CTA BAND -- the third and last deliberately-dark panel on this otherwise
+   light page, same --panel-* reasoning as the nav header and hero mockup
+   card above. */
 .mkt :global(.cta-band) {
   background: linear-gradient(135deg, var(--panel-1), var(--panel-2));
-  border: 1px solid var(--line);
+  border: 1px solid var(--panel-line);
   border-radius: 24px;
   padding: 64px 48px;
   text-align: center;
-  color: #fff;
+  color: var(--panel-ink);
   position: relative;
   overflow: hidden;
 }
@@ -680,20 +721,20 @@
   content: "";
   position: absolute;
   inset: 0;
-  background: radial-gradient(circle at 15% 20%, rgba(34, 211, 238, 0.22), transparent 55%);
+  background: radial-gradient(circle at 15% 20%, rgba(201, 162, 39, 0.22), transparent 55%);
 }
 .mkt :global(.cta-band) :global(h2) {
-  color: #fff;
+  color: var(--panel-ink);
   position: relative;
 }
 .mkt :global(.cta-band) :global(p) {
-  color: var(--body-text);
+  color: var(--panel-text);
   position: relative;
   max-width: 520px;
   margin: 0 auto 30px;
 }
 .mkt :global(.cta-band) :global(.hero-tagline) {
-  color: #fff;
+  color: var(--panel-ink);
   position: relative;
 }
 .mkt :global(.cta-band) :global(.hero-actions) {
@@ -775,7 +816,7 @@
 }
 .mkt :global(.price-card.featured) {
   border: 2px solid var(--accent);
-  box-shadow: 0 16px 48px rgba(34, 211, 238, 0.2);
+  box-shadow: 0 16px 48px rgba(201, 162, 39, 0.2);
   transform: translateY(-8px);
 }
 .mkt :global(.badge-pop) {
@@ -885,7 +926,7 @@
   padding: 12px 14px;
   border-radius: 10px;
   border: 1.5px solid var(--line);
-  background: var(--panel-1);
+  background: var(--surface);
   color: var(--ink);
 }
 .mkt :global(.demo-form) :global(input)::placeholder,
@@ -906,10 +947,10 @@
   margin-top: 14px;
 }
 .mkt :global(.form-note.success) {
-  color: var(--accent);
+  color: var(--success);
 }
 .mkt :global(.form-note.error) {
-  color: var(--amber);
+  color: var(--danger);
 }
 
 /* ===================================================================
@@ -1047,7 +1088,7 @@
   max-height: 320px;
   opacity: 1;
   padding: 8px 24px 16px;
-  border-top-color: var(--line);
+  border-top-color: var(--panel-line);
 }
 @media (prefers-reduced-motion: no-preference) {
   .mkt :global(.mobile-nav) {
