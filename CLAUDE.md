@@ -1005,10 +1005,12 @@ eBay/Temu v1" scope decision.
   alongside its existing Amazon branch.
 - **Automatic catalog sync** (`ShopifyConnector.pullProductCatalog()`,
   `packages/scheduler`'s `syncShopifyCatalog`/`runShopifyCatalogSyncJob`, cron route
-  `GET /api/cron/shopify-catalog-sync` at 4:30am — before the 5am order-sync cron, so a
-  genuinely new product is more likely mapped before that day's orders reference it,
-  though Hobby's ±59min per-job scheduling imprecision means this ordering is a
-  best-effort default, not a guarantee): closes the gap
+  `GET /api/cron/shopify-catalog-sync` — now every 10 minutes, 1 minute ahead of its
+  own order-sync cron (§9's own "Vercel Hobby's once-daily cron cap" entry, applied
+  once Arif upgraded off Hobby), so a genuinely new product is more likely mapped
+  before that cycle's own orders reference it; this ordering was always a
+  best-effort default, not a guarantee, on Hobby's once-daily cadence or this
+  every-10-minutes one alike): closes the gap
   `scripts/add-channel-listing.ts` is a manual, one-SKU-at-a-time stopgap for. Pulls
   every SKU'd variant in the store and upserts a `products`/`channel_listings` row per
   variant, using the exact same `internal_sku = "shopify-<sku>"` convention that script
@@ -2978,45 +2980,51 @@ eBay/Temu v1" scope decision.
 - **Disaster recovery**: point-in-time DB recovery (Postgres WAL), event bus replay
   capability to reconstruct inventory state after an incident rather than trusting a
   single mutable snapshot.
-- **Vercel Hobby's once-daily cron cap — a live constraint, with a ready-to-apply fix
-  prepped as a real file, not just prose**: this app's real deployment (§5) currently
-  runs on Vercel's Hobby plan, which rejects any `vercel.json` cron entry more
-  frequent than once per day at deploy time — every `crons` entry today (9 of them as
-  of the `inventory-partition-maintenance` addition: `rate-limit-window-cleanup`,
-  `amazon-order-sync`, `shopify-catalog-sync`, `shopify-order-sync`,
-  `walmart-order-sync`, `ebay-order-sync`, `temu-order-sync`, `tiktok-order-sync`,
-  `inventory-partition-maintenance`) is staggered across a single day, once each,
-  purely because of this cap — not because once/day is the right cadence for a
-  tenant with real contracts and 30,000+ orders/week (§2.2's own partitioning
-  update). Every one of those channels' own sync jobs is otherwise ready to run far
-  more often today — nothing about `syncXOrders`/`runXOrderSyncJob` assumes a daily
-  cadence, it's purely the `vercel.json` schedule string holding them back.
-  - **`vercel.upgraded-plan.json` (repo root) is the prepped, ready-to-apply
-    replacement** — a full, valid `vercel.json` with every field identical to the
-    live one except the 7 order/catalog-sync crons' own `schedule`, each changed
-    from its current once-daily entry to every-10-minutes
+- **Vercel Hobby's once-daily cron cap — was a live constraint; now lifted, fix
+  applied**: this app's real deployment (§5) ran on Vercel's Hobby plan, which
+  rejected any `vercel.json` cron entry more frequent than once per day at deploy
+  time — every `crons` entry (`rate-limit-window-cleanup`, `amazon-order-sync`,
+  `shopify-catalog-sync`, `shopify-order-sync`, `walmart-order-sync`,
+  `ebay-order-sync`, `temu-order-sync`, `tiktok-order-sync`,
+  `inventory-partition-maintenance`, `sales-rollup`) was staggered across a single
+  day, once each, purely because of this cap — not because once/day was the right
+  cadence for a tenant with real contracts and 30,000+ orders/week (§2.2's own
+  partitioning update). Every one of those channels' own sync jobs was otherwise
+  ready to run far more often — nothing about `syncXOrders`/`runXOrderSyncJob`
+  assumes a daily cadence, it was purely the `vercel.json` schedule string holding
+  them back.
+  - **`vercel.upgraded-plan.json` (repo root) was the prepped replacement, and is
+    now applied to the live `vercel.json`** (Arif upgraded the team's Vercel plan to
+    Pro, which lifts the once-daily cap) — a full, valid `vercel.json` identical to
+    the prior live one except the 7 order/catalog-sync crons' own `schedule`, each
+    changed from a once-daily entry to every-10-minutes
     (`"<offset>,<offset+10>,<offset+20>,<offset+30>,<offset+40>,<offset+50> * * * *"`),
     each channel keeping a distinct 1-minute-apart offset (1 through 7, in the same
-    relative order the live file already uses) so they don't all fire in the same
-    tick and contend for the same rate-limited connections at once (§4.4) — Shopify's
+    relative order the prior file used) so they don't all fire in the same tick and
+    contend for the same rate-limited connections at once (§4.4) — Shopify's
     catalog sync (offset 2) still runs 1 minute ahead of its own order sync (offset
     3), preserving the existing "catalog maps a new SKU before that day's orders
     reference it" ordering (§4.5) at 10-minute-cycle scale instead of the old
-    30-minute one. `rate-limit-window-cleanup`/`inventory-partition-maintenance` stay
-    daily, byte-for-byte unchanged — neither benefits from running more often (a
-    24-hour retention sweep and a 3-months-ahead partition check are both inherently
-    slow-moving).
-  - **To apply, once Arif actually upgrades off Hobby** (Pro or higher lifts this
-    cap): `cp vercel.upgraded-plan.json vercel.json`, commit, deploy. That's the
-    entire fix — no code change, no new route, nothing else in this codebase assumes
-    a particular cron cadence. Not applied to the live `vercel.json` now, and
-    deliberately kept as a separate file rather than a commented-out block (JSON has
-    no comments) — applying the every-10-minutes schedule to the live file today
-    would fail deployment outright under the current plan.
-  - Verified: valid JSON (`python3 -c "import json; json.load(open(...))"`), and a
-    direct diff against the live `vercel.json` confirms it differs in exactly the 7
-    sync-cron `schedule` values and nothing else (same paths, same ordering, same 2
-    maintenance crons).
+    30-minute one. `rate-limit-window-cleanup`/`inventory-partition-maintenance`/
+    `sales-rollup` stay daily, byte-for-byte unchanged — none of the three benefits
+    from running more often (a 24-hour retention sweep, a 3-months-ahead partition
+    check, and a rollup over a trailing few-day window are all inherently
+    slow-moving; `sales-rollup` in particular gains nothing from a tighter cadence
+    since `/reports` is already documented as only as fresh as "last night's run" —
+    see its own §8 entry).
+  - **Applied**: `cp vercel.upgraded-plan.json vercel.json`, verified as valid JSON
+    and byte-for-byte identical to `vercel.upgraded-plan.json` afterward, committed.
+    That was the entire fix — no code change, no new route, nothing else in this
+    codebase assumed a particular cron cadence. `vercel.upgraded-plan.json` is kept
+    in the repo rather than deleted, as the record of what the live file's
+    every-10-minutes schedule should look like if it ever needs reconstructing
+    (e.g. a future channel addition needs its own offset picked the same way).
+  - **Not yet re-verified against a real deploy**: applying this file is confirmed
+    correct at the JSON/git level (the same verification the prior "ready to apply"
+    state already had); whether Vercel's own Pro-plan cron scheduler actually
+    honors the every-10-minutes entries as configured is confirmed only once this
+    deploys and a sync job's own `last_order_sync_at`/logs show the tighter
+    cadence in practice, not yet observed directly.
 
 ## 10. Team & Realistic Timeline
 

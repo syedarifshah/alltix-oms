@@ -15,31 +15,31 @@
     },
     {
       "path": "/api/cron/amazon-order-sync",
-      "schedule": "0 4 * * *"
+      "schedule": "1,11,21,31,41,51 * * * *"
     },
     {
       "path": "/api/cron/shopify-catalog-sync",
-      "schedule": "30 4 * * *"
+      "schedule": "2,12,22,32,42,52 * * * *"
     },
     {
       "path": "/api/cron/shopify-order-sync",
-      "schedule": "0 5 * * *"
+      "schedule": "3,13,23,33,43,53 * * * *"
     },
     {
       "path": "/api/cron/walmart-order-sync",
-      "schedule": "30 5 * * *"
+      "schedule": "4,14,24,34,44,54 * * * *"
     },
     {
       "path": "/api/cron/ebay-order-sync",
-      "schedule": "0 6 * * *"
+      "schedule": "5,15,25,35,45,55 * * * *"
     },
     {
       "path": "/api/cron/temu-order-sync",
-      "schedule": "30 6 * * *"
+      "schedule": "6,16,26,36,46,56 * * * *"
     },
     {
       "path": "/api/cron/tiktok-order-sync",
-      "schedule": "0 7 * * *"
+      "schedule": "7,17,27,37,47,57 * * * *"
     },
     {
       "path": "/api/cron/sales-rollup",
