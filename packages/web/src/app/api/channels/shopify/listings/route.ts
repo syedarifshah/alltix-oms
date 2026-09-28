@@ -26,20 +26,25 @@ export const dynamic = "force-dynamic";
  * requireCurrentUser resolves auth/tenant without opening one; each DB read/
  * write below opens its own short-lived withTenant() block instead.
  *
- * **Deliberately NOT extended for Shopify's own multi-store support**
- * (createShopifyConnectorFromChannelConnection's own new optional
- * connectionId parameter): unlike the order-lookup path in
- * WarehouseService.confirmShipment or a scheduler sync tick, this route has
- * no existing signal for which of a tenant's several connected stores a
- * brand-new outbound listing should be created on -- there's no order, no
- * webhook header, nothing to resolve a specific connection from. This still
- * omits the parameter and falls back to "most recently connected active
- * Shopify store," the same behavior as before multi-store existed. A tenant
- * with more than one connected store who wants to choose which one a new
- * listing goes to needs a real store-picker added to the /products form --
- * a genuinely separate, additive piece of UI work, not attempted here (same
- * "flag it, don't hide it" discipline this codebase applies to every other
- * deliberately-left-open gap).
+ * **Now extended for Shopify's own multi-store support, closing the gap
+ * this doc comment used to flag as deliberately not attempted**: unlike the
+ * order-lookup path in WarehouseService.confirmShipment or a scheduler sync
+ * tick, this route has no *implicit* signal (no order, no webhook header)
+ * for which of a tenant's several connected stores a brand-new outbound
+ * listing should be created on -- so instead of inferring one, /products'
+ * own CreateListingForm now asks the tenant directly: a real `<select>`
+ * appears whenever a tenant has more than one active Shopify connection,
+ * and its chosen value is read here as an optional `connectionId` form
+ * field. With zero or exactly one active connection, the form renders no
+ * such field at all (nothing to choose between), `connectionId` comes
+ * through empty, and `createShopifyConnectorFromChannelConnection` falls
+ * back to its own pre-existing "most recently connected active Shopify
+ * store" default -- identical behavior to before this pass, for the common
+ * single-store case. A `connectionId` that doesn't resolve to an active
+ * Shopify connection for this tenant (stale/tampered value, or a
+ * connection that got disconnected between page load and submit) fails
+ * loudly via the same `shopify_listing_no_connection:` error path already
+ * in place below, rather than silently falling back to a different store.
  */
 export async function POST(req: NextRequest): Promise<Response> {
   const pool = getAppPool();
@@ -55,6 +60,10 @@ export async function POST(req: NextRequest): Promise<Response> {
   const formData = await req.formData();
   const productId = String(formData.get("productId") ?? "").trim();
   const price = String(formData.get("price") ?? "").trim();
+  // Optional -- see this route's own doc comment above. Empty/absent means
+  // "let createShopifyConnectorFromChannelConnection pick the most recently
+  // connected active store," the pre-existing single-store default.
+  const connectionId = String(formData.get("connectionId") ?? "").trim() || null;
 
   if (!productId || !price) {
     return redirectWithError(req, "/products", "shopify_listing_missing_fields");
@@ -93,7 +102,7 @@ export async function POST(req: NextRequest): Promise<Response> {
 
   let connector;
   try {
-    connector = await createShopifyConnectorFromChannelConnection(pool, user.tenantId);
+    connector = await createShopifyConnectorFromChannelConnection(pool, user.tenantId, connectionId);
   } catch (err) {
     return redirectWithError(req, "/products", `shopify_listing_no_connection:${errorMessage(err)}`);
   }
@@ -125,7 +134,7 @@ export async function POST(req: NextRequest): Promise<Response> {
         action: "channel_listing.created",
         entityType: "channel_listing",
         entityId: inserted.rows[0]!.id,
-        details: { channel: "shopify", productId, sellerSku: productRow.internal_sku, status: "draft" },
+        details: { channel: "shopify", productId, sellerSku: productRow.internal_sku, status: "draft", connectionId },
       });
     });
   } catch (err) {

@@ -8,6 +8,11 @@ import { resolveTenantId } from "@/lib/with-tenant-auth";
 
 export const dynamic = "force-dynamic";
 
+interface ShopifyConnectionOption {
+  id: string;
+  external_account_id: string;
+}
+
 interface ProductRow {
   id: string;
   internal_sku: string;
@@ -53,6 +58,16 @@ interface ProductsPageProps {
  *
  * Same auth/tenant pattern as every other page in this app -- see
  * src/app/orders/page.tsx's doc comment.
+ *
+ * **Shopify store-picker -- closes the "falls back to most recently
+ * connected store" gap CLAUDE.md §4.5.1 flagged as deliberately not
+ * touched**: a tenant with more than one active Shopify connection
+ * (§4.5.1's own true multi-store CONNECT) now gets a real `<select>` on
+ * CreateListingForm to choose which connected store a brand-new listing
+ * goes to, instead of the route silently defaulting to "most recently
+ * connected." With exactly one (or zero) active connections the picker
+ * is omitted entirely -- nothing to choose between, and the route's own
+ * connectionId-omitted default behavior is already correct.
  */
 export default async function ProductsPage({ searchParams }: ProductsPageProps): Promise<ReactElement> {
   const authContext = await getAuthContext(await headers());
@@ -84,7 +99,7 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
 
   const {
     products,
-    hasActiveShopifyConnection,
+    shopifyConnections,
     hasActiveWalmartConnection,
     hasActiveAmazonConnection,
     hasEbaySellingSetup,
@@ -115,8 +130,16 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
              ON ce.product_id = p.id AND ce.tenant_id = p.tenant_id AND ce.channel = 'ebay'
           ORDER BY p.internal_sku`,
       );
-      const shopifyConnectionResult = await client.query(
-        `SELECT 1 FROM channel_connections WHERE channel = 'shopify' AND status = 'active' LIMIT 1`,
+      // No LIMIT 1, deliberately -- unlike every other channel's own
+      // existence check on this page, a tenant can have more than one
+      // active Shopify connection (CLAUDE.md §4.5.1's true multi-store
+      // CONNECT). Every row is needed here (id + shop domain), not just
+      // whether one exists, so CreateListingForm can offer a real picker.
+      const shopifyConnectionsResult = await client.query<ShopifyConnectionOption>(
+        `SELECT id, external_account_id
+           FROM channel_connections
+          WHERE channel = 'shopify' AND status = 'active'
+          ORDER BY created_at DESC`,
       );
       const walmartConnectionResult = await client.query(
         `SELECT 1 FROM channel_connections WHERE channel = 'walmart' AND status = 'active' LIMIT 1`,
@@ -141,7 +164,7 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
       );
       return {
         products: productsResult.rows,
-        hasActiveShopifyConnection: shopifyConnectionResult.rows.length > 0,
+        shopifyConnections: shopifyConnectionsResult.rows,
         hasActiveWalmartConnection: walmartConnectionResult.rows.length > 0,
         hasActiveAmazonConnection: amazonConnectionResult.rows.length > 0,
         hasEbaySellingSetup: ebaySellingSetupResult.rows.length > 0,
@@ -202,7 +225,7 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
         </form>
       </details>
 
-      {!hasActiveShopifyConnection && (
+      {shopifyConnections.length === 0 && (
         <div className="alert alert-info">
           No active Shopify connection — connect one on the{" "}
           <a href="/settings/channels">Channels settings page</a> before creating a listing.
@@ -258,8 +281,8 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
                           {product.shopify_list_price ? ` · $${product.shopify_list_price}` : ""}
                         </span>
                       </div>
-                    ) : hasActiveShopifyConnection ? (
-                      <CreateListingForm productId={product.id} />
+                    ) : shopifyConnections.length > 0 ? (
+                      <CreateListingForm productId={product.id} connections={shopifyConnections} />
                     ) : (
                       <span className="muted">not listed</span>
                     )}
@@ -349,11 +372,29 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
 /** Plain HTML form, no client JS -- CLAUDE.md's Next.js conventions call for
  *  <form action method="POST"> submissions, same pattern as every other
  *  mutation form in this app (e.g. /settings/channels' ShopifyConnectForm,
- *  /rules' "New rule" form). */
-function CreateListingForm({ productId }: { productId: string }): ReactElement {
+ *  /rules' "New rule" form).
+ *
+ *  Store picker: with exactly one active Shopify connection (the common
+ *  case), no `connectionId` field is rendered at all -- there's nothing to
+ *  choose between, and the route's own "omitted means most recently
+ *  connected" default is already correct and unambiguous. With more than
+ *  one, a real `<select>` lets the tenant choose which connected store
+ *  this listing gets created on, closing the gap CLAUDE.md §4.5.1 flagged
+ *  ("falls back to most recently connected store, a real store-picker ...
+ *  not attempted here"). */
+function CreateListingForm({ productId, connections }: { productId: string; connections: ShopifyConnectionOption[] }): ReactElement {
   return (
     <form action="/api/channels/shopify/listings" method="POST" className="row" style={{ gap: 6 }}>
       <input type="hidden" name="productId" value={productId} />
+      {connections.length > 1 && (
+        <select name="connectionId" required style={{ maxWidth: 160 }}>
+          {connections.map((connection) => (
+            <option key={connection.id} value={connection.id}>
+              {connection.external_account_id}
+            </option>
+          ))}
+        </select>
+      )}
       <input type="text" name="price" placeholder="19.99" required style={{ width: 80 }} />
       <button type="submit">List on Shopify</button>
     </form>

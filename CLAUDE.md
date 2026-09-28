@@ -1235,13 +1235,15 @@ eBay/Temu v1" scope decision.
   OAuth upsert route per §4.8.1's own "Multi-shop picker" paragraph), while resubmitting
   an existing domain rotates that one store's credentials.
 - **Deliberately NOT touched**: `/api/channels/shopify/connect` itself (no code change
-  needed — see above); `/api/channels/shopify/listings` (creating a new outbound
-  listing) still omits `connectionId` and falls back to "most recently connected
-  store," since there's no order/webhook-header signal to resolve a specific store from
-  for a brand-new listing — a real store-picker for that flow is separate, additive UI
-  work, flagged in that route's own doc comment, not attempted here; no other channel
-  gained multi-connection support; `WarehouseService`'s other five channel branches are
-  untouched.
+  needed — see above); no other channel gained multi-connection support;
+  `WarehouseService`'s other five channel branches are untouched.
+  - **Update — the `/api/channels/shopify/listings` store-picker gap is now closed
+    too, see §4.5.4**: this paragraph originally flagged that route (creating a new
+    outbound listing) as still omitting `connectionId` and falling back to "most
+    recently connected store," since there's no order/webhook-header signal to
+    resolve a specific store from for a brand-new listing — that's fixed now with a
+    real, explicit `<select>` on `/products`' own `CreateListingForm` instead of an
+    inferred signal.
 - **Tested**: `packages/scheduler/test/shopify-multi-store.test.ts` (5 tests, mirroring
   `tiktok-multi-shop.test.ts` exactly — both stores discovered and synced independently
   with distinct `connectionId`s; one store flipping to `status='error'` leaves a
@@ -1402,6 +1404,67 @@ eBay/Temu v1" scope decision.
   application-layer fix, no schema change), `npm run typecheck --workspaces` clean
   across all twelve workspaces, `next build` clean, `bash scripts/run-tests.sh` —
   all 65 test files pass (up from 64).
+
+### 4.5.4 Shopify outbound-listing store-picker — built, closing §4.5.1's own "Deliberately NOT touched" gap
+
+- **Why**: after closing out the entire 7-carrier build (blocked purely on real vendor
+  credentials from that point on, §19.12), the next request was to shift focus back to
+  Shopify. A pasted status summary claimed four items were still open on the Shopify
+  connector — checked against this file's own actual, current record rather than taken
+  at face value (the same "verify a possibly-stale list before proceeding on it"
+  discipline this project already applied once before, when a different stale summary
+  claimed multi-store support and the webhook idempotency check were still open when
+  both were already built). Two of those four claims turned out to be stale: §4.5.1's
+  own true multi-store CONNECT and §4.5.2's own webhook re-registration idempotency fix
+  were both already built and merged. Of what was genuinely still open, Arif's own
+  explicit pick (AskUserQuestion, recommended option) was the smaller, well-scoped one
+  with no external dependency: `/api/channels/shopify/listings` (creating a brand-new
+  outbound listing) still silently defaulted to "most recently connected store" for a
+  tenant with more than one active Shopify connection, per §4.5.1's own "Deliberately
+  NOT touched" paragraph — not the larger, riskier SKU-namespace-collision redesign
+  that same paragraph's sibling gap would need.
+- **The fix**: unlike an order or a webhook delivery, a brand-new outbound listing has
+  no *implicit* signal for which connected store it should go to — so instead of
+  inferring one, `/products`' own `CreateListingForm` now asks the tenant directly.
+  `/products`' own server query for Shopify connections dropped its `LIMIT 1`/`SELECT 1`
+  existence check (`hasActiveShopifyConnection`) in favor of a real list
+  (`SELECT id, external_account_id FROM channel_connections WHERE channel = 'shopify'
+  AND status = 'active' ORDER BY created_at DESC`), mirroring the exact "no LIMIT 1,
+  every row is needed" pattern §4.5.1's/§4.8.1's own settings-page queries already
+  established for showing per-store connection cards. With exactly one (or zero) active
+  connections, `CreateListingForm` renders no `connectionId` field at all — nothing to
+  choose between, and the pre-existing single-store default stays byte-for-byte
+  unchanged. With more than one, a real `<select name="connectionId">` (options: each
+  store's own shop domain) appears, and the chosen value is read on
+  `/api/channels/shopify/listings` and passed straight into
+  `createShopifyConnectorFromChannelConnection`'s own pre-existing optional
+  `connectionId` parameter (added for TikTok's/Shopify's own multi-store work, §4.8.1/
+  §4.5.1 — this route is simply its first real caller to actually populate it). A
+  `connectionId` that doesn't resolve (stale value, a connection disconnected between
+  page load and submit) fails loudly via the same `shopify_listing_no_connection:`
+  error path the route already had, rather than silently falling back to a different
+  store.
+- **What this does NOT solve, deliberately, same scope boundary §4.5.1 itself already
+  drew**: the SKU-namespace-collision risk (two stores under one tenant sharing a
+  literal SKU string) — a genuinely separate, larger redesign of `products.internal_sku`
+  keying, not attempted here, and not what Arif picked this round. Also unchanged: a
+  tenant can still only ever have ONE `channel_listings` row per (tenant, product,
+  'shopify') — the existing `SELECT id FROM channel_listings WHERE tenant_id = $1 AND
+  product_id = $2 AND channel = 'shopify'` duplicate-create guard still blocks creating
+  a *second* Shopify listing for the same internal product even on a *different* store;
+  this pass is about choosing which store the FIRST listing goes to, not about
+  supporting one product listed on multiple stores at once (a real, separate feature,
+  not named as part of Arif's own pick this round).
+- **Tested**: no new dedicated test file — same reasoning several other route-only UI
+  changes in this codebase already carry (e.g. §19.10's live-rate-estimate wiring): the
+  change is a page-level `<select>` plus one route reading one more optional form field
+  and forwarding it into an already-tested connector-resolution function
+  (`createShopifyConnectorFromChannelConnection`'s own `connectionId` parameter is
+  already covered by `shopify-multi-store.test.ts`'s own scheduler-side tests, §4.5.1),
+  with no new pure decision logic to extract. Verified: `npm run typecheck --workspaces`
+  clean across all twelve workspaces, `next build` clean (the updated `/products` page
+  and `/api/channels/shopify/listings` route both compile), `bash scripts/run-tests.sh`
+  — all 65 test files pass, unchanged.
 
 ### 4.6 eBay Sell APIs (channel #4 — built once the connector abstraction had proven itself)
 
