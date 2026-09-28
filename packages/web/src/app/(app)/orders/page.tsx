@@ -6,6 +6,7 @@ import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
 import { ALL_ORDER_STATUSES, orderStatusBadgeClass } from "@/lib/order-status";
+import { channelBadgeClass, channelLabel } from "@/lib/channel-badge";
 
 export const dynamic = "force-dynamic";
 
@@ -156,51 +157,55 @@ export default async function OrdersPage({ searchParams }: OrdersPageProps): Pro
         ))}
       </div>
 
-      {orders.length === 0 ? (
-        <p className="empty">No orders{validFilter ? ` in status '${validFilter}'` : ""}.</p>
-      ) : (
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Status</th>
-                <th>Channel</th>
-                <th>External Order ID</th>
-                <th>Placed At</th>
-                <th>Lines</th>
-              </tr>
-            </thead>
-            <tbody>
-              {orders.map((order) => (
-                <tr key={order.id}>
-                  <td>
-                    <span className={orderStatusBadgeClass(order.status)}>{order.status}</span>
-                  </td>
-                  <td>{order.channel}</td>
-                  <td>
-                    <a href={`/orders/${order.id}`}>{order.externalOrderId}</a>
-                  </td>
-                  <td>{order.placedAt ? new Date(order.placedAt).toISOString() : "—"}</td>
-                  <td>
-                    {order.lines.length === 0 ? (
-                      "—"
-                    ) : (
-                      <ul>
-                        {order.lines.map((line) => (
-                          <li key={line.id}>
-                            {line.internalSku ?? "(unresolved SKU)"} × {line.quantity}
-                            {order.status === "allocated" && (line.reserved ? " — reserved ✓" : " — NOT reserved ✗")}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </td>
+      <div className="panel-card">
+        {orders.length === 0 ? (
+          <p className="empty">No orders{validFilter ? ` in status '${validFilter}'` : ""}.</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Status</th>
+                  <th>Channel</th>
+                  <th>External Order ID</th>
+                  <th>Placed At</th>
+                  <th>Lines</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+              </thead>
+              <tbody>
+                {orders.map((order) => (
+                  <tr key={order.id}>
+                    <td>
+                      <span className={orderStatusBadgeClass(order.status)}>{order.status}</span>
+                    </td>
+                    <td>
+                      <span className={channelBadgeClass(order.channel)}>{channelLabel(order.channel)}</span>
+                    </td>
+                    <td>
+                      <a href={`/orders/${order.id}`}>{order.externalOrderId}</a>
+                    </td>
+                    <td>{order.placedAt ? new Date(order.placedAt).toISOString() : "—"}</td>
+                    <td>
+                      {order.lines.length === 0 ? (
+                        "—"
+                      ) : (
+                        <ul>
+                          {order.lines.map((line) => (
+                            <li key={line.id}>
+                              {line.internalSku ?? "(unresolved SKU)"} × {line.quantity}
+                              {order.status === "allocated" && (line.reserved ? " — reserved ✓" : " — NOT reserved ✗")}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </main>
   );
 }

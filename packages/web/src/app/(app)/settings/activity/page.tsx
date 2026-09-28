@@ -5,6 +5,8 @@ import { withTenant } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { describeAction } from "@/lib/audit-log-format";
+import { SettingsTabs } from "@/components/settings-tabs";
 
 export const dynamic = "force-dynamic";
 
@@ -26,17 +28,6 @@ interface AuditLogRow {
   details: Record<string, unknown> | null;
   created_at: string;
   actor_email: string | null;
-}
-
-/** "rule.created" -> "Rule created"; "settings.reorder_threshold_changed" ->
- *  "Settings reorder threshold changed". Every action string in this
- *  codebase follows the same dot-namespaced, underscore-separated
- *  convention (see audit-log.ts's own doc comment) -- this is a generic
- *  formatter, not a per-action lookup table, so a new instrumented route
- *  needs no change here to render sensibly. */
-function describeAction(action: string): string {
-  const words = action.replace(/[._]/g, " ").trim();
-  return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
 /** Parses `?before=` into a Date, or null for "no cursor, first page" --
@@ -94,7 +85,8 @@ export default async function ActivityPage({ searchParams }: ActivityPageProps):
   if (!tenantId) {
     return (
       <main className="page">
-        <h1>Activity</h1>
+        <h1>Settings</h1>
+        <SettingsTabs active="/settings/activity" />
         <p>No tenant is associated with this account yet.</p>
       </main>
     );
@@ -143,7 +135,8 @@ export default async function ActivityPage({ searchParams }: ActivityPageProps):
 
   return (
     <main className="page">
-      <h1>Activity</h1>
+      <h1>Settings</h1>
+      <SettingsTabs active="/settings/activity" />
       <p className="subtitle">
         Tracked changes for your account -- who created or toggled a rule, transitioned an order, generated a
         picklist, transferred stock, or changed a setting, and when. Not every action in the app is tracked yet; see
@@ -151,56 +144,58 @@ export default async function ActivityPage({ searchParams }: ActivityPageProps):
         {beforeCursor && " Showing activity before " + beforeCursor.toISOString() + "."}
       </p>
 
-      {entityTypes.length > 0 && (
-        <div className="tabs">
-          <a href={tabHref(null)} className={`tab ${entityTypeFilter === null ? "active" : ""}`}>
-            All
-          </a>
-          {entityTypes.map((type) => (
-            <a key={type} href={tabHref(type)} className={`tab ${entityTypeFilter === type ? "active" : ""}`}>
-              {type}
+      <div className="panel-card">
+        {entityTypes.length > 0 && (
+          <div className="tabs">
+            <a href={tabHref(null)} className={`tab ${entityTypeFilter === null ? "active" : ""}`}>
+              All
             </a>
-          ))}
-        </div>
-      )}
+            {entityTypes.map((type) => (
+              <a key={type} href={tabHref(type)} className={`tab ${entityTypeFilter === type ? "active" : ""}`}>
+                {type}
+              </a>
+            ))}
+          </div>
+        )}
 
-      {rows.length === 0 ? (
-        <p className="empty">No tracked activity{entityTypeFilter ? ` for '${entityTypeFilter}'` : ""} yet.</p>
-      ) : (
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>When</th>
-                <th>Action</th>
-                <th>Entity</th>
-                <th>Who</th>
-                <th>Details</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => (
-                <tr key={row.id}>
-                  <td>{new Date(row.created_at).toISOString()}</td>
-                  <td>{describeAction(row.action)}</td>
-                  <td className="muted">
-                    {row.entity_type}
-                    {row.entity_id ? ` (${row.entity_id})` : ""}
-                  </td>
-                  <td>{row.actor_email ?? "system (operator script)"}</td>
-                  <td className="muted">{row.details ? JSON.stringify(row.details) : ""}</td>
+        {rows.length === 0 ? (
+          <p className="empty">No tracked activity{entityTypeFilter ? ` for '${entityTypeFilter}'` : ""} yet.</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>When</th>
+                  <th>Action</th>
+                  <th>Entity</th>
+                  <th>Who</th>
+                  <th>Details</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+              </thead>
+              <tbody>
+                {rows.map((row) => (
+                  <tr key={row.id}>
+                    <td>{new Date(row.created_at).toISOString()}</td>
+                    <td>{describeAction(row.action)}</td>
+                    <td className="muted">
+                      {row.entity_type}
+                      {row.entity_id ? ` (${row.entity_id})` : ""}
+                    </td>
+                    <td>{row.actor_email ?? "system (operator script)"}</td>
+                    <td className="muted">{row.details ? JSON.stringify(row.details) : ""}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
 
-      {olderHref && (
-        <p>
-          <a href={olderHref}>Show older activity →</a>
-        </p>
-      )}
+        {olderHref && (
+          <p style={{ marginBottom: 0 }}>
+            <a href={olderHref}>Show older activity →</a>
+          </p>
+        )}
+      </div>
     </main>
   );
 }

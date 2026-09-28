@@ -6,6 +6,7 @@ import type { EmployeeStatus, TimeEntrySource } from "@alltix/shared";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { PeopleIcon } from "@/components/icons";
 
 export const dynamic = "force-dynamic";
 
@@ -112,7 +113,11 @@ export default async function HrPage({ searchParams }: HrPageProps): Promise<Rea
 
   return (
     <main className="page">
-      <h1>HR &amp; Payroll</h1>
+      <h1>
+        <span className="row" style={{ gap: 8 }}>
+          <PeopleIcon /> HR &amp; Payroll
+        </span>
+      </h1>
       <p className="subtitle">
         Employee directory and time tracking. See <a href="/hr/payroll">/hr/payroll</a> for gross wages (hours ×
         rate, no tax withholding) per pay period.
@@ -125,113 +130,131 @@ export default async function HrPage({ searchParams }: HrPageProps): Promise<Rea
       {timeEntryAdded === "1" && <div className="alert alert-success">Shift added.</div>}
       {error && <div className="alert alert-danger">{describeError(error)}</div>}
 
-      <h2>Employees</h2>
-
-      <details className="stack" style={{ marginBottom: 16 }}>
-        <summary>Add an employee</summary>
-        <form action="/api/hr/employees/create" method="POST" className="row" style={{ gap: 6, marginTop: 8 }}>
-          <input type="text" name="name" placeholder="Full name" required />
-          <input type="text" name="role" placeholder="Role (e.g. Picker)" required />
-          <select name="locationId" defaultValue="">
-            <option value="">No location</option>
-            {locations.map((location) => (
-              <option key={location.id} value={location.id}>
-                {location.name}
-              </option>
-            ))}
-          </select>
-          <input type="number" name="hourlyRate" placeholder="Hourly rate (optional)" min="0" step="0.01" style={{ width: 160 }} />
-          <button type="submit">Add employee</button>
-        </form>
-      </details>
-
-      {employees.length === 0 ? (
-        <p className="empty">No employees yet.</p>
-      ) : (
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Role</th>
-                <th>Location</th>
-                <th>Hourly rate</th>
-                <th>Status</th>
-                <th>Edit</th>
-                <th>Time clock</th>
-              </tr>
-            </thead>
-            <tbody>
-              {employees.map((employee) => (
-                <tr key={employee.id}>
-                  <td>{employee.name}</td>
-                  <td>{employee.role}</td>
-                  <td>{employee.location_name ?? <span className="muted">none</span>}</td>
-                  <td>{employee.hourly_rate ?? <span className="muted">not set</span>}</td>
-                  <td>
-                    <span className="badge">{employee.status}</span>
-                  </td>
-                  <td>
-                    <EditEmployeeForm employee={employee} locations={locations} />
-                  </td>
-                  <td>
-                    <ClockForm employeeId={employee.id} locations={locations} openTimeEntryId={employee.open_time_entry_id} />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+      <div className="panel-card">
+        <div className="panel-card-header">
+          <h2 className="panel-card-title" style={{ margin: 0 }}>
+            Employees
+          </h2>
         </div>
-      )}
 
-      <h2 style={{ marginTop: 32 }}>Add a shift (manual entry)</h2>
-      <p className="subtitle">
-        For a shift that wasn't live clocked in/out. Enter a start time and hours worked -- the end time is
-        computed for you.
-      </p>
-      <ManualTimeEntryForm employees={employees} locations={locations} />
-
-      <h2 style={{ marginTop: 32 }}>Recent shifts</h2>
-      {timeEntries.length === 0 ? (
-        <p className="empty">No shifts recorded yet.</p>
-      ) : (
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Employee</th>
-                <th>Location</th>
-                <th>Clock in</th>
-                <th>Clock out</th>
-                <th>Hours</th>
-                <th>Source</th>
-                <th>Notes</th>
-              </tr>
-            </thead>
-            <tbody>
-              {timeEntries.map((entry) => (
-                <tr key={entry.id}>
-                  <td>{entry.employee_name}</td>
-                  <td>{entry.location_name ?? <span className="muted">none</span>}</td>
-                  <td>{new Date(entry.clock_in).toISOString()}</td>
-                  <td>
-                    {entry.clock_out ? (
-                      new Date(entry.clock_out).toISOString()
-                    ) : (
-                      <span className="badge">in progress</span>
-                    )}
-                  </td>
-                  <td>{formatHours(entry.clock_in, entry.clock_out)}</td>
-                  <td>
-                    <span className="badge">{entry.entry_source}</span>
-                  </td>
-                  <td>{entry.notes ?? <span className="muted">—</span>}</td>
-                </tr>
+        <details className="stack" style={{ marginBottom: 16 }}>
+          <summary>Add an employee</summary>
+          <form action="/api/hr/employees/create" method="POST" className="row" style={{ gap: 6, marginTop: 8 }}>
+            <input type="text" name="name" placeholder="Full name" required />
+            <input type="text" name="role" placeholder="Role (e.g. Picker)" required />
+            <select name="locationId" defaultValue="">
+              <option value="">No location</option>
+              {locations.map((location) => (
+                <option key={location.id} value={location.id}>
+                  {location.name}
+                </option>
               ))}
-            </tbody>
-          </table>
+            </select>
+            <input type="number" name="hourlyRate" placeholder="Hourly rate (optional)" min="0" step="0.01" style={{ width: 160 }} />
+            <button type="submit">Add employee</button>
+          </form>
+        </details>
+
+        {employees.length === 0 ? (
+          <p className="empty">No employees yet.</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Role</th>
+                  <th>Location</th>
+                  <th>Hourly rate</th>
+                  <th>Status</th>
+                  <th>Edit</th>
+                  <th>Time clock</th>
+                </tr>
+              </thead>
+              <tbody>
+                {employees.map((employee) => (
+                  <tr key={employee.id}>
+                    <td>{employee.name}</td>
+                    <td>{employee.role}</td>
+                    <td>{employee.location_name ?? <span className="muted">none</span>}</td>
+                    <td>{employee.hourly_rate ?? <span className="muted">not set</span>}</td>
+                    <td>
+                      <span className="badge">{employee.status}</span>
+                    </td>
+                    <td>
+                      <EditEmployeeForm employee={employee} locations={locations} />
+                    </td>
+                    <td>
+                      <ClockForm employeeId={employee.id} locations={locations} openTimeEntryId={employee.open_time_entry_id} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div className="panel-card" style={{ marginTop: 24 }}>
+        <div className="panel-card-header">
+          <h2 className="panel-card-title" style={{ margin: 0 }}>
+            Add a shift (manual entry)
+          </h2>
         </div>
-      )}
+        <p className="subtitle">
+          For a shift that wasn't live clocked in/out. Enter a start time and hours worked -- the end time is
+          computed for you.
+        </p>
+        <ManualTimeEntryForm employees={employees} locations={locations} />
+      </div>
+
+      <div className="panel-card" style={{ marginTop: 24 }}>
+        <div className="panel-card-header">
+          <h2 className="panel-card-title" style={{ margin: 0 }}>
+            Recent shifts
+          </h2>
+        </div>
+        {timeEntries.length === 0 ? (
+          <p className="empty">No shifts recorded yet.</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Employee</th>
+                  <th>Location</th>
+                  <th>Clock in</th>
+                  <th>Clock out</th>
+                  <th>Hours</th>
+                  <th>Source</th>
+                  <th>Notes</th>
+                </tr>
+              </thead>
+              <tbody>
+                {timeEntries.map((entry) => (
+                  <tr key={entry.id}>
+                    <td>{entry.employee_name}</td>
+                    <td>{entry.location_name ?? <span className="muted">none</span>}</td>
+                    <td>{new Date(entry.clock_in).toISOString()}</td>
+                    <td>
+                      {entry.clock_out ? (
+                        new Date(entry.clock_out).toISOString()
+                      ) : (
+                        <span className="badge">in progress</span>
+                      )}
+                    </td>
+                    <td>{formatHours(entry.clock_in, entry.clock_out)}</td>
+                    <td>
+                      <span className="badge">{entry.entry_source}</span>
+                    </td>
+                    <td>{entry.notes ?? <span className="muted">—</span>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </main>
   );
 }

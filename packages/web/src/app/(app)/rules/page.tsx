@@ -6,6 +6,7 @@ import type { AutomationRuleAction, AutomationRuleCondition } from "@alltix/shar
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { AutomationIcon } from "@/components/icons";
 
 export const dynamic = "force-dynamic";
 
@@ -23,6 +24,7 @@ interface RuleRow {
   last_error: string | null;
   last_executed_at: string | null;
   last_order_id: string | null;
+  fired_count: string;
 }
 
 function formatCondition(c: AutomationRuleCondition): string {
@@ -73,7 +75,8 @@ export default async function RulesPage({ searchParams }: RulesPageProps): Promi
     const result = await client.query<RuleRow>(
       `SELECT ar.id, ar.name, ar.trigger_event, ar.conditions, ar.actions, ar.priority, ar.enabled, ar.created_at,
               le.applied AS last_applied, le.matched AS last_matched, le.error AS last_error,
-              le.created_at AS last_executed_at, le.order_id AS last_order_id
+              le.created_at AS last_executed_at, le.order_id AS last_order_id,
+              coalesce(fc.fired_count, 0)::text AS fired_count
          FROM automation_rules ar
          LEFT JOIN LATERAL (
            SELECT applied, matched, error, created_at, order_id
@@ -82,6 +85,14 @@ export default async function RulesPage({ searchParams }: RulesPageProps): Promi
             ORDER BY re.created_at DESC
             LIMIT 1
          ) le ON true
+         -- "X times fired" (Arif's reference) -- a real COUNT(*) over
+         -- rule_executions.applied = true, data this table already recorded
+         -- for every rule but never aggregated anywhere until this pass
+         -- (see /dashboard's identical fired-count query, which sums this
+         -- same column across every rule instead of per-rule).
+         LEFT JOIN LATERAL (
+           SELECT count(*) AS fired_count FROM rule_executions re2 WHERE re2.automation_rule_id = ar.id AND re2.applied = true
+         ) fc ON true
         ORDER BY ar.priority ASC, ar.created_at ASC`,
     );
     return result.rows;
@@ -89,7 +100,7 @@ export default async function RulesPage({ searchParams }: RulesPageProps): Promi
 
   return (
     <main className="page">
-      <h1>Rules</h1>
+      <h1>Automation</h1>
       <p className="subtitle">
         Order automation on two triggers — order.received and order.backordered. Actions: route_to_warehouse (sets a
         preferred warehouse, order.received only), hold_order (places the order on_hold instead of letting it
@@ -110,17 +121,23 @@ export default async function RulesPage({ searchParams }: RulesPageProps): Promi
       ) : (
         <div className="stack">
           {rules.map((rule) => (
-            <div className="card" key={rule.id}>
-              <div className="row">
-                <strong>{rule.name}</strong>
-                <span className="badge">{rule.trigger_event}</span>
-                <span className="badge">priority {rule.priority}</span>
-                <span className={rule.enabled ? "badge badge-success" : "badge"}>{rule.enabled ? "enabled" : "disabled"}</span>
-                <form action={`/api/rules/${rule.id}/toggle`} method="POST">
-                  <button type="submit" className="secondary">
-                    {rule.enabled ? "Disable" : "Enable"}
-                  </button>
-                </form>
+            <div className="panel-card" key={rule.id} style={{ opacity: rule.enabled ? 1 : 0.7 }}>
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <div className="row">
+                  <AutomationIcon />
+                  <strong>{rule.name}</strong>
+                  <span className="badge">{rule.trigger_event}</span>
+                  <span className="badge">P{rule.priority}</span>
+                  <span className="badge badge-accent">{rule.fired_count}× fired</span>
+                </div>
+                <div className="row">
+                  <span className={rule.enabled ? "badge badge-success" : "badge"}>{rule.enabled ? "enabled" : "disabled"}</span>
+                  <form action={`/api/rules/${rule.id}/toggle`} method="POST">
+                    <button type="submit" className="secondary">
+                      {rule.enabled ? "Disable" : "Enable"}
+                    </button>
+                  </form>
+                </div>
               </div>
 
               <div style={{ marginTop: 10 }}>
@@ -169,56 +186,62 @@ export default async function RulesPage({ searchParams }: RulesPageProps): Promi
         </div>
       )}
 
-      <h2>New rule</h2>
-      <form action="/api/rules" method="POST" className="card stack">
-        <div className="form-row">
-          <label htmlFor="name">Name</label>
-          <input id="name" type="text" name="name" required />
+      <div className="panel-card">
+        <div className="panel-card-header">
+          <h2 className="panel-card-title" style={{ margin: 0 }}>
+            New rule
+          </h2>
         </div>
-        <div className="row">
+        <form action="/api/rules" method="POST" className="stack">
           <div className="form-row">
-            <label htmlFor="triggerEvent">Trigger event (order.received or order.backordered)</label>
-            <input id="triggerEvent" type="text" name="triggerEvent" defaultValue="order.received" required />
+            <label htmlFor="name">Name</label>
+            <input id="name" type="text" name="name" required />
+          </div>
+          <div className="row">
+            <div className="form-row">
+              <label htmlFor="triggerEvent">Trigger event (order.received or order.backordered)</label>
+              <input id="triggerEvent" type="text" name="triggerEvent" defaultValue="order.received" required />
+            </div>
+            <div className="form-row">
+              <label htmlFor="priority">Priority (lower = higher priority)</label>
+              <input id="priority" type="number" name="priority" defaultValue={100} required />
+            </div>
+            <div className="form-row">
+              <label htmlFor="enabled">Enabled</label>
+              <input id="enabled" type="checkbox" name="enabled" defaultChecked />
+            </div>
           </div>
           <div className="form-row">
-            <label htmlFor="priority">Priority (lower = higher priority)</label>
-            <input id="priority" type="number" name="priority" defaultValue={100} required />
+            <label htmlFor="conditions">
+              Conditions — JSON array of field/op/value objects (&quot;eq&quot;, &quot;in&quot;, or
+              &quot;contains&quot; for &quot;this SKU is somewhere in the order&quot; against{" "}
+              <code>lineSkus</code>), e.g.:
+            </label>
+            <pre className="mono" style={{ margin: 0 }}>
+              {`[{"field": "channel", "op": "eq", "value": "amazon"},\n {"field": "lineSkus", "op": "contains", "value": "WIDGET-RED"}]`}
+            </pre>
+            <textarea id="conditions" name="conditions" rows={3} defaultValue="[]" className="mono" />
           </div>
           <div className="form-row">
-            <label htmlFor="enabled">Enabled</label>
-            <input id="enabled" type="checkbox" name="enabled" defaultChecked />
+            <label htmlFor="actions">
+              Actions (JSON array — &quot;route_to_warehouse&quot; (value = a warehouse location name),
+              &quot;hold_order&quot; (value ignored), &quot;send_notification&quot; (value = an optional custom
+              message string; omit or leave blank for a generic default), or &quot;webhook&quot; (value = an https://
+              URL, required, not pointing at a private/internal address) are implemented)
+            </label>
+            <textarea
+              id="actions"
+              name="actions"
+              rows={3}
+              defaultValue={'[{"type":"route_to_warehouse","value":""}]'}
+              className="mono"
+            />
           </div>
-        </div>
-        <div className="form-row">
-          <label htmlFor="conditions">
-            Conditions — JSON array of field/op/value objects (&quot;eq&quot;, &quot;in&quot;, or
-            &quot;contains&quot; for &quot;this SKU is somewhere in the order&quot; against{" "}
-            <code>lineSkus</code>), e.g.:
-          </label>
-          <pre className="mono" style={{ margin: 0 }}>
-            {`[{"field": "channel", "op": "eq", "value": "amazon"},\n {"field": "lineSkus", "op": "contains", "value": "WIDGET-RED"}]`}
-          </pre>
-          <textarea id="conditions" name="conditions" rows={3} defaultValue="[]" className="mono" />
-        </div>
-        <div className="form-row">
-          <label htmlFor="actions">
-            Actions (JSON array — &quot;route_to_warehouse&quot; (value = a warehouse location name),
-            &quot;hold_order&quot; (value ignored), &quot;send_notification&quot; (value = an optional custom
-            message string; omit or leave blank for a generic default), or &quot;webhook&quot; (value = an https://
-            URL, required, not pointing at a private/internal address) are implemented)
-          </label>
-          <textarea
-            id="actions"
-            name="actions"
-            rows={3}
-            defaultValue={'[{"type":"route_to_warehouse","value":""}]'}
-            className="mono"
-          />
-        </div>
-        <div>
-          <button type="submit">Create rule</button>
-        </div>
-      </form>
+          <div>
+            <button type="submit">Create rule</button>
+          </div>
+        </form>
+      </div>
     </main>
   );
 }

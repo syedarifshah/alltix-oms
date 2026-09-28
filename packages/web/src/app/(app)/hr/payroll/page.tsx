@@ -5,6 +5,7 @@ import { withTenant } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { PayrollIcon } from "@/components/icons";
 
 export const dynamic = "force-dynamic";
 
@@ -77,7 +78,11 @@ export default async function PayrollPage({ searchParams }: PayrollPageProps): P
   if (!tenantId) {
     return (
       <main className="page">
-        <h1>Payroll</h1>
+        <h1>
+          <span className="row" style={{ gap: 8 }}>
+            <PayrollIcon /> Payroll
+          </span>
+        </h1>
         <p>No tenant is associated with this account yet.</p>
       </main>
     );
@@ -114,23 +119,28 @@ export default async function PayrollPage({ searchParams }: PayrollPageProps): P
 
   return (
     <main className="page">
-      <h1>Payroll</h1>
+      <h1>
+        <span className="row" style={{ gap: 8 }}>
+          <PayrollIcon /> Payroll
+        </span>
+      </h1>
       <p className="subtitle">
         Gross wages (hours × hourly rate) for a pay period, computed live from tracked time. No tax withholding,
         deductions, or filings -- see <a href="/hr">/hr</a> for the employee directory and time clock.
       </p>
 
-      <form method="GET" className="row" style={{ gap: 8, marginBottom: 20 }}>
-        <label>
-          From <input type="date" name="from" defaultValue={toDateOnly(from)} />
-        </label>
-        <label>
-          To <input type="date" name="to" defaultValue={toDateOnly(to)} />
-        </label>
-        <button type="submit">View</button>
-      </form>
+      <div className="panel-card">
+        <form method="GET" className="row" style={{ gap: 8, marginBottom: 20 }}>
+          <label>
+            From <input type="date" name="from" defaultValue={toDateOnly(from)} />
+          </label>
+          <label>
+            To <input type="date" name="to" defaultValue={toDateOnly(to)} />
+          </label>
+          <button type="submit">View</button>
+        </form>
 
-      {rows.length === 0 ? (
+        {rows.length === 0 ? (
         <p className="empty">No shifts started in this period.</p>
       ) : (
         <div className="table-wrap">
@@ -202,7 +212,8 @@ export default async function PayrollPage({ searchParams }: PayrollPageProps): P
             </tbody>
           </table>
         </div>
-      )}
+        )}
+      </div>
     </main>
   );
 }

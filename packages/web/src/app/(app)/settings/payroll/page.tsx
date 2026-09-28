@@ -6,6 +6,7 @@ import { getPayrollConnection, getCompanyOnboardStatus } from "@alltix/payroll-s
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { SettingsTabs } from "@/components/settings-tabs";
 
 export const dynamic = "force-dynamic";
 
@@ -50,7 +51,8 @@ export default async function PayrollSettingsPage({ searchParams }: PayrollSetti
   if (!tenantId) {
     return (
       <main className="page">
-        <h1>Payroll</h1>
+        <h1>Settings</h1>
+        <SettingsTabs active="/settings/payroll" />
         <p>No tenant is associated with this account yet.</p>
       </main>
     );
@@ -79,7 +81,8 @@ export default async function PayrollSettingsPage({ searchParams }: PayrollSetti
 
   return (
     <main className="page">
-      <h1>Payroll</h1>
+      <h1>Settings</h1>
+      <SettingsTabs active="/settings/payroll" />
       <p className="subtitle">
         Real payroll processing via Check (CLAUDE.md §0/§14.1) -- tax withholding, filings, and money movement,
         handled entirely inside Check&apos;s own hosted Components. Wiring is complete but UNVERIFIED against real

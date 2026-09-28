@@ -6,6 +6,7 @@ import type { LocationType } from "@alltix/shared";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { SettingsTabs } from "@/components/settings-tabs";
 
 export const dynamic = "force-dynamic";
 
@@ -79,7 +80,8 @@ export default async function LocationsPage({ searchParams }: LocationsPageProps
   if (!tenantId) {
     return (
       <main className="page">
-        <h1>Locations</h1>
+        <h1>Settings</h1>
+        <SettingsTabs active="/locations" />
         <p>No tenant is associated with this account yet.</p>
       </main>
     );
@@ -100,7 +102,8 @@ export default async function LocationsPage({ searchParams }: LocationsPageProps
 
   return (
     <main className="page">
-      <h1>Locations</h1>
+      <h1>Settings</h1>
+      <SettingsTabs active="/locations" />
       <p className="subtitle">
         Warehouses, 3PLs, and FBA/WFS placeholders you can allocate, pick, and transfer stock between. A warehouse
         with a ZIP code set is preferred nearest-first when an order's shipping address resolves to a US ZIP;
@@ -112,62 +115,70 @@ export default async function LocationsPage({ searchParams }: LocationsPageProps
       {locationPostalCodeSet === "1" && <div className="alert alert-success">Location ZIP code updated.</div>}
       {error && <div className="alert alert-danger">{describeError(error)}</div>}
 
-      <details className="stack" style={{ marginBottom: 16 }}>
-        <summary>Add a location</summary>
-        <form action="/api/locations/create" method="POST" className="row" style={{ gap: 6, marginTop: 8 }}>
-          <input type="text" name="name" placeholder="Main Warehouse" required />
-          <select name="type" required defaultValue="warehouse">
-            {LOCATION_TYPE_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-          <input type="text" name="postalCode" placeholder="ZIP (optional)" style={{ width: 100 }} />
-          <button type="submit">Add location</button>
-        </form>
-      </details>
-
-      {locations.length === 0 ? (
-        <p className="empty">No locations yet.</p>
-      ) : (
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Type</th>
-                <th>ZIP</th>
-                <th>Products</th>
-                <th>Total on hand</th>
-                <th>Created</th>
-                <th>Rename</th>
-                <th>Set ZIP</th>
-              </tr>
-            </thead>
-            <tbody>
-              {locations.map((location) => (
-                <tr key={location.id}>
-                  <td>{location.name}</td>
-                  <td>
-                    <span className="badge">{location.type}</span>
-                  </td>
-                  <td>{location.postal_code ?? <span className="muted">not set</span>}</td>
-                  <td>{location.product_count}</td>
-                  <td>{location.total_on_hand}</td>
-                  <td>{new Date(location.created_at).toISOString()}</td>
-                  <td>
-                    <RenameLocationForm locationId={location.id} currentName={location.name} />
-                  </td>
-                  <td>
-                    <SetPostalCodeForm locationId={location.id} currentPostalCode={location.postal_code} />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+      <div className="panel-card">
+        <div className="panel-card-header">
+          <h2 className="panel-card-title" style={{ margin: 0 }}>
+            Locations
+          </h2>
         </div>
-      )}
+
+        <details className="stack" style={{ marginBottom: 16 }}>
+          <summary>Add a location</summary>
+          <form action="/api/locations/create" method="POST" className="row" style={{ gap: 6, marginTop: 8 }}>
+            <input type="text" name="name" placeholder="Main Warehouse" required />
+            <select name="type" required defaultValue="warehouse">
+              {LOCATION_TYPE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <input type="text" name="postalCode" placeholder="ZIP (optional)" style={{ width: 100 }} />
+            <button type="submit">Add location</button>
+          </form>
+        </details>
+
+        {locations.length === 0 ? (
+          <p className="empty">No locations yet.</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Type</th>
+                  <th>ZIP</th>
+                  <th>Products</th>
+                  <th>Total on hand</th>
+                  <th>Created</th>
+                  <th>Rename</th>
+                  <th>Set ZIP</th>
+                </tr>
+              </thead>
+              <tbody>
+                {locations.map((location) => (
+                  <tr key={location.id}>
+                    <td>{location.name}</td>
+                    <td>
+                      <span className="badge">{location.type}</span>
+                    </td>
+                    <td>{location.postal_code ?? <span className="muted">not set</span>}</td>
+                    <td>{location.product_count}</td>
+                    <td>{location.total_on_hand}</td>
+                    <td>{new Date(location.created_at).toISOString()}</td>
+                    <td>
+                      <RenameLocationForm locationId={location.id} currentName={location.name} />
+                    </td>
+                    <td>
+                      <SetPostalCodeForm locationId={location.id} currentPostalCode={location.postal_code} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </main>
   );
 }

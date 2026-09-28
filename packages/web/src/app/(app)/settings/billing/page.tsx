@@ -5,6 +5,7 @@ import { getOrCreateStripeCustomer, getBillingSummary } from "@alltix/billing-se
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { SettingsTabs } from "@/components/settings-tabs";
 
 export const dynamic = "force-dynamic";
 
@@ -48,7 +49,8 @@ export default async function BillingPage({ searchParams }: BillingPageProps): P
   if (!tenantId) {
     return (
       <main className="page">
-        <h1>Billing</h1>
+        <h1>Settings</h1>
+        <SettingsTabs active="/settings/billing" />
         <p>No tenant is associated with this account yet.</p>
       </main>
     );
@@ -63,14 +65,15 @@ export default async function BillingPage({ searchParams }: BillingPageProps): P
 
   return (
     <main className="page">
-      <h1>Billing</h1>
+      <h1>Settings</h1>
+      <SettingsTabs active="/settings/billing" />
       <p className="subtitle">One MVP plan for now — tiered pricing comes later once there&apos;s a real reason to need it.</p>
 
       {checkout === "success" && <div className="alert alert-success">Subscription started — thanks!</div>}
       {checkout === "cancelled" && <div className="alert alert-info">Checkout was cancelled — no charge was made.</div>}
       {error && <div className="alert alert-danger">{decodeURIComponent(error)}</div>}
 
-      <div className="card">
+      <div className="panel-card">
         <div className="row">
           <span className="muted">Subscription status:</span>
           <span className={isActiveIsh ? "badge badge-success" : "badge"}>
@@ -95,31 +98,37 @@ export default async function BillingPage({ searchParams }: BillingPageProps): P
         </div>
       </div>
 
-      <h2>Usage this month</h2>
-      <div className="card stack">
-        <div>
-          <div className="row">
-            <span>{summary.ordersThisMonth} orders processed</span>
-            <span className="muted">/ {summary.orderLimit} plan limit</span>
-            {overOrderLimit && <span className="badge badge-warning">over limit</span>}
-          </div>
-          <div style={{ background: "var(--neutral-bg)", borderRadius: 4, height: 6, marginTop: 6, overflow: "hidden" }}>
-            <div
-              style={{
-                width: `${Math.min(orderUsageRatio, 1) * 100}%`,
-                background: overOrderLimit ? "var(--danger)" : "var(--accent)",
-                height: "100%",
-              }}
-            />
-          </div>
+      <div className="panel-card" style={{ marginTop: 20 }}>
+        <div className="panel-card-header">
+          <h2 className="panel-card-title" style={{ margin: 0 }}>
+            Usage this month
+          </h2>
         </div>
-        <div>{summary.skuCount} SKUs</div>
+        <div className="stack">
+          <div>
+            <div className="row">
+              <span>{summary.ordersThisMonth} orders processed</span>
+              <span className="muted">/ {summary.orderLimit} plan limit</span>
+              {overOrderLimit && <span className="badge badge-warning">over limit</span>}
+            </div>
+            <div style={{ background: "var(--neutral-bg)", borderRadius: 4, height: 6, marginTop: 6, overflow: "hidden" }}>
+              <div
+                style={{
+                  width: `${Math.min(orderUsageRatio, 1) * 100}%`,
+                  background: overOrderLimit ? "var(--danger)" : "var(--accent)",
+                  height: "100%",
+                }}
+              />
+            </div>
+          </div>
+          <div>{summary.skuCount} SKUs</div>
+        </div>
+        <p className="muted" style={{ marginBottom: 0 }}>
+          {summary.usageBasedBillingConfigured
+            ? "Orders beyond the plan limit are billed as metered overage on your next Checkout — nothing is blocked for being over a limit, but going over does cost something now."
+            : "Usage limits are informational only in this pass — nothing is blocked for being over a limit yet."}
+        </p>
       </div>
-      <p className="muted">
-        {summary.usageBasedBillingConfigured
-          ? "Orders beyond the plan limit are billed as metered overage on your next Checkout — nothing is blocked for being over a limit, but going over does cost something now."
-          : "Usage limits are informational only in this pass — nothing is blocked for being over a limit yet."}
-      </p>
     </main>
   );
 }

@@ -6,6 +6,7 @@ import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
 import { getEnabledCarriers } from "@/lib/carrier-flags";
+import { SettingsTabs } from "@/components/settings-tabs";
 
 export const dynamic = "force-dynamic";
 
@@ -141,7 +142,8 @@ export default async function CarrierSettingsPage({
 
   return (
     <main className="page">
-      <h1>Carriers</h1>
+      <h1>Settings</h1>
+      <SettingsTabs active="/settings/carriers" />
       <p className="subtitle">
         Real carrier label generation and tracking, separate from the marketplace connections on{" "}
         <a href="/settings/channels">Channels</a>. Royal Mail, Evri, FedEx, Parcelforce, UPS, DHL, and DPD are all

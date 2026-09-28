@@ -5,6 +5,7 @@ import { withTenant } from "@alltix/db";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { ProductsIcon } from "@/components/icons";
 
 export const dynamic = "force-dynamic";
 
@@ -207,7 +208,11 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
 
   return (
     <main className="page">
-      <h1>Products</h1>
+      <h1>
+        <span className="row" style={{ gap: 8 }}>
+          <ProductsIcon /> Products
+        </span>
+      </h1>
       <p className="subtitle">
         Your internal catalog — push any of these out as a new Shopify listing. Pulling existing Shopify products in
         works the other way (Settings → Channels' automatic catalog sync); this is for creating a listing that
@@ -247,17 +252,18 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
       )}
       {error && <div className="alert alert-danger">{describeError(error)}</div>}
 
-      <details className="stack" style={{ marginBottom: 16 }}>
-        <summary>Add a product</summary>
-        {/* Every existing product so far arrived via catalog sync or order persistence --
-            this is the only way to get a brand-new internal product into the catalog on
-            purpose, e.g. specifically to try the "List on Shopify" flow below on it. */}
-        <form action="/api/products/create" method="POST" className="row" style={{ gap: 6, marginTop: 8 }}>
-          <input type="text" name="internalSku" placeholder="internal-sku-001" required />
-          <input type="text" name="name" placeholder="Product name" required />
-          <button type="submit">Add product</button>
-        </form>
-      </details>
+      <div className="panel-card">
+        <details className="stack" style={{ marginBottom: 16 }}>
+          <summary>Add a product</summary>
+          {/* Every existing product so far arrived via catalog sync or order persistence --
+              this is the only way to get a brand-new internal product into the catalog on
+              purpose, e.g. specifically to try the "List on Shopify" flow below on it. */}
+          <form action="/api/products/create" method="POST" className="row" style={{ gap: 6, marginTop: 8 }}>
+            <input type="text" name="internalSku" placeholder="internal-sku-001" required />
+            <input type="text" name="name" placeholder="Product name" required />
+            <button type="submit">Add product</button>
+          </form>
+        </details>
 
       {shopifyConnections.length === 0 && (
         <div className="alert alert-info">
@@ -389,6 +395,7 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
           </table>
         </div>
       )}
+      </div>
     </main>
   );
 }

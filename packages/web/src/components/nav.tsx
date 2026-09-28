@@ -2,24 +2,49 @@ import { Show, UserButton } from "@clerk/nextjs";
 import { headers } from "next/headers";
 import type { ReactElement } from "react";
 import { ThemeToggle } from "@/components/theme-toggle";
+import {
+  DashboardIcon,
+  InventoryIcon,
+  OrdersIcon,
+  ChannelsIcon,
+  AutomationIcon,
+  FulfillmentIcon,
+  AnalyticsIcon,
+  SettingsIcon,
+  ProductsIcon,
+  PeopleIcon,
+  PayrollIcon,
+} from "@/components/icons";
 
 /**
- * Static top nav across every page. Channel connectors (Amazon, Shopify)
- * still don't get their own nav entries -- they're configured from
- * /settings/channels, not a dedicated per-channel page -- but /products now
- * does (added alongside outbound Shopify listing creation) since it's a
- * page in its own right, not a channel settings screen.
+ * Sidebar nav for the whole authenticated app -- replaced the previous
+ * single-row top nav as part of the v1 visual redesign (see
+ * app/globals.css's "app shell" section and app/(app)/layout.tsx, which
+ * wraps this in the new .app-shell/.app-main/.topbar structure). Every
+ * route this used to link to still exists at the exact same path; this is
+ * a navigation/labeling change only, not a routing change:
  *
- * An async Server Component (not just a static one) so it can check the
- * same test-auth-bypass condition src/lib/auth-context.ts and src/proxy.ts
- * already gate on. That's not optional here: proxy.ts's isTestBypass skips
- * clerkMiddleware() entirely for a bypass request, and Clerk's own
- * <Show>/<UserButton> unconditionally assume clerkMiddleware() ran --
- * rendering them anyway throws "auth() was called but Clerk can't detect
- * usage of clerkMiddleware()" for *every* page in the tree, since Nav sits
- * in the root layout. This isn't a hypothetical: it's exactly the failure
- * mode a bypass-driven page-level test (as opposed to the existing
- * API-route-only e2e suite) hits immediately.
+ *   Dashboard  -> /dashboard (new page, see that route's own doc comment)
+ *   Inventory  -> /inventory (unchanged)
+ *   Orders     -> /orders (unchanged)
+ *   Channels   -> /channels (promoted to a top-level route; /settings/channels
+ *                still resolves via redirect() for any bookmarked link)
+ *   Automation -> /rules (relabeled only -- same route, same rules engine)
+ *   Fulfillment-> /picklists (relabeled only -- same route, same 4 sections)
+ *   Analytics  -> /reports (relabeled only -- same route, same rollup data)
+ *   Settings   -> /settings (new tabbed shell wrapping locations, billing,
+ *                carriers, Check payroll, and activity -- see that route's
+ *                own doc comment)
+ *   Products/HR/Payroll -> unchanged; kept in their own second group since
+ *                the reference design this redesign follows has no
+ *                equivalent module for them (Arif's own instruction: keep
+ *                every existing feature, only change how it looks).
+ *
+ * Still an async Server Component for the same reason as before (the
+ * test-auth-bypass check below needs `headers()`, and rendering Clerk's
+ * <Show>/<UserButton> unconditionally would throw under that bypass -- see
+ * the original version of this comment, preserved here since the reasoning
+ * is unchanged by the visual redesign).
  */
 export async function Nav(): Promise<ReactElement> {
   const requestHeaders = await headers();
@@ -29,45 +54,54 @@ export async function Nav(): Promise<ReactElement> {
     requestHeaders.has("x-test-clerk-user-id");
 
   return (
-    <nav className="nav">
-      {/* "/" is now the public marketing home (src/app/(marketing)), not
-          part of the authenticated app -- the brand link here goes to
-          /orders instead so it stays inside the dashboard a signed-in user
-          is already in, rather than bouncing them out to the marketing
-          site. */}
-      <a href="/orders" className="nav-brand">
+    <aside className="sidebar">
+      <a href="/dashboard" className="sidebar-brand">
         {/* eslint-disable-next-line @next/next/no-img-element -- same small,
-            fixed brand mark as the marketing header/footer (see
-            marketing-header.tsx); not worth next/image config for one file. */}
+            fixed brand mark as before (see marketing-header.tsx); not worth
+            next/image config for one file. */}
         <img src="/logo-mark.png" alt="" width={22} height={24} />
         AlltixOMS
       </a>
-      <a href="/orders">Orders</a>
-      <a href="/inventory">Inventory</a>
-      <a href="/locations">Locations</a>
-      <a href="/products">Products</a>
-      <a href="/picklists">Picklists</a>
-      <a href="/rules">Rules</a>
-      <a href="/hr">HR</a>
-      <a href="/hr/payroll">Payroll</a>
-      <a href="/reports">Reports</a>
-      <a href="/settings/billing">Billing</a>
-      <a href="/settings/channels">Settings</a>
-      {/* New Carrier Integration layer (Royal Mail, task #59) -- separate
-          nav entry from "Settings" (which is /settings/channels, sales
-          channels only) since a carrier is a structurally different kind
-          of connection -- see settings/carriers/page.tsx's own doc
-          comment. */}
-      <a href="/settings/carriers">Carriers</a>
-      {/* Real Check payroll-processor integration (CLAUDE.md §14.1, task
-          #34) -- deliberately a separate nav entry from "/hr/payroll" above
-          (task #33's existing gross-wage-calculation view): that one is a
-          read-only report over tracked hours, this one is where money
-          actually moves through Check's own hosted Components. See
-          settings/payroll/page.tsx's own doc comment for the full split. */}
-      <a href="/settings/payroll">Check Payroll</a>
-      <a href="/settings/activity">Activity</a>
-      <div className="nav-spacer" />
+
+      <nav className="sidebar-nav" aria-label="Main">
+        <div className="sidebar-section-label">Operations</div>
+        <SidebarLink href="/dashboard" icon={<DashboardIcon />} label="Dashboard" />
+        <SidebarLink href="/inventory" icon={<InventoryIcon />} label="Inventory" />
+        <SidebarLink href="/orders" icon={<OrdersIcon />} label="Orders" />
+        <SidebarLink href="/channels" icon={<ChannelsIcon />} label="Channels" />
+        <SidebarLink href="/rules" icon={<AutomationIcon />} label="Automation" />
+        <SidebarLink href="/picklists" icon={<FulfillmentIcon />} label="Fulfillment" />
+        <SidebarLink href="/reports" icon={<AnalyticsIcon />} label="Analytics" />
+        <SidebarLink href="/settings" icon={<SettingsIcon />} label="Settings" />
+
+        <div className="sidebar-section-label">Catalog &amp; team</div>
+        <SidebarLink href="/products" icon={<ProductsIcon />} label="Products" />
+        <SidebarLink href="/hr" icon={<PeopleIcon />} label="HR" />
+        <SidebarLink href="/hr/payroll" icon={<PayrollIcon />} label="Payroll" />
+      </nav>
+    </aside>
+  );
+}
+
+/**
+ * Theme toggle + auth control, rendered in the top bar (see
+ * app/(app)/layout.tsx) rather than the sidebar -- kept as its own small
+ * async Server Component (same test-auth-bypass reasoning as Nav above,
+ * duplicated rather than shared since the two live in different parts of
+ * the tree and each `headers()` call is just a context read, not I/O) so
+ * the sidebar itself stays purely navigational, matching where a real SaaS
+ * product usually puts account controls (top-right) rather than the
+ * previous single-row nav's trailing-edge placement.
+ */
+export async function TopBarControls(): Promise<ReactElement> {
+  const requestHeaders = await headers();
+  const isTestBypass =
+    process.env.NODE_ENV !== "production" &&
+    process.env.ALLTIX_TEST_AUTH_BYPASS === "true" &&
+    requestHeaders.has("x-test-clerk-user-id");
+
+  return (
+    <div className="row" style={{ gap: 12 }}>
       <ThemeToggle />
       {isTestBypass ? (
         <span className="muted">test session</span>
@@ -81,6 +115,23 @@ export async function Nav(): Promise<ReactElement> {
           </Show>
         </>
       )}
-    </nav>
+    </div>
+  );
+}
+
+/**
+ * A plain <a> styled as a sidebar row -- deliberately NOT highlighting the
+ * "current page" (that would need either a client component reading
+ * usePathname(), or every page passing its own route down to this Server
+ * Component; neither is worth it for a visual redesign that changes no
+ * behavior). The hover/active CSS states in globals.css still apply on
+ * :hover; "active" here only ever means ":hover", not "current route".
+ */
+function SidebarLink({ href, icon, label }: { href: string; icon: ReactElement; label: string }): ReactElement {
+  return (
+    <a href={href} className="sidebar-link">
+      {icon}
+      {label}
+    </a>
   );
 }

@@ -6455,6 +6455,106 @@ real Sapient account to actually configure and test the tracking webhook against
 exclusively Arif's own next vendor-facing step, not more of this codebase's own
 code.
 
+## 20. Frontend Visual Redesign (v1) — Arif's own explicit brief, visual/UX-only
+
+**Why**: Arif's own words: "the current pages work but look basic... I want the
+whole app to look as polished and professional as [a reference SaaS design], so it
+feels like a real SaaS product for managing orders across multiple sales channels."
+A deliberately narrow brief, restated here because it's the governing constraint
+every page in this pass was held to: **restyle only — don't change how the app
+works behind the scenes, keep all existing data/features/logic exactly as they
+are, and don't add new features that aren't in the reference.** Every page below
+was a markup/CSS change over an already-working Server Component; no query, form
+action, service-layer call, or route handler changed as part of this pass. Three
+scope questions Arif answered directly, before any page was touched, still govern
+the result: **Fulfillment** keeps this app's own real 4 sections (Ready to pick /
+Picklists / Ready to pack / Ready to ship), not the reference's 3-tab shape;
+**rate-limit dashboards** show this app's own real `channel_connections`/
+`carrier_connections` throttle/failure state (§4.4/§19.11), never a fabricated
+token-bucket percentage; and **light/dark mode stays a toggle** (the pre-existing
+`theme-toggle.tsx`/`data-theme` mechanism, §-adjacent to nothing else in this file
+since it predates this pass), not switched to the reference's dark-only design.
+
+**Design system, built first, reused by every page after it**: plain,
+framework-free CSS (`packages/web/src/app/globals.css`) — Tailwind is named in §5's
+stack table but was never actually wired into this app (no config, no dependency,
+confirmed by grep before this pass), so this fills the same role with zero new
+build-tool risk, using semantic class names (`.panel-card`, `.badge`, `.kpi-grid`)
+rather than one-off utility soup, so a future real Tailwind migration wouldn't need
+to touch markup much. Palette pulled in line with the marketing site's own brand
+(`app/(marketing)/marketing.module.css`) so the dashboard and the marketing site
+read as one product — same cyan accent family, tuned per light/dark mode for
+contrast, same CSS-custom-property theme-resolution order the pre-existing
+light/dark toggle already established (`:root` light default →
+`@media (prefers-color-scheme: dark)` guarded by `:root:not([data-theme="light"])`
+→ `:root[data-theme="dark"]` for an explicit user choice). `components/nav.tsx`
+became a fixed sidebar (was a single top row) with a shared `Nav`/`TopBarControls`
+pair every `(app)` page renders through its one shared `layout.tsx` — one nav
+change, every page inherits it, not per-page duplication. `components/kpi-tile.tsx`
+(`KpiTile({label, value, meta?, delta?})`) and three hand-rolled inline-SVG chart
+components (`components/charts/{donut,line,bar}-chart.tsx` — no chart library
+dependency added, same "don't add build-tool risk" reasoning as the CSS choice)
+back the dashboard's/Analytics' own KPI tiles and charts. `components/icons.tsx`
+holds one small inline-SVG icon per nav section, reused in every page's own `<h1>`
+for a consistent icon-plus-title pattern. `lib/channel-badge.ts`
+(`channelBadgeClass`/`channelChartColor`/`channelLabel`) is the one place a
+channel's display color/label is decided, so Orders/Picklists/Analytics all render
+the same channel identically instead of drifting.
+
+**Dashboard** (`app/(app)/dashboard/page.tsx`, new page, promoted to the nav's own
+first item) and **Channels** (`app/(app)/channels/page.tsx`, promoted from a
+`/settings/channels` sub-page to its own top-level nav item, per the reference's own
+IA) are the only two pages this pass added as new files — both are pure
+presentation over data other pages/queries already computed (the dashboard's own
+KPI tiles and activity feed read from the same `orders`/`inventory_events`/
+`channel_connections` tables every other page already reads, no new query
+introduced beyond what a plain `SELECT` over existing tables needed), not a new
+feature or a new source of truth. `/settings/channels` itself still exists,
+unchanged in its own logic, for its established settings-flow role (connect/
+reconnect forms) — `/channels` is a new, higher-level status view, not a
+replacement.
+
+**Every other page** (Inventory, Orders + order detail, Picklists/Fulfillment,
+Rules/Automation, Analytics/Reports, Locations, Products, HR, HR/Payroll, every
+`/settings/*` sub-page, sign-in/sign-up) was restyled in place: wrapped existing
+sections in `.panel-card`, added the page's own icon to its `<h1>`, added KPI tiles
+where a page already computed the underlying numbers (e.g. Analytics' revenue/
+orders/trouble-spot tiles, built from data `/reports` already fetched — no new SQL),
+and — for the two pages with no first-party markup at all — gave Clerk's own hosted
+`<SignIn>`/`<SignUp>` widgets a `variables` appearance map keyed to this app's own
+CSS custom properties (`var(--accent)`, `var(--surface)`, etc. — resolved live by
+the browser, so it automatically follows the light/dark toggle same as everything
+else) rather than leaving them visually disconnected from the themed shell around
+them. A new `components/settings-tabs.tsx` gives the `/settings/*` family a shared
+tab bar (Locations/Billing/Carriers/Payroll/Audit Log) — deliberately 5 tabs, not
+the reference's Tenant/Locations/Billing/Webhooks/Audit-Log set, since this app has
+no dedicated tenant-profile page (the one tenant-level setting,
+`reorder_threshold_days`, §8, is edited on `/inventory` itself) and no standalone
+webhook-management page (Shopify's webhook secret is set on `/channels`'s own
+connect form, §4.5; the Sapient tracking webhook is documented on
+`/settings/carriers`, §19.9) — `Carriers` was added instead, since it's a real,
+already-built settings sub-page the reference's own list didn't anticipate. Every
+page's own queries, form actions, POST routes, and service-layer calls are
+byte-for-byte unchanged from before this pass — confirmed by re-reading each
+page's own diff before considering it done, not just by the fact that the build
+still passes.
+
+**What this pass deliberately did not do**: add any new page, route, query, or
+feature beyond what the reference showed and Arif's own three answered scope
+questions allowed; touch `packages/web/src/app/(marketing)` (the public marketing
+site already had its own polished, fixed-dark design, §-prior-to-this-pass, and
+was out of scope); or restructure `settings/carriers/page.tsx`'s own 7 carrier
+connect-form cards beyond adding the shared tab bar — a deliberate scope-risk
+call given that file's size (677 lines) and the number of already-correct,
+carefully-documented forms inside it, not an oversight.
+
+**Tested/Verified**: `npm run typecheck --workspaces` clean across all twelve
+workspaces, `next build` clean, and `bash scripts/run-tests.sh` — all 68 test
+files pass, unchanged from before this pass (expected: a pure visual/markup pass
+touches no logic any of these tests exercise). No new test file was needed or
+added — this pass has no new pure decision logic, query, or service-layer
+behavior to extract and test, only markup/CSS.
+
 ---
 
 *This document reflects standard, well-documented patterns for multichannel OMS/IMS

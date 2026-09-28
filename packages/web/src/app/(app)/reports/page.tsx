@@ -6,6 +6,10 @@ import { assessStockForecast } from "@alltix/inventory-service";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { AnalyticsIcon } from "@/components/icons";
+import { channelChartColor, channelLabel } from "@/lib/channel-badge";
+import { KpiTile } from "@/components/kpi-tile";
+import { DonutChart } from "@/components/charts/donut-chart";
 
 export const dynamic = "force-dynamic";
 
@@ -313,7 +317,11 @@ export default async function ReportsPage({ searchParams }: ReportsPageProps): P
 
   return (
     <main className="page">
-      <h1>Reports</h1>
+      <h1>
+        <span className="row" style={{ gap: 8 }}>
+          <AnalyticsIcon /> Analytics
+        </span>
+      </h1>
       <p className="subtitle">Sales, top SKUs, returns, and a live inventory snapshot — computed straight off the ledger.</p>
 
       <div className="row" style={{ marginBottom: 20, gap: 8 }}>
@@ -325,106 +333,156 @@ export default async function ReportsPage({ searchParams }: ReportsPageProps): P
         ))}
       </div>
 
-      <h2>Sales by channel</h2>
-      <p className="subtitle">
-        Last {periodDays} days, by <code>placed_at</code>. Excludes cancelled orders. Gross revenue — not net of returns; see
-        Returns below. Figures come from the nightly sales rollup, not a live scan — today's sales appear after tonight's
-        run.
-      </p>
-      {salesByChannel.length === 0 ? (
-        <p className="empty">No sales in this period.</p>
-      ) : (
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Channel</th>
-                <th>Orders</th>
-                <th>Units sold</th>
-                <th>Revenue</th>
-              </tr>
-            </thead>
-            <tbody>
-              {salesByChannel.map((row) => (
-                <tr key={row.channel}>
-                  <td>{row.channel}</td>
-                  <td>{row.order_count}</td>
-                  <td>{row.units_sold}</td>
-                  <td>{Number(row.revenue).toFixed(2)}</td>
-                </tr>
-              ))}
-              <tr>
-                <td>
-                  <strong>Total</strong>
-                </td>
-                <td>
-                  <strong>{totalOrders}</strong>
-                </td>
-                <td></td>
-                <td>
-                  <strong>{totalRevenue.toFixed(2)}</strong>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      <h2>Top SKUs</h2>
-      <p className="subtitle">By revenue, last {periodDays} days.</p>
-      {topSkus.length === 0 ? (
-        <p className="empty">No sales in this period.</p>
-      ) : (
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>SKU</th>
-                <th>Product</th>
-                <th>Units sold</th>
-                <th>Revenue</th>
-              </tr>
-            </thead>
-            <tbody>
-              {topSkus.map((row) => (
-                <tr key={row.internal_sku}>
-                  <td className="mono">{row.internal_sku}</td>
-                  <td>{row.product_name}</td>
-                  <td>{row.units_sold}</td>
-                  <td>{Number(row.revenue).toFixed(2)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      <h2>Returns</h2>
-      <p className="subtitle">Orders marked returned, last {periodDays} days.</p>
-      <div className="row" style={{ gap: 8, marginBottom: 20 }}>
-        <span className="badge">{returnsSummary.total_returns} total</span>
-        <span className="badge badge-success">{returnsSummary.sellable_returns} restocked (sellable)</span>
-        <span className="badge badge-danger">
-          {Number(returnsSummary.total_returns) - Number(returnsSummary.sellable_returns)} damaged / not restocked
-        </span>
+      <div className="kpi-grid">
+        <KpiTile label="Revenue" value={`£${totalRevenue.toFixed(2)}`} meta={`Last ${periodDays}d`} />
+        <KpiTile label="Orders" value={totalOrders} meta={`Last ${periodDays}d`} />
+        <KpiTile label="Out of stock / oversold" value={troubleSpots.length} meta="Right now" />
+        <KpiTile label="Reorder soon" value={reorderSoon.length} meta={`Last ${periodDays}d velocity`} />
       </div>
 
-      <h2>Inventory snapshot</h2>
-      <p className="subtitle">
-        Right now, all locations — units, not a dollar value (this schema has no cost/COGS field to value stock against, only
-        sale price, so a dollar figure here would misrepresent cost as revenue). See <a href="/inventory">/inventory</a> for
-        the full per-location breakdown.
-      </p>
-      <div className="row" style={{ gap: 8, marginBottom: 20 }}>
-        <span className="badge">{inventorySnapshot.distinct_skus} SKUs</span>
-        <span className="badge">{inventorySnapshot.total_on_hand} on hand</span>
-        <span className="badge">{inventorySnapshot.total_reserved} reserved</span>
-        <span className="badge badge-accent">{inventorySnapshot.total_available} available</span>
+      <div className="panel-card">
+        <div className="panel-card-header">
+          <h2 className="panel-card-title" style={{ margin: 0 }}>
+            Sales by channel
+          </h2>
+        </div>
+        <p className="subtitle">
+          Last {periodDays} days, by <code>placed_at</code>. Excludes cancelled orders. Gross revenue — not net of returns; see
+          Returns below. Figures come from the nightly sales rollup, not a live scan — today's sales appear after tonight's
+          run.
+        </p>
+        {salesByChannel.length === 0 ? (
+          <p className="empty">No sales in this period.</p>
+        ) : (
+          <div className="panel-grid-2">
+            <div className="chart-wrap">
+              <DonutChart
+                segments={salesByChannel.map((row) => ({
+                  label: channelLabel(row.channel),
+                  value: Number(row.revenue),
+                  color: channelChartColor(row.channel),
+                }))}
+                centerLabel="Revenue"
+                centerValue={`£${totalRevenue.toFixed(0)}`}
+              />
+            </div>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Channel</th>
+                    <th>Orders</th>
+                    <th>Units sold</th>
+                    <th>Revenue</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {salesByChannel.map((row) => (
+                    <tr key={row.channel}>
+                      <td>{channelLabel(row.channel)}</td>
+                      <td>{row.order_count}</td>
+                      <td>{row.units_sold}</td>
+                      <td>{Number(row.revenue).toFixed(2)}</td>
+                    </tr>
+                  ))}
+                  <tr>
+                    <td>
+                      <strong>Total</strong>
+                    </td>
+                    <td>
+                      <strong>{totalOrders}</strong>
+                    </td>
+                    <td></td>
+                    <td>
+                      <strong>{totalRevenue.toFixed(2)}</strong>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="panel-card" style={{ marginTop: 24 }}>
+        <div className="panel-card-header">
+          <h2 className="panel-card-title" style={{ margin: 0 }}>
+            Top SKUs
+          </h2>
+        </div>
+        <p className="subtitle">By revenue, last {periodDays} days.</p>
+        {topSkus.length === 0 ? (
+          <p className="empty">No sales in this period.</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>SKU</th>
+                  <th>Product</th>
+                  <th>Units sold</th>
+                  <th>Revenue</th>
+                </tr>
+              </thead>
+              <tbody>
+                {topSkus.map((row) => (
+                  <tr key={row.internal_sku}>
+                    <td className="mono">{row.internal_sku}</td>
+                    <td>{row.product_name}</td>
+                    <td>{row.units_sold}</td>
+                    <td>{Number(row.revenue).toFixed(2)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div className="panel-grid-2" style={{ marginTop: 24 }}>
+        <div className="panel-card">
+          <div className="panel-card-header">
+            <h2 className="panel-card-title" style={{ margin: 0 }}>
+              Returns
+            </h2>
+          </div>
+          <p className="subtitle">Orders marked returned, last {periodDays} days.</p>
+          <div className="row" style={{ gap: 8 }}>
+            <span className="badge">{returnsSummary.total_returns} total</span>
+            <span className="badge badge-success">{returnsSummary.sellable_returns} restocked (sellable)</span>
+            <span className="badge badge-danger">
+              {Number(returnsSummary.total_returns) - Number(returnsSummary.sellable_returns)} damaged / not restocked
+            </span>
+          </div>
+        </div>
+
+        <div className="panel-card">
+          <div className="panel-card-header">
+            <h2 className="panel-card-title" style={{ margin: 0 }}>
+              Inventory snapshot
+            </h2>
+          </div>
+          <p className="subtitle">
+            Right now, all locations — units, not a dollar value (this schema has no cost/COGS field to value stock against,
+            only sale price, so a dollar figure here would misrepresent cost as revenue). See{" "}
+            <a href="/inventory">/inventory</a> for the full per-location breakdown.
+          </p>
+          <div className="row" style={{ gap: 8 }}>
+            <span className="badge">{inventorySnapshot.distinct_skus} SKUs</span>
+            <span className="badge">{inventorySnapshot.total_on_hand} on hand</span>
+            <span className="badge">{inventorySnapshot.total_reserved} reserved</span>
+            <span className="badge badge-accent">{inventorySnapshot.total_available} available</span>
+          </div>
+        </div>
       </div>
 
       {troubleSpots.length > 0 && (
-        <>
-          <h3>Out of stock / oversold</h3>
+        <div className="panel-card" style={{ marginTop: 24 }}>
+          <div className="panel-card-header">
+            <h2 className="panel-card-title" style={{ margin: 0 }}>
+              Out of stock / oversold
+            </h2>
+          </div>
           <div className="table-wrap">
             <table>
               <thead>
@@ -453,52 +511,56 @@ export default async function ReportsPage({ searchParams }: ReportsPageProps): P
               </tbody>
             </table>
           </div>
-        </>
-      )}
-
-      <h2>Reorder soon</h2>
-      <p className="subtitle">
-        Still in stock, but recent sales velocity over the last {periodDays} days puts them at {reorderThresholdDays} or
-        fewer estimated days of stock remaining — a separate, velocity-based signal from the out-of-stock list above. See{" "}
-        <a href="/inventory">/inventory</a> for the per-row figure (fixed 30-day window), every product/location not just
-        the top 10 most urgent shown here, and to change the {reorderThresholdDays}-day threshold itself. A product with
-        low stock but no recent sales in this window won't appear here — see the inventory page's own note on why that's a
-        deliberate "unknown," not "safe."
-      </p>
-      {reorderSoon.length === 0 ? (
-        <p className="empty">Nothing trending toward stockout in this period.</p>
-      ) : (
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>SKU</th>
-                <th>Product</th>
-                <th>Location</th>
-                <th>Available</th>
-                <th>Sold ({periodDays}d)</th>
-                <th>Est. days left</th>
-              </tr>
-            </thead>
-            <tbody>
-              {reorderSoon.map((row) => (
-                <tr key={`${row.internal_sku}:${row.location_name}`}>
-                  <td className="mono">{row.internal_sku}</td>
-                  <td>{row.product_name}</td>
-                  <td>{row.location_name}</td>
-                  <td>{row.available}</td>
-                  <td>{row.units_sold}</td>
-                  <td>
-                    <span className="badge badge-warning">
-                      ~{Math.round(row.forecast.daysRemaining ?? 0)}d
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
         </div>
       )}
+
+      <div className="panel-card" style={{ marginTop: 24 }}>
+        <div className="panel-card-header">
+          <h2 className="panel-card-title" style={{ margin: 0 }}>
+            Reorder soon
+          </h2>
+        </div>
+        <p className="subtitle">
+          Still in stock, but recent sales velocity over the last {periodDays} days puts them at {reorderThresholdDays} or
+          fewer estimated days of stock remaining — a separate, velocity-based signal from the out-of-stock list above. See{" "}
+          <a href="/inventory">/inventory</a> for the per-row figure (fixed 30-day window), every product/location not just
+          the top 10 most urgent shown here, and to change the {reorderThresholdDays}-day threshold itself. A product with
+          low stock but no recent sales in this window won't appear here — see the inventory page's own note on why that's a
+          deliberate "unknown," not "safe."
+        </p>
+        {reorderSoon.length === 0 ? (
+          <p className="empty">Nothing trending toward stockout in this period.</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>SKU</th>
+                  <th>Product</th>
+                  <th>Location</th>
+                  <th>Available</th>
+                  <th>Sold ({periodDays}d)</th>
+                  <th>Est. days left</th>
+                </tr>
+              </thead>
+              <tbody>
+                {reorderSoon.map((row) => (
+                  <tr key={`${row.internal_sku}:${row.location_name}`}>
+                    <td className="mono">{row.internal_sku}</td>
+                    <td>{row.product_name}</td>
+                    <td>{row.location_name}</td>
+                    <td>{row.available}</td>
+                    <td>{row.units_sold}</td>
+                    <td>
+                      <span className="badge badge-warning">~{Math.round(row.forecast.daysRemaining ?? 0)}d</span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </main>
   );
 }

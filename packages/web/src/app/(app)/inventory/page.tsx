@@ -7,6 +7,8 @@ import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
 import { MIN_REORDER_THRESHOLD_DAYS, MAX_REORDER_THRESHOLD_DAYS } from "@/lib/reorder-threshold";
+import { channelBadgeClass, channelLabel } from "@/lib/channel-badge";
+import { KpiTile } from "@/components/kpi-tile";
 
 export const dynamic = "force-dynamic";
 
@@ -199,15 +201,11 @@ export default async function InventoryPage({ searchParams }: InventoryPageProps
       <h1>Inventory</h1>
       <p className="subtitle">Available-to-sell per product/location — the ledger-derived rollup, never edited directly.</p>
 
-      {rows.length > 0 && (outOfStockCount > 0 || lowStockCount > 0 || reorderSoonCount > 0) && (
-        <div className="row" style={{ marginBottom: 16 }}>
-          {outOfStockCount > 0 && <span className="badge badge-danger">{outOfStockCount} out of stock</span>}
-          {lowStockCount > 0 && <span className="badge badge-warning">{lowStockCount} running low</span>}
-          {reorderSoonCount > 0 && (
-            <span className="badge badge-warning">
-              {reorderSoonCount} reorder soon (≤{reorderThresholdDays}d left)
-            </span>
-          )}
+      {rows.length > 0 && (
+        <div className="kpi-grid">
+          <KpiTile label="Out of stock" value={outOfStockCount} meta={outOfStockCount > 0 ? "needs attention" : "none right now"} />
+          <KpiTile label="Running low" value={lowStockCount} meta="below channel buffer" />
+          <KpiTile label="Reorder soon" value={reorderSoonCount} meta={`≤${reorderThresholdDays}d of stock left`} />
         </div>
       )}
 
@@ -215,71 +213,81 @@ export default async function InventoryPage({ searchParams }: InventoryPageProps
       {reorderThresholdUpdated === "1" && <div className="alert alert-success">Reorder threshold updated.</div>}
       {error && <div className="alert alert-danger">{describeInventoryError(error)}</div>}
 
-      {products.length > 0 && locations.length >= 2 && (
-        <details className="stack" style={{ marginBottom: 16 }}>
-          <summary>Transfer stock</summary>
-          <TransferStockForm products={products} locations={locations} />
+      <div className="panel-grid-2" style={{ marginBottom: 4 }}>
+        {products.length > 0 && locations.length >= 2 && (
+          <details className="panel-card" style={{ marginBottom: 0 }}>
+            <summary style={{ fontWeight: 700 }}>Transfer stock</summary>
+            <TransferStockForm products={products} locations={locations} />
+          </details>
+        )}
+
+        <details className="panel-card" style={{ marginBottom: 0 }}>
+          <summary style={{ fontWeight: 700 }}>Reorder threshold</summary>
+          <ReorderThresholdForm currentValue={reorderThresholdDays} />
         </details>
-      )}
+      </div>
 
-      <details className="stack" style={{ marginBottom: 16 }}>
-        <summary>Reorder threshold</summary>
-        <ReorderThresholdForm currentValue={reorderThresholdDays} />
-      </details>
-
-      {rows.length === 0 ? (
-        <p className="empty">No inventory records yet.</p>
-      ) : (
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>SKU</th>
-                <th>Product</th>
-                <th>Location</th>
-                <th>On hand</th>
-                <th>Reserved</th>
-                <th>Available</th>
-                <th>Channel buffer</th>
-                <th>Risk</th>
-                <th>Est. days left</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => {
-                const risk = assessRisk(row.available, row.channel_buffer);
-                const bufferEntries = Object.entries(row.channel_buffer ?? {});
-                const forecast = forecastByKey.get(`${row.product_id}:${row.location_id}`);
-                return (
-                  <tr key={`${row.product_id}:${row.location_id}`}>
-                    <td className="mono">{row.internal_sku}</td>
-                    <td>{row.product_name}</td>
-                    <td>{row.location_name}</td>
-                    <td>{row.on_hand}</td>
-                    <td>{row.reserved}</td>
-                    <td>
-                      <strong>{row.available}</strong>
-                    </td>
-                    <td>
-                      {bufferEntries.length === 0 ? (
-                        <span className="muted">none</span>
-                      ) : (
-                        bufferEntries.map(([channel, qty]) => (
-                          <span key={channel} className="badge" style={{ marginRight: 4 }}>
-                            {channel}: {qty}
-                          </span>
-                        ))
-                      )}
-                    </td>
-                    <td>{riskBadge(risk)}</td>
-                    <td>{forecastCell(forecast)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+      <div className="panel-card">
+        <div className="panel-card-header">
+          <h2 className="panel-card-title" style={{ margin: 0 }}>
+            Stock levels
+          </h2>
         </div>
-      )}
+        <p className="panel-card-subtitle">On-hand, reserved, and available-to-sell for every product/location pair.</p>
+        {rows.length === 0 ? (
+          <p className="empty">No inventory records yet.</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>SKU</th>
+                  <th>Product</th>
+                  <th>Location</th>
+                  <th>On hand</th>
+                  <th>Reserved</th>
+                  <th>Available</th>
+                  <th>Channel buffer</th>
+                  <th>Risk</th>
+                  <th>Est. days left</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => {
+                  const risk = assessRisk(row.available, row.channel_buffer);
+                  const bufferEntries = Object.entries(row.channel_buffer ?? {});
+                  const forecast = forecastByKey.get(`${row.product_id}:${row.location_id}`);
+                  return (
+                    <tr key={`${row.product_id}:${row.location_id}`}>
+                      <td className="mono">{row.internal_sku}</td>
+                      <td>{row.product_name}</td>
+                      <td>{row.location_name}</td>
+                      <td>{row.on_hand}</td>
+                      <td>{row.reserved}</td>
+                      <td>
+                        <strong>{row.available}</strong>
+                      </td>
+                      <td>
+                        {bufferEntries.length === 0 ? (
+                          <span className="muted">none</span>
+                        ) : (
+                          bufferEntries.map(([channel, qty]) => (
+                            <span key={channel} className={channelBadgeClass(channel)} style={{ marginRight: 4 }}>
+                              {channelLabel(channel)}: {qty}
+                            </span>
+                          ))
+                        )}
+                      </td>
+                      <td>{riskBadge(risk)}</td>
+                      <td>{forecastCell(forecast)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </main>
   );
 }

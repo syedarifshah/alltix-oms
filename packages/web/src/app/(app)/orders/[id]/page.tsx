@@ -13,6 +13,7 @@ import {
   RETURN_DISPOSITIONS,
 } from "@/lib/order-status";
 import type { OrderStatus } from "@alltix/shared";
+import { channelBadgeClass, channelLabel } from "@/lib/channel-badge";
 
 export const dynamic = "force-dynamic";
 
@@ -331,9 +332,12 @@ export default async function OrderDetailPage({ params, searchParams }: OrderDet
       <h1>
         Order {order.external_order_id} <span className={orderStatusBadgeClass(order.status)}>{order.status}</span>
       </h1>
-      <p className="subtitle">
-        {order.channel} · placed {order.placed_at ? new Date(order.placed_at).toISOString() : "—"} · last updated{" "}
-        {new Date(order.updated_at).toISOString()}
+      <p className="subtitle row" style={{ gap: 8 }}>
+        <span className={channelBadgeClass(order.channel)}>{channelLabel(order.channel)}</span>
+        <span>
+          placed {order.placed_at ? new Date(order.placed_at).toISOString() : "—"} · last updated{" "}
+          {new Date(order.updated_at).toISOString()}
+        </span>
       </p>
 
       {error && <div className="alert alert-danger">Couldn&apos;t update this order ({error}).</div>}
@@ -411,52 +415,61 @@ export default async function OrderDetailPage({ params, searchParams }: OrderDet
         </form>
       )}
 
-      <h2>Line items</h2>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>SKU</th>
-              <th>Product</th>
-              <th>Qty</th>
-              <th>Unit price</th>
-              <th>Fulfillment</th>
-              <th>Allocation</th>
-            </tr>
-          </thead>
-          <tbody>
-            {lines.length === 0 ? (
+      <div className="panel-card">
+        <div className="panel-card-header">
+          <h2 className="panel-card-title" style={{ margin: 0 }}>
+            Line items
+          </h2>
+        </div>
+        <div className="table-wrap">
+          <table>
+            <thead>
               <tr>
-                <td colSpan={6} className="empty">
-                  No line items.
-                </td>
+                <th>SKU</th>
+                <th>Product</th>
+                <th>Qty</th>
+                <th>Unit price</th>
+                <th>Fulfillment</th>
+                <th>Allocation</th>
               </tr>
-            ) : (
-              lines.map((line) => (
-                <tr key={line.id}>
-                  <td className="mono">{line.internal_sku}</td>
-                  <td>{line.product_name}</td>
-                  <td>{line.quantity}</td>
-                  <td>{line.unit_price}</td>
-                  <td>{line.fulfillment_type}</td>
-                  <td>
-                    {line.reserved ? (
-                      <span className="badge badge-success">reserved</span>
-                    ) : (
-                      <span className="badge">not reserved</span>
-                    )}
+            </thead>
+            <tbody>
+              {lines.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="empty">
+                    No line items.
                   </td>
                 </tr>
-              ))
-            )}
-          </tbody>
-        </table>
+              ) : (
+                lines.map((line) => (
+                  <tr key={line.id}>
+                    <td className="mono">{line.internal_sku}</td>
+                    <td>{line.product_name}</td>
+                    <td>{line.quantity}</td>
+                    <td>{line.unit_price}</td>
+                    <td>{line.fulfillment_type}</td>
+                    <td>
+                      {line.reserved ? (
+                        <span className="badge badge-success">reserved</span>
+                      ) : (
+                        <span className="badge">not reserved</span>
+                      )}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
 
       {shipment && (
-        <>
-          <h2>Shipment tracking</h2>
-          <div className="card" style={{ marginBottom: 20 }}>
+        <div className="panel-card">
+          <div className="panel-card-header">
+            <h2 className="panel-card-title" style={{ margin: 0 }}>
+              Shipment tracking
+            </h2>
+          </div>
             <div className="row">
               <span className="badge">{shipment.carrier}</span>
               {shipment.tracking_number && <span className="mono">{shipment.tracking_number}</span>}
@@ -495,29 +508,34 @@ export default async function OrderDetailPage({ params, searchParams }: OrderDet
                 ))}
               </ul>
             )}
-          </div>
-        </>
+        </div>
       )}
 
-      <h2>Activity</h2>
-      <p className="subtitle">
-        Assembled from the inventory ledger, rule executions, and picklist activity for this order — there is no
-        separate order-status-history log, so a transition that left no trace in any of those tables (e.g. a plain
-        status flip with no side effect) won&apos;t appear as its own row here.
-      </p>
-      {timeline.length === 0 ? (
-        <p className="empty">No recorded activity yet.</p>
-      ) : (
-        <ul className="timeline">
-          {timeline.map((entry, i) => (
-            <li key={i}>
-              <div className="timeline-time">{new Date(entry.at).toISOString()}</div>
-              <div>{entry.label}</div>
-              {entry.detail && <div className="muted">{entry.detail}</div>}
-            </li>
-          ))}
-        </ul>
-      )}
+      <div className="panel-card">
+        <div className="panel-card-header">
+          <h2 className="panel-card-title" style={{ margin: 0 }}>
+            Activity
+          </h2>
+        </div>
+        <p className="panel-card-subtitle">
+          Assembled from the inventory ledger, rule executions, and picklist activity for this order — there is no
+          separate order-status-history log, so a transition that left no trace in any of those tables (e.g. a plain
+          status flip with no side effect) won&apos;t appear as its own row here.
+        </p>
+        {timeline.length === 0 ? (
+          <p className="empty">No recorded activity yet.</p>
+        ) : (
+          <ul className="timeline">
+            {timeline.map((entry, i) => (
+              <li key={i}>
+                <div className="timeline-time">{new Date(entry.at).toISOString()}</div>
+                <div>{entry.label}</div>
+                {entry.detail && <div className="muted">{entry.detail}</div>}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
     </main>
   );
 }

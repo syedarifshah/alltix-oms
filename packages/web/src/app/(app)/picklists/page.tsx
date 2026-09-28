@@ -6,6 +6,8 @@ import type { RateEstimate } from "@alltix/carrier-connectors";
 import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
+import { FulfillmentIcon } from "@/components/icons";
+import { channelBadgeClass, channelLabel } from "@/lib/channel-badge";
 
 export const dynamic = "force-dynamic";
 
@@ -228,37 +230,47 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
 
   return (
     <main className="page">
-      <h1>Picklists</h1>
+      <h1>
+        <span className="row" style={{ gap: 8 }}>
+          <FulfillmentIcon /> Fulfillment
+        </span>
+      </h1>
       <p className="subtitle">Pick, pack, and ship allocated orders.</p>
 
       {error && <div className="alert alert-danger">{decodeURIComponent(error)}</div>}
 
-      <h2>Ready to pick ({allocatedOrders.length})</h2>
-      {allocatedOrders.length === 0 ? (
-        <p className="empty">No allocated orders waiting to be picked.</p>
-      ) : (
-        <form action="/api/picklists" method="POST" className="card">
-          <div className="stack">
-            {allocatedOrders.map((o) => (
-              <label key={o.id} className="row">
-                <input type="checkbox" name="orderIds" value={o.id} />
-                {o.external_order_id} ({o.channel}) — placed {o.placed_at ? new Date(o.placed_at).toISOString() : "—"}
-              </label>
-            ))}
-          </div>
-          <div style={{ marginTop: 12 }}>
-            <button type="submit">Generate picklist</button>
-          </div>
-        </form>
-      )}
+      <div className="panel-card">
+        <div className="panel-card-header">
+          <h2 className="panel-card-title" style={{ margin: 0 }}>
+            Ready to pick ({allocatedOrders.length})
+          </h2>
+        </div>
+        {allocatedOrders.length === 0 ? (
+          <p className="empty">No allocated orders waiting to be picked.</p>
+        ) : (
+          <form action="/api/picklists" method="POST">
+            <div className="stack">
+              {allocatedOrders.map((o) => (
+                <label key={o.id} className="row">
+                  <input type="checkbox" name="orderIds" value={o.id} />
+                  {o.external_order_id} ({o.channel}) — placed {o.placed_at ? new Date(o.placed_at).toISOString() : "—"}
+                </label>
+              ))}
+            </div>
+            <div style={{ marginTop: 12 }}>
+              <button type="submit">Generate picklist</button>
+            </div>
+          </form>
+        )}
+      </div>
 
-      <h2>Picklists ({picklists.length})</h2>
+      <h2 style={{ marginTop: 24 }}>Picklists ({picklists.length})</h2>
       {picklists.length === 0 ? (
         <p className="empty">No picklists yet.</p>
       ) : (
         <div className="stack">
           {picklists.map((pk) => (
-            <div className="card" key={pk.id}>
+            <div className="panel-card" key={pk.id}>
               <div className="row">
                 <strong>Picklist {pk.id.slice(0, 8)}</strong>
                 <span className="badge">{pk.status}</span>
@@ -327,57 +339,65 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
         </div>
       )}
 
-      <h2>Ready to pack ({pickingOrders.length})</h2>
-      {pickingOrders.length === 0 ? (
-        <p className="empty">No orders in 'picking'.</p>
-      ) : (
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Order</th>
-                <th>Channel</th>
-                <th>Picking progress</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {pickingOrders.map((o) => {
-                const pending = Number(o.pending_count);
-                const total = Number(o.total_lines);
-                const ready = pending === 0;
-                return (
-                  <tr key={o.id}>
-                    <td>
-                      <a href={`/orders/${o.id}`}>{o.external_order_id}</a>
-                    </td>
-                    <td>{o.channel}</td>
-                    <td>{total === 0 ? "no picklist lines" : `${total - pending}/${total} recorded`}</td>
-                    <td>
-                      <form action={`/api/orders/${o.id}/pack`} method="POST">
-                        <button type="submit" disabled={!ready}>
-                          Pack
-                        </button>
-                      </form>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+      <div className="panel-card" style={{ marginTop: 24 }}>
+        <div className="panel-card-header">
+          <h2 className="panel-card-title" style={{ margin: 0 }}>
+            Ready to pack ({pickingOrders.length})
+          </h2>
         </div>
-      )}
+        {pickingOrders.length === 0 ? (
+          <p className="empty">No orders in &apos;picking&apos;.</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Order</th>
+                  <th>Channel</th>
+                  <th>Picking progress</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {pickingOrders.map((o) => {
+                  const pending = Number(o.pending_count);
+                  const total = Number(o.total_lines);
+                  const ready = pending === 0;
+                  return (
+                    <tr key={o.id}>
+                      <td>
+                        <a href={`/orders/${o.id}`}>{o.external_order_id}</a>
+                      </td>
+                      <td>
+                        <span className={channelBadgeClass(o.channel)}>{channelLabel(o.channel)}</span>
+                      </td>
+                      <td>{total === 0 ? "no picklist lines" : `${total - pending}/${total} recorded`}</td>
+                      <td>
+                        <form action={`/api/orders/${o.id}/pack`} method="POST">
+                          <button type="submit" disabled={!ready}>
+                            Pack
+                          </button>
+                        </form>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
 
-      <h2>Ready to ship ({packedOrders.length})</h2>
+      <h2 style={{ marginTop: 24 }}>Ready to ship ({packedOrders.length})</h2>
       {packedOrders.length === 0 ? (
-        <p className="empty">No orders in 'packed'.</p>
+        <p className="empty">No orders in &apos;packed&apos;.</p>
       ) : (
         <div className="stack">
           {packedOrders.map((o) => (
-            <div className="card" key={o.id}>
+            <div className="panel-card" key={o.id}>
               <div className="row" style={{ marginBottom: 8 }}>
                 <a href={`/orders/${o.id}`}>{o.external_order_id}</a>
-                <span className="muted">{o.channel}</span>
+                <span className={channelBadgeClass(o.channel)}>{channelLabel(o.channel)}</span>
               </div>
               <form action={`/api/orders/${o.id}/ship`} method="POST" className="row">
                 <input type="text" name="carrier" placeholder="Carrier (e.g. UPS)" required />
