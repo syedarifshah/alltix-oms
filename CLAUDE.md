@@ -3019,12 +3019,26 @@ eBay/Temu v1" scope decision.
     in the repo rather than deleted, as the record of what the live file's
     every-10-minutes schedule should look like if it ever needs reconstructing
     (e.g. a future channel addition needs its own offset picked the same way).
-  - **Not yet re-verified against a real deploy**: applying this file is confirmed
-    correct at the JSON/git level (the same verification the prior "ready to apply"
-    state already had); whether Vercel's own Pro-plan cron scheduler actually
-    honors the every-10-minutes entries as configured is confirmed only once this
-    deploys and a sync job's own `last_order_sync_at`/logs show the tighter
-    cadence in practice, not yet observed directly.
+  - **Verified against a real deploy**: a production Vercel log for
+    `GET /api/cron/amazon-order-sync` (deployment `dpl_AMDBNxyi8FLxYJGvEjBqvjQFCfqW`,
+    branch `main`) fired at 22:41:05 GMT+5 (17:41 UTC) — minute 41, matching
+    `amazon-order-sync`'s offset-1 schedule (`"1,11,21,31,41,51 * * * *"`) — and
+    returned 200 in 3.7s with 4 successful external API calls. This confirms
+    Vercel's Pro-plan cron scheduler is genuinely honoring the every-10-minutes
+    entries in production, not just accepting them as valid JSON at deploy time.
+  - **Minor follow-up, not urgent, not a code fix**: that same log emitted a
+    `pg-connection-string`/`pg` deprecation warning — `sslmode=prefer/require/
+    verify-ca` are currently aliased to `verify-full` but will adopt weaker
+    libpq-standard semantics in the next major version (`pg-connection-string`
+    v3 / `pg` v9). This isn't set anywhere in this repo (grepped — no
+    `sslmode` literal in code, `.env*`, or docs), so it's coming from whatever
+    `DATABASE_URL`/`APP_DATABASE_URL` value is configured in Vercel's
+    production env vars. Doesn't block anything today (request still returned
+    200) — whenever Arif is next in Vercel's env var settings, appending
+    `sslmode=verify-full` explicitly to both connection strings would pin
+    today's actual behavior against that future default change, rather than
+    silently inheriting weaker semantics on some future `pg`/`pg-connection-string`
+    bump.
 
 ## 10. Team & Realistic Timeline
 
