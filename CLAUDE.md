@@ -1101,6 +1101,18 @@ eBay/Temu v1" scope decision.
       Distinguishing "one bad order" from "the whole connection is broken" for
       circuit-breaker purposes is a real gap, intentionally left open rather than
       redesigned as part of this fix.
+      - **Update — this gap is now closed, see §4.5.3**: `persistPulledOrders()`
+        now throws a distinguishable `PartialOrderPersistFailureError` (not a plain
+        `Error`) for exactly this "every other order is fine, one order has a
+        data-quality problem" case, and every one of the 6 channel sync catch
+        blocks (Amazon/Shopify/Walmart/eBay/Temu/TikTok, not just Shopify — this
+        was never actually Shopify-specific, since `persistPulledOrders()` is
+        shared) now calls `recordSyncSuccess()` instead of `recordSyncFailure()`
+        when it sees one. The permanently-bad order still can't advance the
+        cursor past itself and still keeps failing every run — that part is
+        unchanged and unfixable from code, per the paragraph above — but it can no
+        longer poison the circuit breaker and flip an otherwise-healthy connection
+        to `status = 'error'`.
 - **Outbound listing creation** (`ShopifyConnector.createListing()`, `POST
   /api/channels/shopify/listings`, `/products` page): closes part of the "Not
   implemented" gap above for Shopify specifically — a tenant can now push an existing
@@ -1314,6 +1326,82 @@ eBay/Temu v1" scope decision.
   not a single topic in isolation. Verified: `npm run typecheck --workspaces` clean
   across all twelve workspaces, `next build` clean, `bash scripts/run-tests.sh` — all 64
   test files pass (30/30 in the Shopify connector's own file, up from 26).
+
+### 4.5.3 Permanently-unresolvable-order circuit-breaker fix — built, closing §4.5's own "Known residual behavior" gap
+
+- **Why**: quoting back an item from an earlier status summary — "The
+  permanently-unresolvable-order edge case (a Shopify demo order with no SKU) — a
+  data-quality issue at the source, not something more code fixes" — is correct
+  about the core edge case itself (a Shopify line item with no SKU genuinely can't
+  be fixed by more code; it needs a real SKU set at the source, per §4.5's own
+  "Known residual behavior" paragraph). But that framing missed a real, distinct,
+  already-documented ADJACENT gap: that one permanently-bad order doesn't just keep
+  failing on its own — every consecutive failure it causes still counts toward
+  `CONSECUTIVE_FAILURE_ERROR_THRESHOLD` (3) the exact same way a genuine
+  connection-level failure (bad token, network down) would, so it eventually flips
+  the ENTIRE channel connection to `status = 'error'` — cutting off sync for every
+  *other*, perfectly good order on that same connection too. Proposed building the
+  fix for this adjacent, genuinely-fixable gap instead of the unfixable core edge
+  case; confirmed via AskUserQuestion — Arif's own explicit **"Yes, build that fix
+  (Recommended)."**
+- **The core distinction this fix makes real**: "one order in this batch has a
+  data-quality problem, but every other order proves the connection itself is
+  healthy" is a fundamentally different signal than "this sync run failed" — before
+  this fix, `packages/scheduler`'s catch blocks couldn't tell the two apart, because
+  `persistPulledOrders()`'s own partial-batch-failure throw (§4.5's own "batch-wide
+  rollback bug" fix, directly above) was just a plain `Error` with a formatted
+  message — indistinguishable, to a `catch (err)` block, from a real connection
+  outage.
+- **`PartialOrderPersistFailureError`** (new exported class,
+  `packages/order-service/src/index.ts`): thrown by `persistPulledOrders()` instead
+  of a plain `Error` for exactly the "every other order in this batch persisted
+  fine" case — carries `failedOrders` (each with its own `externalOrderId`/`error`),
+  plus the batch's own real `insertedOrderIds`/`skippedExternalOrderIds` (so a
+  caller catching this error still knows exactly what DID succeed, not just that
+  something failed). `PersistPulledOrdersResult`'s own shape is unchanged — this is
+  still a throw, not a partial-result return, keeping every existing caller's
+  no-throw-means-success contract exactly as it already was.
+- **`recordPartialOrderPersistFailure()`** (new exported helper,
+  `packages/scheduler/src/index.ts`): the shared function all 6 channel sync catch
+  blocks (Amazon's `syncTenant`, Shopify's `syncShopifyConnection`, Walmart's
+  `syncWalmartTenant`, eBay's, Temu's, TikTok's `syncTikTokConnection`) now call as
+  the FIRST check inside their own catch block, before the existing generic
+  `recordSyncFailure()` path runs — `if (err instanceof PartialOrderPersistFailureError)
+  { return recordPartialOrderPersistFailure(...); }`. Calls `recordSyncSuccess()`,
+  not `recordSyncFailure()` — since every other order in the batch already proved
+  the connection itself is healthy, this run genuinely is a success, not a failure —
+  and returns a `TenantSyncResult` with `success: true` and the error's own real
+  `insertedOrderIds`/`skippedExternalOrderIds` (not empty arrays), so a tenant's own
+  sync-result reporting doesn't lose visibility into what actually got inserted just
+  because the batch also had one bad order in it. Deliberately does **not** advance
+  `last_order_sync_at` — unchanged, pre-existing, accepted behavior (the
+  permanently-bad order keeps getting re-pulled and re-failing every run, exactly as
+  §4.5's own "Known residual behavior" paragraph already says it will, just without
+  poisoning the health signal anymore).
+- **Applies to all 6 channels, not just Shopify**: `persistPulledOrders()` is the
+  one shared method every pull-based connector (Amazon, Shopify, Walmart, eBay,
+  Temu, TikTok) already goes through — this was never actually a Shopify-specific
+  gap, even though the incident that surfaced it was a Shopify demo order. All 6
+  catch blocks in `packages/scheduler/src/index.ts` got the identical one-line
+  guard.
+- **Tested**: a new test in `packages/order-service/test/batch-partial-failure.test.ts`
+  ("a partial batch failure throws a `PartialOrderPersistFailureError` carrying the
+  real inserted/skipped counts, not a plain Error") proves the thrown error is the
+  distinguishable type, not just a matching message string, and that it carries the
+  real counts. A new file, `packages/scheduler/test/partial-order-persist-failure.test.ts`
+  (2 tests), proves `recordPartialOrderPersistFailure()` against a real seeded
+  `channel_connections` row: one test walks a connection to
+  `CONSECUTIVE_FAILURE_ERROR_THRESHOLD - 1` real failures (one more `recordSyncFailure()`
+  call would trip it to `'error'`) and then proves a partial-order-persist failure
+  RESETS the counter to 0 and leaves `status = 'active'`, rather than being the run
+  that tips it over — the exact real-world shape this fix exists to prevent; the
+  other proves the returned `TenantSyncResult` carries the error's own real
+  `insertedOrderIds`/`skippedExternalOrderIds`, not empty arrays. Both added to
+  `scripts/run-tests.sh`'s `SAFE_TESTS`.
+- **Verified**: `npm run db:migrate` clean (no new migration — this is a pure
+  application-layer fix, no schema change), `npm run typecheck --workspaces` clean
+  across all twelve workspaces, `next build` clean, `bash scripts/run-tests.sh` —
+  all 65 test files pass (up from 64).
 
 ### 4.6 eBay Sell APIs (channel #4 — built once the connector abstraction had proven itself)
 

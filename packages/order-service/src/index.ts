@@ -19,6 +19,55 @@ export interface PersistPulledOrdersResult {
   skippedExternalOrderIds: string[];
 }
 
+/**
+ * Thrown by {@link OrderService.persistPulledOrders} instead of a plain
+ * `Error` specifically for the "one or more orders in this batch failed on
+ * a per-order data-quality problem, but every other order in the batch
+ * persisted fine" case (the SAVEPOINT-per-order isolation described in that
+ * method's own doc comment). A distinguishable type -- not just a string
+ * pattern-matched out of a generic Error's message -- so a caller
+ * (packages/scheduler's syncXTenant()/syncXConnection() functions) can tell
+ * this apart from a genuine connection-level failure (bad/expired
+ * credentials, a network error, the marketplace itself being down) without
+ * parsing text.
+ *
+ * That distinction matters for exactly one reason: a *permanently*
+ * unresolvable order (CLAUDE.md §4.5's "Update" -- e.g. a Shopify demo
+ * product whose line item has no SKU and therefore no fallback that will
+ * ever match a channel_listings row) keeps failing and getting re-pulled on
+ * every single sync run forever, since the batch-partial-failure fix
+ * deliberately leaves the sync cursor stuck rather than silently skipping
+ * past it (see persistPulledOrders()'s own "Known residual behavior"
+ * comment -- unchanged by this class). Before this type existed, every one
+ * of those runs called `recordSyncFailure()` exactly like a real connection
+ * outage would, so a single bad order could eventually flip an otherwise
+ * perfectly healthy connection to `status = 'error'` after
+ * `CONSECUTIVE_FAILURE_ERROR_THRESHOLD` runs -- purely because it never
+ * stops failing on its own, not because anything is actually wrong with the
+ * connection. A caller that checks `instanceof PartialOrderPersistFailureError`
+ * can call `recordSyncSuccess()` instead: every order this batch pulled
+ * OTHER than the ones named in `failedOrders` already committed
+ * successfully, which is direct proof the connection/credentials are
+ * healthy, exactly the signal `recordSyncSuccess()` exists to record.
+ *
+ * Carries the same partial-success data a full return would have
+ * (`insertedOrderIds`/`skippedExternalOrderIds`) precisely so a catcher can
+ * still report accurate counts instead of the empty arrays every other
+ * failure path returns -- this is a batch that mostly succeeded, not one
+ * that failed outright.
+ */
+export class PartialOrderPersistFailureError extends Error {
+  constructor(
+    message: string,
+    public readonly failedOrders: Array<{ externalOrderId: string; error: string }>,
+    public readonly insertedOrderIds: string[],
+    public readonly skippedExternalOrderIds: string[],
+  ) {
+    super(message);
+    this.name = "PartialOrderPersistFailureError";
+  }
+}
+
 /** The event each simpleTransition() `to` status publishes once its UPDATE
  *  commits. 'allocated' isn't here -- allocateOrder() publishes its own
  *  (either OrderAllocated or OrderBackordered) since it has two possible
@@ -1066,28 +1115,36 @@ export class OrderService {
     // Every order that succeeded above has already committed (the SAVEPOINT
     // dance above runs inside the withTenant() transaction that has already
     // returned/committed by this point) and been published/allocated -- so
-    // this throw can't lose or roll any of that back. Its only job is
-    // signaling: every existing caller (packages/scheduler/src/index.ts's
-    // syncTenant()/syncShopifyTenant()/etc.) wraps this call in try/catch and
-    // treats "no throw" as "call recordSyncSuccess() and advance
-    // last_order_sync_at"; silently swallowing a partial failure here would
-    // make the scheduler mark this run a full success (and move the sync
-    // cursor past the bad order) even though one or more orders never made
-    // it into the system. Throwing keeps that contract intact -- the batch
-    // is a success overall only when every order in it actually persisted.
+    // this throw can't lose or roll any of that back. Its job is signaling:
+    // every existing caller (packages/scheduler/src/index.ts's
+    // syncTenant()/syncShopifyTenant()/etc.) wraps this call in try/catch,
+    // and a throw here means last_order_sync_at is never advanced past this
+    // batch -- silently swallowing a partial failure here would move the
+    // sync cursor past the bad order even though one or more orders never
+    // made it into the system. Throwing keeps that contract intact -- the
+    // cursor advances only when every order in the batch actually
+    // persisted. What a caller does about *cross-run failure tracking*
+    // (recordSyncFailure() vs. recordSyncSuccess()) is a separate decision,
+    // no longer uniform for every throw -- see PartialOrderPersistFailureError's
+    // own doc comment just below for why this specific throw type gets
+    // treated as proof the connection itself is healthy.
     //
     // Known residual behavior (deliberately not solved here, see CLAUDE.md
-    // §4.4's Shopify update): because the cursor doesn't advance on this
-    // throw, a *permanently* bad order (e.g. a Shopify line item that will
-    // never get a SKU) keeps getting re-pulled and re-failing on every sync
-    // until it's resolved at the source -- eventually tripping the same
-    // circuit breaker a real connection-health failure would. That's a
-    // data-quality problem, not a connection problem, and ideally the two
-    // would be classified differently; today they aren't.
+    // §4.5's "Update" for the fix this DOES make -- the circuit-breaker
+    // misclassification, via PartialOrderPersistFailureError below): because
+    // the cursor doesn't advance on this throw, a *permanently* bad order
+    // (e.g. a Shopify line item that will never get a SKU) keeps getting
+    // re-pulled and re-failing on every sync until it's resolved at the
+    // source. That part is unchanged and still accepted -- only which
+    // recordSync*() call a caller makes in response is fixed now.
     if (failedOrders.length > 0) {
-      throw new Error(
+      const insertedOrderIds = [...insertedOrders.map((o) => o.id), ...earlyCancelledOrderIds];
+      throw new PartialOrderPersistFailureError(
         `${failedOrders.length} of ${orders.length} order(s) in this batch failed to persist: ` +
           failedOrders.map((f) => `${f.externalOrderId} (${f.error})`).join("; "),
+        failedOrders,
+        insertedOrderIds,
+        skippedExternalOrderIds,
       );
     }
 

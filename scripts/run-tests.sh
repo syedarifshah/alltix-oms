@@ -84,6 +84,7 @@ SAFE_TESTS=(
   "packages/scheduler/test/rate-limit-cooldown.test.ts"
   "packages/scheduler/test/tiktok-multi-shop.test.ts"
   "packages/scheduler/test/shopify-multi-store.test.ts"
+  "packages/scheduler/test/partial-order-persist-failure.test.ts"
   "packages/scheduler/test/cron-runner-platform-alerts.test.ts"
   "packages/shared/test/email.test.ts"
 )

@@ -25,7 +25,7 @@ import { config as loadEnv } from "dotenv";
 import { Client, type Pool } from "pg";
 import { createAppPool, withTenant } from "@alltix/db";
 import type { NormalizedOrder } from "@alltix/channel-connectors";
-import { OrderService } from "../src/index.js";
+import { OrderService, PartialOrderPersistFailureError } from "../src/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..", "..", "..");
@@ -172,6 +172,42 @@ test("a batch with one unresolvable-SKU order still persists every other order, 
     ),
   );
   assert.equal(badOrderLines.rows[0]?.count, "0", "no orphan order_lines for the bad order either");
+});
+
+test("a partial batch failure throws a PartialOrderPersistFailureError carrying the real inserted/skipped counts, not a plain Error", async () => {
+  // Regression coverage for CLAUDE.md §4.5's "Update" -- packages/scheduler's
+  // syncXTenant()/syncXConnection() catch blocks need a distinguishable type
+  // (not just a message pattern) to tell "connection is fine, one order has
+  // a data-quality problem" apart from a genuine connection-level failure,
+  // so a permanently-bad order stops flipping an otherwise healthy
+  // connection's status to 'error'. See PartialOrderPersistFailureError's
+  // own doc comment in ../src/index.ts for the full reasoning.
+  const goodSku = `GOOD-TYPED-${randomUUID().slice(0, 8)}`;
+  const unresolvableSku = `gid://shopify/LineItem/${randomUUID()}`;
+
+  await seedProduct(10, goodSku);
+
+  const goodOrderId = `GOOD-TYPED-ORDER-${randomUUID()}`;
+  const badOrderId = `BAD-TYPED-ORDER-${randomUUID()}`;
+
+  const orderService = new OrderService(pool);
+
+  await assert.rejects(
+    () =>
+      orderService.persistPulledOrders(tenantId, [
+        makeSyntheticOrder(goodOrderId, goodSku, 1),
+        makeSyntheticOrder(badOrderId, unresolvableSku, 1),
+      ]),
+    (err: unknown) => {
+      assert.ok(err instanceof PartialOrderPersistFailureError, "must be the distinguishable type, not a plain Error");
+      assert.equal(err.failedOrders.length, 1);
+      assert.equal(err.failedOrders[0]?.externalOrderId, badOrderId);
+      assert.match(err.failedOrders[0]?.error ?? "", /channel_listings|no product_id|SKU/i);
+      assert.equal(err.insertedOrderIds.length, 1, "the one good order's id must be carried on the error, not lost");
+      assert.deepEqual(err.skippedExternalOrderIds, []);
+      return true;
+    },
+  );
 });
 
 test("a batch where every order fails throws and leaves nothing committed", async () => {

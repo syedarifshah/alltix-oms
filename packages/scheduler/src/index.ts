@@ -13,7 +13,7 @@ import {
   type NormalizedShopifyProductVariant,
 } from "@alltix/channel-connectors";
 import { InventoryService } from "@alltix/inventory-service";
-import { OrderService } from "@alltix/order-service";
+import { OrderService, PartialOrderPersistFailureError } from "@alltix/order-service";
 import { RulesEngine } from "@alltix/rules-engine";
 import { UsageReporter } from "@alltix/billing-service";
 
@@ -285,6 +285,67 @@ export async function recordSyncSuccess(
 }
 
 /**
+ * Shared by every syncXTenant()/syncXConnection() catch block below, once
+ * `persistPulledOrders()` throws a {@link PartialOrderPersistFailureError}
+ * instead of a generic `Error` -- see that class's own doc comment in
+ * `@alltix/order-service` for the full "why this isn't a connection
+ * failure" reasoning (CLAUDE.md §4.5's "Update" on the real Shopify
+ * demo-order incident this closes out). Centralized here rather than
+ * repeated at all six call sites, the same way recordSyncFailure()/
+ * recordSyncSuccess() themselves are shared instead of six separate
+ * per-channel UPDATE statements.
+ *
+ * Calls recordSyncSuccess() -- not recordSyncFailure() -- because every
+ * order this batch pulled OTHER than the ones `err.failedOrders` names
+ * already committed successfully, which is direct proof the connection and
+ * its credentials are healthy right now. Returns a `success: true` result
+ * carrying the real partial counts from the error (not the empty arrays a
+ * genuine failure returns), so a caller's own logs/summary still reflect
+ * what actually got persisted -- `error` stays non-null even though
+ * `success` is `true`, since nothing downstream (every cron route's own
+ * `results.filter((r) => r.success)`) reads `.error` at all when `.success`
+ * is `true`; it's kept only for visibility if that ever changes.
+ *
+ * Deliberately does NOT touch `last_order_sync_at` -- the caller's own
+ * `UPDATE ... SET last_order_sync_at` is simply never reached on this path
+ * (same as any other throw), so a permanently-bad order keeps getting
+ * re-pulled and re-failing every run until it's fixed at the source. That's
+ * pre-existing, accepted behavior (persistPulledOrders()'s own "Known
+ * residual behavior" comment) this function doesn't change -- only the
+ * circuit-breaker misclassification is what's fixed here.
+ *
+ * Exported (along with the six catch-block call sites that use it
+ * implicitly) purely so `packages/scheduler/test/partial-order-persist-
+ * failure.test.ts` can drive it directly against a real
+ * `channel_connections` row, the same way `recordSyncFailure`/
+ * `recordSyncSuccess` are already exported for `sync-failure-tracking.test.ts`
+ * to call directly rather than only ever indirectly through a full sync run.
+ */
+export async function recordPartialOrderPersistFailure(
+  appPool: Pool,
+  tenantId: string,
+  channel: "amazon" | "shopify" | "walmart" | "ebay" | "temu" | "tiktok",
+  err: PartialOrderPersistFailureError,
+  connectionId?: string,
+): Promise<TenantSyncResult> {
+  console.warn(
+    `${channel} order sync for tenant ${tenantId}${connectionId ? `, connection ${connectionId}` : ""}: ` +
+      `${err.failedOrders.length} order(s) failed to persist on a data-quality problem, not a connection ` +
+      `problem -- every other order in this batch persisted fine, so this run counts as a success, not a ` +
+      `failure. Still-unresolved order(s): ${err.failedOrders.map((f) => `${f.externalOrderId} (${f.error})`).join("; ")}`,
+  );
+  await recordSyncSuccess(appPool, tenantId, channel, connectionId);
+  return {
+    tenantId,
+    connectionId,
+    success: true,
+    insertedOrderIds: err.insertedOrderIds,
+    skippedExternalOrderIds: err.skippedExternalOrderIds,
+    error: err.message,
+  };
+}
+
+/**
  * The cross-run half of CLAUDE.md §4.4's circuit breaker: called from a
  * syncXTenant()/syncShopifyCatalogForConnection() catch block specifically when
  * `err instanceof RateLimitExhaustedError` (i.e. fetchWithBackoff itself
@@ -492,6 +553,9 @@ async function syncTenant(appPool: Pool, orderService: OrderService, tenantId: s
 
     return { tenantId, success: true, ...persisted, error: null };
   } catch (err) {
+    if (err instanceof PartialOrderPersistFailureError) {
+      return recordPartialOrderPersistFailure(appPool, tenantId, "amazon", err);
+    }
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Amazon order sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
     // Cross-run failure tracking/alerting -- see recordSyncFailure()'s doc
@@ -613,6 +677,9 @@ async function syncShopifyConnection(
 
     return { tenantId, connectionId, success: true, ...persisted, error: null };
   } catch (err) {
+    if (err instanceof PartialOrderPersistFailureError) {
+      return recordPartialOrderPersistFailure(appPool, tenantId, "shopify", err, connectionId);
+    }
     const message = err instanceof Error ? err.message : String(err);
     console.error(
       `Shopify order sync failed for tenant ${tenantId}, connection ${connectionId}, continuing with remaining stores/tenants:`,
@@ -723,6 +790,9 @@ async function syncWalmartTenant(appPool: Pool, orderService: OrderService, tena
 
     return { tenantId, success: true, ...persisted, error: null };
   } catch (err) {
+    if (err instanceof PartialOrderPersistFailureError) {
+      return recordPartialOrderPersistFailure(appPool, tenantId, "walmart", err);
+    }
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Walmart order sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
     // Same cross-run failure tracking as syncTenant()/syncShopifyConnection()
@@ -825,6 +895,9 @@ async function syncEbayTenant(appPool: Pool, orderService: OrderService, tenantI
 
     return { tenantId, success: true, ...persisted, error: null };
   } catch (err) {
+    if (err instanceof PartialOrderPersistFailureError) {
+      return recordPartialOrderPersistFailure(appPool, tenantId, "ebay", err);
+    }
     const message = err instanceof Error ? err.message : String(err);
     console.error(`eBay order sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
     // Same cross-run failure tracking as syncWalmartTenant() -- see
@@ -926,6 +999,9 @@ async function syncTemuTenant(appPool: Pool, orderService: OrderService, tenantI
 
     return { tenantId, success: true, ...persisted, error: null };
   } catch (err) {
+    if (err instanceof PartialOrderPersistFailureError) {
+      return recordPartialOrderPersistFailure(appPool, tenantId, "temu", err);
+    }
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Temu order sync failed for tenant ${tenantId}, continuing with remaining tenants:`, message);
     // Same cross-run failure tracking as syncEbayTenant() -- see
@@ -1059,6 +1135,9 @@ async function syncTikTokConnection(
 
     return { tenantId, connectionId, success: true, ...persisted, error: null };
   } catch (err) {
+    if (err instanceof PartialOrderPersistFailureError) {
+      return recordPartialOrderPersistFailure(appPool, tenantId, "tiktok", err, connectionId);
+    }
     const message = err instanceof Error ? err.message : String(err);
     console.error(
       `TikTok Shop order sync failed for tenant ${tenantId}, connection ${connectionId}, continuing with remaining shops/tenants:`,
