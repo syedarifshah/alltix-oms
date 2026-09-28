@@ -37,10 +37,13 @@
       "path": "/api/cron/temu-order-sync",
       "schedule": "30 6 * * *"
     },
-        {
+    {
       "path": "/api/cron/tiktok-order-sync",
       "schedule": "0 7 * * *"
+    },
+    {
+      "path": "/api/cron/sales-rollup",
+      "schedule": "0 8 * * *"
     }
-
   ]
 }

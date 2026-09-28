@@ -2540,8 +2540,11 @@ eBay/Temu v1" scope decision.
   page's own doc comment for the "start simple" reasoning, same call already made for
   the event bus and job queue). No dollar inventory-value figure — this schema has no
   cost/COGS column, only sale price, so a $ "stock value" would silently misrepresent
-  one as the other; units only. The real CDC-fed store is still open, see the item
-  below. Multi-warehouse/3PL support: the ledger-level piece (moving stock
+  one as the other; units only. **Update — sales by channel and top SKUs now read
+  from daily rollup tables, not a live scan** (migration `0045_daily_sales_rollups.sql`,
+  see the "Reporting/Analytics" item below for the full why/mechanism/what's-not-solved
+  breakdown) — the returns summary and inventory snapshot are untouched, they were
+  never this change's target. Multi-warehouse/3PL support: the ledger-level piece (moving stock
   between two locations, §2.2's "Multi-location transfers") and the
   locations-management UI (`/locations` — create + rename a warehouse/3pl/fba/wfs
   location, plus set/clear its optional ZIP code (see the nearest-location-routing
@@ -2821,8 +2824,77 @@ eBay/Temu v1" scope decision.
     slow, or (b) any tenant's monthly order volume crosses roughly 10,000-20,000
     orders/month (the point `inventory_events`' own growth, §2.2's "Retrofit risk"
     note, starts making a plain-query report meaningfully more expensive than it is
-    today). Until one of those two fires, `/reports`' plain-query approach stays as-is
-    — no infra work now.
+    today).
+  - **Update — trigger (b) has fired; built a pragmatic v1, not the full CDC-fed
+    store** (migration `0045_daily_sales_rollups.sql`,
+    `packages/scheduler/src/index.ts`'s `rollupDailySales`,
+    `GET /api/cron/sales-rollup`, `scripts/backfill-sales-rollups.ts`): this same
+    conversation independently established real contracts with a few large
+    companies and 30,000+ orders/week expected (~130,000/month) — well past the
+    10,000-20,000/month trigger this section itself recorded above. **Why not the
+    real Debezium + ClickHouse/BigQuery store the architecture diagram (§1)
+    pictures**: that needs real external vendor accounts, billing, and a new
+    deployment surface this session has no way to provision (no cloud credentials
+    for any external warehouse exist anywhere in this codebase) — building it
+    sight-unseen would repeat the exact "standing up infra nobody's earned yet"
+    mistake this codebase has deliberately avoided elsewhere (BullMQ/Redis §4.4,
+    Kafka §1, a real feature-flag vendor §15), just with the trigger backwards:
+    here the infra genuinely IS earned, so silence wasn't the honest option either.
+  - **Mechanism**: two new tenant-scoped, RLS-protected tables —
+    `daily_channel_sales_rollups`/`daily_product_sales_rollups`, one row per
+    (tenant, UTC calendar day, channel) or (tenant, day, product) — precompute
+    exactly the two queries on `/reports` that scan `orders`/`order_lines`
+    per-row for the selected period (sales-by-channel, top-SKUs-by-revenue); the
+    returns/inventory-snapshot/reorder-soon sections were never this feature's
+    target (they scan `inventory_levels`, one row per product/location, not per
+    order). `rollupDailySales()` recomputes a trailing 3-day window
+    (`SALES_ROLLUP_RECOMPUTE_DAYS`) via DELETE-then-INSERT — not an upsert,
+    specifically so a group whose every underlying order has since been
+    cancelled is removed outright rather than left at a stale non-zero value,
+    something an upsert alone cannot do (see that function's own doc comment).
+    The trailing window absorbs same-day/next-day cancellations and backdated
+    channel syncs; a cancellation of a much older order needs a manual backfill
+    (`scripts/backfill-sales-rollups.ts`, same function, an explicit wide
+    `sinceDate`). Both tables grant `app_user` `SELECT` only — no
+    `INSERT`/`UPDATE`/`DELETE` — so only the nightly cron job (via `adminPool`,
+    the schema-owning role) can ever write them, a real security boundary beyond
+    RLS. `/reports`' own sales-by-channel/top-SKUs queries now sum rollup rows
+    for the selected period instead of scanning `orders`/`order_lines` directly
+    — a period's cost is now bounded by (days) x (channels or SKUs), not by
+    order volume.
+  - **What's not solved**: this is Postgres-native precompute, not a separate
+    columnar engine or a separate physical database — heavy report reads still
+    share the same transactional database as everything else, just against
+    small precomputed tables instead of scanning raw order rows. A genuine
+    cancellation of an order older than the 3-day trailing window silently
+    leaves that day's rollup stale until a manual backfill is run — documented,
+    not hidden. `/reports` is now eventually consistent with a real lag: today's
+    not-yet-rolled-up sales only appear after the next nightly cron run, a gap
+    the page's own live-query predecessor never had.
+  - **Tested/Verified**: `packages/scheduler/test/sales-rollup.test.ts` (5 tests,
+    real seeded Postgres) — correct per-channel/per-product aggregation
+    excluding cancelled orders; the DELETE-then-INSERT recompute actually
+    removing a group once its only order is cancelled (not left stale); two
+    tenants' same-day rollups staying isolated; the default trailing window
+    leaving an old order's rollup untouched while an explicit `sinceDate` picks
+    it up; and idempotent re-runs producing no duplicate rows. Wired into
+    `scripts/run-tests.sh`'s `SAFE_TESTS`. `npm run db:migrate` (migration 0045
+    applied cleanly), `npm run db:backfill-sales-rollups` (ran end-to-end
+    against real local data), `npm run typecheck --workspaces` clean across all
+    twelve workspaces (after rebuilding `@alltix/scheduler`'s own `dist/` output
+    so `packages/web` could see the new `rollupDailySales`/`SalesRollupResult`
+    exports), `next build` clean (the new `/api/cron/sales-rollup` route and the
+    updated `/reports` page both compile), `bash scripts/run-tests.sh` — all 68
+    test files pass (67 previous + this pass's own new file).
+  - **New, concrete revisit trigger for THIS approach, so it doesn't stay a vague
+    "later" either**: whichever happens first — (a) `/reports` becomes
+    visibly/measurably slow again even reading from the rollup tables (a sign
+    the tables themselves, or the transactional DB they share, need to move to a
+    separate physical store), or (b) a tenant needs report freshness tighter than
+    "as of last night's cron run" (a sign precompute-on-a-schedule itself, not
+    just where it runs, is the wrong shape and a real event/CDC-driven pipeline
+    is warranted). Until one of those two fires, this rollup-table approach
+    stays as-is — no further infra work now.
 - **Stock forecasting — built, v1 scope, moved up from Phase 5** (`@alltix/inventory-service`'s
   `computeDailyVelocity`/`computeDaysOfStockRemaining`/`assessStockForecast`,
   `/inventory`'s new "Est. days left" column, `/reports`' new "Reorder soon" section):

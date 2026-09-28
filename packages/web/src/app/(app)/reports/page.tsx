@@ -117,6 +117,25 @@ function parsePeriodDays(raw: string | undefined): number {
  * rows -- the same "never silently net two different things together"
  * instinct CLAUDE.md's inventory-ledger rule already encodes elsewhere in
  * this app.
+ *
+ * **Sales-by-channel and top-SKUs now read from the daily rollup tables**
+ * (`daily_channel_sales_rollups`/`daily_product_sales_rollups`, migration
+ * 0045, `@alltix/scheduler`'s `rollupDailySales`), not a live scan of
+ * `orders`/`order_lines` -- the pragmatic v1 CLAUDE.md §8's own recorded
+ * CDC-store revisit trigger (real contracts, 30,000+ orders/week) is
+ * built around; see that migration's own header comment for the full
+ * "why this instead of real Debezium+ClickHouse/BigQuery" reasoning. Both
+ * queries sum whole calendar-day rollup rows for `sale_date >= since`
+ * (UTC date, not a timestamp) rather than grouping raw order/line rows,
+ * so their cost is bounded by (days in period) x (channels or SKUs), not
+ * by order volume. **A real, honest limitation this trades in**: these
+ * tables are only as fresh as the last nightly `sales-rollup` cron run
+ * (`/api/cron/sales-rollup`, `vercel.json`) -- today's not-yet-rolled-up
+ * sales won't appear here until tomorrow's run, an eventual-consistency
+ * gap this page didn't have before. The returns/inventory-snapshot/
+ * reorder-soon sections below are untouched -- they don't scan
+ * `orders`/`order_lines` per-row the way sales-by-channel/top-SKUs did,
+ * so they were never this feature's target.
  */
 export default async function ReportsPage({ searchParams }: ReportsPageProps): Promise<ReactElement> {
   const authContext = await getAuthContext(await headers());
@@ -151,31 +170,40 @@ export default async function ReportsPage({ searchParams }: ReportsPageProps): P
         [tenantId],
       );
 
+      // UTC calendar date, not a timestamp -- matches
+      // daily_channel_sales_rollups/daily_product_sales_rollups' own
+      // `sale_date DATE` column (migration 0045), which is itself derived
+      // from `orders.placed_at` the same way. `since` above is a plain JS
+      // Date at "periodDays days ago, right now" -- slicing its own
+      // ISO string to the date part is a deliberately simple truncation
+      // (same spirit as rollupDailySales' own UTC day-boundary math), not
+      // a timezone-aware "start of day" -- a report window boundary,
+      // never a financial cutoff, doesn't need that precision.
+      const sinceDate = since.toISOString().slice(0, 10);
+
       const salesByChannelResult = await client.query<SalesByChannelRow>(
-        `SELECT o.channel,
-                count(DISTINCT o.id)::text AS order_count,
-                coalesce(sum(ol.quantity), 0)::text AS units_sold,
-                coalesce(sum(ol.quantity * ol.unit_price), 0)::text AS revenue
-           FROM orders o
-           JOIN order_lines ol ON ol.order_id = o.id
-          WHERE o.status <> 'cancelled' AND o.placed_at >= $1
-          GROUP BY o.channel
-          ORDER BY sum(ol.quantity * ol.unit_price) DESC`,
-        [since.toISOString()],
+        `SELECT channel,
+                sum(order_count)::text AS order_count,
+                sum(units_sold)::text AS units_sold,
+                sum(revenue)::text AS revenue
+           FROM daily_channel_sales_rollups
+          WHERE sale_date >= $1
+          GROUP BY channel
+          ORDER BY sum(revenue) DESC`,
+        [sinceDate],
       );
 
       const topSkusResult = await client.query<TopSkuRow>(
         `SELECT p.internal_sku, p.name AS product_name,
-                sum(ol.quantity)::text AS units_sold,
-                sum(ol.quantity * ol.unit_price)::text AS revenue
-           FROM order_lines ol
-           JOIN orders o ON o.id = ol.order_id
-           JOIN products p ON p.id = ol.product_id
-          WHERE o.status <> 'cancelled' AND o.placed_at >= $1
+                sum(r.units_sold)::text AS units_sold,
+                sum(r.revenue)::text AS revenue
+           FROM daily_product_sales_rollups r
+           JOIN products p ON p.id = r.product_id
+          WHERE r.sale_date >= $1
           GROUP BY p.id, p.internal_sku, p.name
-          ORDER BY sum(ol.quantity * ol.unit_price) DESC
+          ORDER BY sum(r.revenue) DESC
           LIMIT 10`,
-        [since.toISOString()],
+        [sinceDate],
       );
 
       // 'returned' is a terminal state (ORDER_STATE_TRANSITIONS.returned =
@@ -300,7 +328,8 @@ export default async function ReportsPage({ searchParams }: ReportsPageProps): P
       <h2>Sales by channel</h2>
       <p className="subtitle">
         Last {periodDays} days, by <code>placed_at</code>. Excludes cancelled orders. Gross revenue — not net of returns; see
-        Returns below.
+        Returns below. Figures come from the nightly sales rollup, not a live scan — today's sales appear after tonight's
+        run.
       </p>
       {salesByChannel.length === 0 ? (
         <p className="empty">No sales in this period.</p>

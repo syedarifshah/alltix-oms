@@ -1714,6 +1714,143 @@ export async function ensureInventoryEventPartitions(
   return created;
 }
 
+/** How many trailing UTC calendar days the nightly rollup job recomputes on
+ *  every run, not just "yesterday." A day's own aggregate can change after
+ *  it was first rolled up -- an order cancelled a day or two later, a
+ *  backdated channel sync landing an order whose `placed_at` is slightly in
+ *  the past -- so recomputing a short trailing window absorbs the common
+ *  case for free. Deliberately NOT unlimited: a cancellation of an order
+ *  placed further back than this window won't be reflected until a manual
+ *  full recompute (`scripts/backfill-sales-rollups.ts`) is run -- a real,
+ *  documented limitation, not silently assumed away. 3 days covers same-day
+ *  and next-day cancellations/backdated syncs, the overwhelming majority of
+ *  real-world cases, without turning every cron run into a full-history
+ *  scan. */
+const SALES_ROLLUP_RECOMPUTE_DAYS = 3;
+
+/** Result of one {@link rollupDailySales} run -- row counts, not table
+ *  contents, since this is a cron/backfill-script return value meant for
+ *  logging, not a caller that needs the rows themselves (a caller wanting
+ *  the actual numbers reads `daily_channel_sales_rollups`/
+ *  `daily_product_sales_rollups` directly, the same tables /reports itself
+ *  reads). */
+export interface SalesRollupResult {
+  channelRowsWritten: number;
+  productRowsWritten: number;
+  sinceDate: string;
+  throughDate: string;
+}
+
+/**
+ * Recomputes `daily_channel_sales_rollups`/`daily_product_sales_rollups`
+ * (migration 0045) for every UTC calendar day in `[sinceDate, throughDate)`
+ * -- CLAUDE.md §8 Phase 4's own pragmatic v1 of the deferred CDC-fed
+ * reporting store, see that migration's own header comment for the full
+ * reasoning (why this instead of standing up Debezium + ClickHouse/BigQuery
+ * sight-unseen).
+ *
+ * Defaults to the trailing {@link SALES_ROLLUP_RECOMPUTE_DAYS} days ending
+ * "today" (UTC) when no explicit range is given -- what the daily cron
+ * route actually calls with. A caller doing a one-time historical backfill
+ * (`scripts/backfill-sales-rollups.ts`) passes an explicit, much wider
+ * `sinceDate` instead; the function itself doesn't know or care which case
+ * it's in, it just recomputes whatever range it's given.
+ *
+ * DELETE-then-INSERT per table, not an upsert: an upsert (`ON CONFLICT ...
+ * DO UPDATE`) can only ever raise or correct a group's own numbers, never
+ * remove a row whose underlying orders have ALL since become cancelled
+ * (that query now returns zero rows for that group, and an upsert has
+ * nothing to reconcile against) -- exactly the failure mode that would
+ * silently leave a stale, too-high rollup behind. DELETE-then-INSERT
+ * against the same date range fixes that at the cost of a brief window
+ * (between the DELETE and the following INSERT completing) where a
+ * concurrent read of `/reports` could see an incomplete day -- the same
+ * non-transactional two-statement shape {@link cleanupRateLimitWindows}
+ * already uses for the identical reason (a rollup/cleanup table, not the
+ * transactional order/inventory path CLAUDE.md §9's blue/green guidance is
+ * actually protecting), and this only ever touches the trailing few days'
+ * rows, never a day a report reader is likely to be summing at the exact
+ * millisecond this job runs.
+ *
+ * Runs via `adminPool` (bypasses RLS) for the same reason every other
+ * cross-tenant maintenance sweep in this file does (see
+ * `SyncAmazonOrdersParams.adminPool`'s own doc comment): this aggregates
+ * across every tenant in one query, not one tenant at a time, and
+ * `app_user` has no INSERT/UPDATE/DELETE grant on either rollup table at
+ * all (migration 0045's own comment) -- only this admin-run job ever
+ * writes them.
+ */
+export async function rollupDailySales(
+  adminPool: Pool,
+  options?: { sinceDate?: Date; throughDate?: Date },
+): Promise<SalesRollupResult> {
+  const now = options?.throughDate ?? new Date();
+  const throughDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  const sinceDate =
+    options?.sinceDate ??
+    new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - SALES_ROLLUP_RECOMPUTE_DAYS));
+
+  const channelDeleted = await adminPool.query(
+    `DELETE FROM daily_channel_sales_rollups
+      WHERE sale_date >= ($1::timestamptz AT TIME ZONE 'UTC')::date
+        AND sale_date < ($2::timestamptz AT TIME ZONE 'UTC')::date`,
+    [sinceDate.toISOString(), throughDate.toISOString()],
+  );
+  void channelDeleted; // row count not reported -- only the freshly-written count is, below
+
+  const channelInserted = await adminPool.query(
+    `INSERT INTO daily_channel_sales_rollups (tenant_id, sale_date, channel, order_count, units_sold, revenue, updated_at)
+     SELECT o.tenant_id,
+            (o.placed_at AT TIME ZONE 'UTC')::date AS sale_date,
+            o.channel,
+            count(DISTINCT o.id),
+            coalesce(sum(ol.quantity), 0),
+            coalesce(sum(ol.quantity * ol.unit_price), 0),
+            now()
+       FROM orders o
+       JOIN order_lines ol ON ol.order_id = o.id
+      WHERE o.status <> 'cancelled'
+        AND o.placed_at >= $1 AND o.placed_at < $2
+      GROUP BY o.tenant_id, (o.placed_at AT TIME ZONE 'UTC')::date, o.channel
+     ON CONFLICT (tenant_id, sale_date, channel) DO UPDATE SET
+       order_count = EXCLUDED.order_count, units_sold = EXCLUDED.units_sold,
+       revenue = EXCLUDED.revenue, updated_at = EXCLUDED.updated_at`,
+    [sinceDate.toISOString(), throughDate.toISOString()],
+  );
+
+  await adminPool.query(
+    `DELETE FROM daily_product_sales_rollups
+      WHERE sale_date >= ($1::timestamptz AT TIME ZONE 'UTC')::date
+        AND sale_date < ($2::timestamptz AT TIME ZONE 'UTC')::date`,
+    [sinceDate.toISOString(), throughDate.toISOString()],
+  );
+
+  const productInserted = await adminPool.query(
+    `INSERT INTO daily_product_sales_rollups (tenant_id, sale_date, product_id, units_sold, revenue, updated_at)
+     SELECT o.tenant_id,
+            (o.placed_at AT TIME ZONE 'UTC')::date AS sale_date,
+            ol.product_id,
+            sum(ol.quantity),
+            sum(ol.quantity * ol.unit_price),
+            now()
+       FROM order_lines ol
+       JOIN orders o ON o.id = ol.order_id
+      WHERE o.status <> 'cancelled'
+        AND o.placed_at >= $1 AND o.placed_at < $2
+      GROUP BY o.tenant_id, (o.placed_at AT TIME ZONE 'UTC')::date, ol.product_id
+     ON CONFLICT (tenant_id, sale_date, product_id) DO UPDATE SET
+       units_sold = EXCLUDED.units_sold, revenue = EXCLUDED.revenue, updated_at = EXCLUDED.updated_at`,
+    [sinceDate.toISOString(), throughDate.toISOString()],
+  );
+
+  return {
+    channelRowsWritten: channelInserted.rowCount ?? 0,
+    productRowsWritten: productInserted.rowCount ?? 0,
+    sinceDate: sinceDate.toISOString(),
+    throughDate: throughDate.toISOString(),
+  };
+}
+
 // The recurring trigger this file's own header comment above flagged as
 // separate, later infrastructure work -- see cron-runner.ts for why
 // node-cron (not BullMQ) and what "later" means concretely.

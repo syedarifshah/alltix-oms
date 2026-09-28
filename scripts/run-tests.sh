@@ -88,6 +88,7 @@ SAFE_TESTS=(
   "packages/scheduler/test/shopify-sku-collision.test.ts"
   "packages/scheduler/test/partial-order-persist-failure.test.ts"
   "packages/scheduler/test/cron-runner-platform-alerts.test.ts"
+  "packages/scheduler/test/sales-rollup.test.ts"
   "packages/shared/test/email.test.ts"
 )
 
