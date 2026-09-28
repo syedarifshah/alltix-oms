@@ -6,6 +6,10 @@
   "outputDirectory": "packages/web/.next",
   "crons": [
     {
+      "path": "/api/cron/inventory-partition-maintenance",
+      "schedule": "0 2 * * *"
+    },
+    {
       "path": "/api/cron/rate-limit-window-cleanup",
       "schedule": "0 3 * * *"
     },

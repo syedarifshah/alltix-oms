@@ -1648,6 +1648,72 @@ export async function cleanupRateLimitWindows(
   return (tenantScoped.rowCount ?? 0) + (ipScoped.rowCount ?? 0);
 }
 
+/** How many months past "now" to keep a real monthly partition of
+ *  `inventory_events` (migration 0044) ready for. Migration 0044's own
+ *  DEFAULT partition is a safety net, not the primary mechanism (see that
+ *  migration's own doc comment) -- this job is what's actually supposed to
+ *  keep every real insert landing in a proper monthly partition, never the
+ *  DEFAULT one, under ordinary operation. 3 months of runway means even if
+ *  this job's own daily cron were somehow down for weeks, there would still
+ *  be a real partition waiting when it recovers. */
+const INVENTORY_EVENT_PARTITION_MONTHS_AHEAD = 3;
+
+/**
+ * Ensures a real monthly range partition of `inventory_events` (migration
+ * 0044_inventory_events_partitioning.sql) exists for every month from the
+ * current one through `monthsAhead` months out. Naturally idempotent --
+ * checks each month via `to_regclass` before creating it, so running this
+ * daily creates, at most, one new partition (the month that just rolled
+ * into the window) on most days and none on the rest; re-running it against
+ * an already-fully-covered window is a safe no-op, same "idempotent by
+ * construction" shape {@link cleanupRateLimitWindows} already has.
+ *
+ * Runs via `adminPool` (the schema-owning `DATABASE_URL` role, not
+ * `app_user`) -- creating a partition is DDL (`CREATE TABLE ... PARTITION
+ * OF ...`), which `app_user`'s own least-privilege grants (migration 0001)
+ * were never meant to allow, the same reasoning every migration in this
+ * codebase already runs as the schema owner rather than the app's own
+ * runtime role.
+ *
+ * Returns the list of partition table names actually created this run
+ * (empty on an ordinary day, once the current window is already covered).
+ */
+export async function ensureInventoryEventPartitions(
+  adminPool: Pool,
+  monthsAhead: number = INVENTORY_EVENT_PARTITION_MONTHS_AHEAD,
+): Promise<string[]> {
+  const created: string[] = [];
+  const now = new Date();
+  const startYear = now.getUTCFullYear();
+  const startMonthIndex = now.getUTCMonth();
+
+  for (let i = 0; i <= monthsAhead; i++) {
+    const monthStart = new Date(Date.UTC(startYear, startMonthIndex + i, 1));
+    const monthEnd = new Date(Date.UTC(startYear, startMonthIndex + i + 1, 1));
+    const partitionName = `inventory_events_${monthStart.getUTCFullYear()}_${String(monthStart.getUTCMonth() + 1).padStart(2, "0")}`;
+
+    const existing = await adminPool.query<{ existing: string | null }>("SELECT to_regclass($1)::text AS existing", [
+      partitionName,
+    ]);
+    if (existing.rows[0]?.existing) {
+      continue;
+    }
+
+    // Bounds are computed Date objects, never external input -- safe to
+    // inline as ISO literals here the same way migration 0044's own DO
+    // block builds its partition DDL via format(%L, ...), since neither
+    // approach supports genuine $-parameter binding for a partition
+    // bound's own literal syntax.
+    await adminPool.query(
+      `CREATE TABLE IF NOT EXISTS "${partitionName}" PARTITION OF inventory_events
+         FOR VALUES FROM ('${monthStart.toISOString()}') TO ('${monthEnd.toISOString()}')`,
+    );
+    created.push(partitionName);
+  }
+
+  return created;
+}
+
 // The recurring trigger this file's own header comment above flagged as
 // separate, later infrastructure work -- see cron-runner.ts for why
 // node-cron (not BullMQ) and what "later" means concretely.

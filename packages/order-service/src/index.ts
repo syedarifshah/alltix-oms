@@ -1,6 +1,12 @@
+import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import * as zipcodes from "zipcodes";
-import { withTenant, recordAuditEvent } from "@alltix/db";
+import {
+  withTenant,
+  recordAuditEvent,
+  claimInventoryEventIdempotencyKey,
+  claimInventoryEventIdempotencyKeyOrThrow,
+} from "@alltix/db";
 import {
   DomainEvent,
   InProcessEventBus,
@@ -453,15 +459,33 @@ export class OrderService {
         // §2.2: "reserved -= delta"); releasing needs the positive
         // magnitude being given back.
         const releaseQuantity = -row.quantity_delta;
-        const inserted = await client.query<{ id: string }>(
-          `INSERT INTO inventory_events
-             (tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
-           VALUES ($1, $2, $3, 'release', $4, 'order', $5, $6)
-           ON CONFLICT (idempotency_key) DO NOTHING
-           RETURNING id`,
-          [tenantId, row.product_id, row.location_id, releaseQuantity, orderId, `order-cancellation:${orderId}:${row.id}`],
+        // True idempotency now lives on inventory_event_idempotency_keys,
+        // not a table-level UNIQUE constraint -- inventory_events is
+        // partitioned by created_at and can no longer carry one. See
+        // packages/db/src/inventory-event-idempotency.ts's own doc comment.
+        // A duplicate key claims/applies nothing, same as the old
+        // `ON CONFLICT (idempotency_key) DO NOTHING RETURNING id` shape.
+        const releaseEventId = randomUUID();
+        const claimed = await claimInventoryEventIdempotencyKey(
+          client,
+          `order-cancellation:${orderId}:${row.id}`,
+          releaseEventId,
         );
-        if (inserted.rows[0]) {
+        if (claimed) {
+          await client.query(
+            `INSERT INTO inventory_events
+               (id, tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
+             VALUES ($1, $2, $3, $4, 'release', $5, 'order', $6, $7)`,
+            [
+              releaseEventId,
+              tenantId,
+              row.product_id,
+              row.location_id,
+              releaseQuantity,
+              orderId,
+              `order-cancellation:${orderId}:${row.id}`,
+            ],
+          );
           await client.query(
             `UPDATE inventory_levels SET reserved = reserved - $1, updated_at = now()
                WHERE product_id = $2 AND location_id = $3`,
@@ -587,15 +611,29 @@ export class OrderService {
         // dropped when it shipped) -- restocking needs the positive
         // magnitude being given back.
         const restockQuantity = -row.quantity_delta;
-        const inserted = await client.query<{ id: string }>(
-          `INSERT INTO inventory_events
-             (tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
-           VALUES ($1, $2, $3, 'receipt', $4, 'return', $5, $6)
-           ON CONFLICT (idempotency_key) DO NOTHING
-           RETURNING id`,
-          [tenantId, row.product_id, row.location_id, restockQuantity, orderId, `order-return:${orderId}:${row.id}`],
+        // Same sidecar-table idempotency claim as the cancellation-release
+        // branch above -- see that branch's own comment.
+        const restockEventId = randomUUID();
+        const claimed = await claimInventoryEventIdempotencyKey(
+          client,
+          `order-return:${orderId}:${row.id}`,
+          restockEventId,
         );
-        if (inserted.rows[0]) {
+        if (claimed) {
+          await client.query(
+            `INSERT INTO inventory_events
+               (id, tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
+             VALUES ($1, $2, $3, $4, 'receipt', $5, 'return', $6, $7)`,
+            [
+              restockEventId,
+              tenantId,
+              row.product_id,
+              row.location_id,
+              restockQuantity,
+              orderId,
+              `order-return:${orderId}:${row.id}`,
+            ],
+          );
           await client.query(
             `UPDATE inventory_levels SET on_hand = on_hand + $1, updated_at = now()
                WHERE product_id = $2 AND location_id = $3`,
@@ -818,11 +856,25 @@ export class OrderService {
       }
 
       for (const line of lines.rows) {
+        // This should never legitimately fire twice for the same order
+        // line under the same allocation attempt -- claim (or throw) via
+        // the sidecar table, same "genuine duplicate is a real bug worth
+        // crashing loudly on" contract the old unguarded UNIQUE constraint
+        // on inventory_events.idempotency_key already gave this call site.
+        // See packages/db/src/inventory-event-idempotency.ts's own doc
+        // comment.
+        const reservationEventId = randomUUID();
+        await claimInventoryEventIdempotencyKeyOrThrow(
+          client,
+          `order-allocation:${orderId}:${line.id}`,
+          reservationEventId,
+        );
         await client.query(
           `INSERT INTO inventory_events
-             (tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
-           VALUES ($1, $2, $3, 'reservation', $4, 'order', $5, $6)`,
+             (id, tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
+           VALUES ($1, $2, $3, $4, 'reservation', $5, 'order', $6, $7)`,
           [
+            reservationEventId,
             tenantId,
             line.product_id,
             chosenLocationId,

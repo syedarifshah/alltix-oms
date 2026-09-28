@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
-import { withTenant, recordAuditEvent } from "@alltix/db";
+import {
+  withTenant,
+  recordAuditEvent,
+  claimInventoryEventIdempotencyKey,
+  claimInventoryEventIdempotencyKeyOrThrow,
+} from "@alltix/db";
 import {
   DomainEvent,
   InProcessEventBus,
@@ -177,22 +182,30 @@ export class InventoryService {
     const { onHandDelta, reservedDelta } = columnDeltasFor(eventType, quantityDelta);
 
     const outcome = await withTenant(this.pool, tenantId, async (client) => {
-      const inserted = await client.query<{ id: string }>(
-        `INSERT INTO inventory_events
-           (tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (idempotency_key) DO NOTHING
-         RETURNING id`,
-        [tenantId, productId, locationId, eventType, quantityDelta, referenceType, referenceId, idempotencyKey],
-      );
-
-      const eventRow = inserted.rows[0];
-      if (!eventRow) {
+      // True global idempotency now lives on inventory_event_idempotency_keys,
+      // not a UNIQUE constraint on inventory_events itself -- partitioning
+      // that table by created_at means it can no longer carry one. See
+      // packages/db/src/inventory-event-idempotency.ts's own doc comment for
+      // the full reasoning. Claiming first (before the real row exists) and
+      // pre-generating the id keeps the externally-observed contract
+      // identical to the old `ON CONFLICT (idempotency_key) DO NOTHING
+      // RETURNING id` shape: a duplicate key claims nothing, applies
+      // nothing, same as before.
+      const eventId = randomUUID();
+      const claimed = await claimInventoryEventIdempotencyKey(client, idempotencyKey, eventId);
+      if (!claimed) {
         // Already applied by an earlier call with this same idempotency
         // key -- inventory_levels was already updated then, so touching it
         // again here would double-apply the delta.
         return { applied: false as const, eventId: null, levels: null };
       }
+
+      await client.query(
+        `INSERT INTO inventory_events
+           (id, tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [eventId, tenantId, productId, locationId, eventType, quantityDelta, referenceType, referenceId, idempotencyKey],
+      );
 
       const levels = await client.query<{ on_hand: number; reserved: number; available: number }>(
         `INSERT INTO inventory_levels (tenant_id, product_id, location_id, on_hand, reserved)
@@ -205,7 +218,7 @@ export class InventoryService {
         [tenantId, productId, locationId, onHandDelta, reservedDelta],
       );
 
-      return { applied: true as const, eventId: eventRow.id, levels: levels.rows[0]! };
+      return { applied: true as const, eventId, levels: levels.rows[0]! };
     });
 
     // Published after the transaction above has committed -- see this
@@ -346,11 +359,24 @@ export class InventoryService {
 
       const transferId = randomUUID();
 
+      // Claims outboundKey/inboundKey against inventory_event_idempotency_keys
+      // BEFORE the real inventory_events rows exist -- no ON CONFLICT here,
+      // deliberately: a genuine duplicate (a real race between two truly
+      // concurrent calls with the same idempotencyKey, both passing the
+      // pre-check above before either commits) should still throw and abort
+      // the whole transaction, exactly like the old table-level UNIQUE
+      // constraint on inventory_events.idempotency_key already did -- see
+      // packages/db/src/inventory-event-idempotency.ts's own doc comment.
+      const outboundEventId = randomUUID();
+      const inboundEventId = randomUUID();
+      await claimInventoryEventIdempotencyKeyOrThrow(client, outboundKey, outboundEventId);
+      await claimInventoryEventIdempotencyKeyOrThrow(client, inboundKey, inboundEventId);
+
       await client.query(
         `INSERT INTO inventory_events
-           (tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
-         VALUES ($1, $2, $3, 'transfer', $4, 'transfer', $5, $6)`,
-        [tenantId, productId, fromLocationId, -quantity, transferId, outboundKey],
+           (id, tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
+         VALUES ($1, $2, $3, $4, 'transfer', $5, 'transfer', $6, $7)`,
+        [outboundEventId, tenantId, productId, fromLocationId, -quantity, transferId, outboundKey],
       );
       // A plain UPDATE, not the upsert `recordInventoryEvent` uses for its
       // single-location writes -- the sufficiency check above already
@@ -366,9 +392,9 @@ export class InventoryService {
 
       await client.query(
         `INSERT INTO inventory_events
-           (tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
-         VALUES ($1, $2, $3, 'transfer', $4, 'transfer', $5, $6)`,
-        [tenantId, productId, toLocationId, quantity, transferId, inboundKey],
+           (id, tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
+         VALUES ($1, $2, $3, $4, 'transfer', $5, 'transfer', $6, $7)`,
+        [inboundEventId, tenantId, productId, toLocationId, quantity, transferId, inboundKey],
       );
       // Upsert here, unlike the source: the destination may be receiving
       // its first-ever stock for this product, exactly the "first event

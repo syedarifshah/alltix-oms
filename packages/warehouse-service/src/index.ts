@@ -1,5 +1,6 @@
+import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
-import { withTenant, recordAuditEvent } from "@alltix/db";
+import { withTenant, recordAuditEvent, claimInventoryEventIdempotencyKeyOrThrow } from "@alltix/db";
 import {
   DomainEvent,
   InProcessEventBus,
@@ -748,11 +749,24 @@ export class WarehouseService {
           continue;
         }
 
+        // This should never legitimately fire twice for the same order
+        // line -- claim (or throw) via the sidecar table, same "genuine
+        // duplicate is a real bug worth crashing loudly on" contract the
+        // old unguarded UNIQUE constraint on inventory_events.idempotency_key
+        // already gave this call site. See
+        // packages/db/src/inventory-event-idempotency.ts's own doc comment.
+        const shortfallEventId = randomUUID();
+        await claimInventoryEventIdempotencyKeyOrThrow(
+          client,
+          `pack-shortfall:${orderId}:${line.id}`,
+          shortfallEventId,
+        );
         await client.query(
           `INSERT INTO inventory_events
-             (tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
-           VALUES ($1, $2, $3, $4, $5, 'order', $6, $7)`,
+             (id, tenant_id, product_id, location_id, event_type, quantity_delta, reference_type, reference_id, idempotency_key)
+           VALUES ($1, $2, $3, $4, $5, $6, 'order', $7, $8)`,
           [
+            shortfallEventId,
             tenantId,
             line.product_id,
             locationId,

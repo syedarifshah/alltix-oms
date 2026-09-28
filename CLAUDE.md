@@ -265,12 +265,66 @@ return form (`POST /api/orders/[id]/return`, separate from the generic `/transit
 route the same way `/cancel` is) rather than a plain button, since the disposition choice
 can't be expressed as a fixed `to` value.
 
-**Retrofit risk at the top of the target range**: a tenant near 50,000 orders/month
-(§0) can generate 100k+ `inventory_events` rows/month on its own, before
-receipts/adjustments/transfers are counted. An unpartitioned, unarchived ledger table
-is the same "expensive to retrofit later" category as RLS (§11, item 6) — not
-implemented now, but a decision point to revisit before it becomes urgent. Monthly range
-partitioning on `created_at` is the likely approach when it's needed.
+**Retrofit risk at the top of the target range — built** (migration
+`0044_inventory_events_partitioning.sql`): this paragraph used to say monthly
+range partitioning was "the likely approach when it's needed" — it's needed
+now, real contracts with a few large companies and 30,000+ orders/week
+expected (well past the ~50,000 orders/month threshold this paragraph itself
+named), and doing it now, while the table is still comparatively small, is
+materially cheaper and safer than retrofitting it onto an already-grown,
+already-live production table — the same lesson this codebase already
+learned twice from the RLS bug in §18.
+
+- **Mechanism**: `inventory_events` is now `PARTITION BY RANGE (created_at)`,
+  monthly partitions, converted in place from the existing plain table (rename
+  the old table and its named indexes/constraints out of the way, create the
+  new partitioned table directly under the freed `inventory_events` name,
+  copy every row across in one `INSERT ... SELECT` — the old table survives,
+  archived as `inventory_events_pre_partition_20260928`, never dropped, same
+  "the ledger should show why" caution §3 applies to order cancellation). A
+  `DEFAULT` partition is a backstop (data landing there is still fully correct
+  and queryable, just without partition-pruning benefit) — the real ongoing
+  mechanism is `ensureInventoryEventPartitions`
+  (`packages/scheduler/src/index.ts`), run daily via
+  `GET /api/cron/inventory-partition-maintenance` (`vercel.json`), which keeps
+  a real monthly partition ready 3 months ahead of "now" at all times.
+- **The idempotency-key fix, the actual hard part**: Postgres requires every
+  unique constraint on a partitioned table to include the partition key, so
+  `idempotency_key TEXT UNIQUE` could not simply become
+  `UNIQUE (idempotency_key, created_at)` — that would silently stop catching a
+  redelivered/retried event that lands in a DIFFERENT calendar month than the
+  original, exactly the double-application bug §4.4's own "handlers must be
+  safe to run twice" promise exists to prevent. Fixed with a small,
+  deliberately NOT partitioned sidecar table,
+  `inventory_event_idempotency_keys`, whose own `PRIMARY KEY (idempotency_key)`
+  is the one place true, table-wide uniqueness is still enforced, independent
+  of which partition the real event lands in. Two shared helper functions
+  (`claimInventoryEventIdempotencyKey`/`claimInventoryEventIdempotencyKeyOrThrow`,
+  `packages/db/src/inventory-event-idempotency.ts`) preserve each of this
+  table's 7 real write call sites' EXACT prior behavior (silent-skip-on-duplicate
+  vs. throw-on-duplicate) rather than inventing one new uniform behavior — see
+  that file's own doc comment for exactly which call sites use which.
+- **A minor, non-functional naming artifact, left as-is rather than chased
+  down**: the two CHECK constraints and two foreign keys on the new
+  partitioned table carry an auto-generated `_check1`/`_fkey1` suffix
+  (Postgres detected a name collision against the archived old table's own
+  unrenamed CHECK/FK constraints when generating the new ones). The
+  constraint logic itself is fully intact and enforced either way — confirmed
+  directly via `psql`, not just assumed — this is cosmetic only.
+- **Tested/Verified**: applied cleanly against real local Postgres 16
+  (`npm run db:migrate`), with the resulting schema inspected directly via
+  `psql` (partitioned table structure, RLS policy, partition list, lossless
+  data migration, correct sidecar table population). A dedicated smoke test
+  (`packages/db/test/inventory-event-partitioning.test.ts`, wired into
+  `scripts/run-tests.sh`'s `SAFE_TESTS`) proves the property this whole
+  design exists for: a duplicate `idempotency_key` is rejected even with a
+  different `inventory_event_id`, a real event lands in the correct
+  current-month partition, a simulated future-dated redelivery of the same
+  key is still rejected (proving uniqueness is NOT scoped by
+  partition/`created_at`), the throw-on-duplicate variant genuinely throws a
+  real `23505 unique_violation`, and exactly 1 of 10 concurrent claims of the
+  same key succeeds. `npm run typecheck --workspaces`, `next build`, and
+  `bash scripts/run-tests.sh` (all 67 test files) all clean.
 
 ### 2.3 Orders
 
@@ -2852,6 +2906,29 @@ eBay/Temu v1" scope decision.
 - **Disaster recovery**: point-in-time DB recovery (Postgres WAL), event bus replay
   capability to reconstruct inventory state after an incident rather than trusting a
   single mutable snapshot.
+- **Vercel Hobby's once-daily cron cap — a live constraint, not yet resolved, with a
+  ready-to-apply fix documented here rather than in code**: this app's real
+  deployment (§5) currently runs on Vercel's Hobby plan, which rejects any
+  `vercel.json` cron entry more frequent than once per day at deploy time — every
+  `crons` entry today (9 of them as of the `inventory-partition-maintenance` addition:
+  `rate-limit-window-cleanup`, `amazon-order-sync`, `shopify-catalog-sync`,
+  `shopify-order-sync`, `walmart-order-sync`, `ebay-order-sync`, `temu-order-sync`,
+  `tiktok-order-sync`, `inventory-partition-maintenance`) is staggered across a single
+  day, once each, purely because of this cap — not because once/day is the right
+  cadence for a tenant with real contracts and 30,000+ orders/week (§2.2's own
+  partitioning update). Every one of those channels' own sync jobs is otherwise ready
+  to run far more often today — nothing about `syncXOrders`/`runXOrderSyncJob` assumes
+  a daily cadence, it's purely the `vercel.json` schedule string holding them back.
+  **The fix, when Arif upgrades off Hobby (Pro or higher lifts this cap)**: change each
+  order-sync cron's own `schedule` from its current once-daily entry to something in
+  the 5-15 minute range (e.g. `"*/10 * * * *"`), keeping each channel's own distinct
+  minute offset so they still don't all fire in the same tick and contend for the same
+  rate-limited connections at once (§4.4). `rate-limit-window-cleanup` and
+  `inventory-partition-maintenance` should both stay daily regardless of plan — neither
+  benefits from running more often (a 24-hour retention sweep and a 3-months-ahead
+  partition check are both inherently slow-moving). This is a one-line-per-route
+  `vercel.json` edit at that point, not a code change — flagged here, not applied now,
+  since applying it today would fail deployment outright under the current plan.
 
 ## 10. Team & Realistic Timeline
 
