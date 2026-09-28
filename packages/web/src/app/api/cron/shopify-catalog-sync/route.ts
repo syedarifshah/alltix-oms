@@ -27,9 +27,12 @@ export const maxDuration = 60;
  * Safe to invoke more than once concurrently or in quick succession: the
  * product/channel_listings upserts key on their own UNIQUE constraints,
  * and the baseline-stock receipt is idempotent on (tenant, channel, sku) --
- * see syncShopifyCatalogForConnection's doc comment (also documenting a
- * real, deliberately open cross-store SKU-collision risk now that a tenant
- * can connect more than one Shopify store).
+ * see syncShopifyCatalogForConnection's doc comment, which also now
+ * documents CLAUDE.md §4.5.5's own SKU-namespace-collision detection
+ * (resolveShopifyProductIdentity) -- a tenant with two connected Shopify
+ * stores that genuinely share a SKU across two different products no
+ * longer silently merges them; skuCollisionsDetected below surfaces how
+ * often that happened on this run.
  */
 export async function GET(req: NextRequest): Promise<Response> {
   const authHeader = req.headers.get("authorization");
@@ -58,5 +61,6 @@ export async function GET(req: NextRequest): Promise<Response> {
     succeeded,
     failed: failed.length,
     variantsUpserted: results.reduce((sum, r) => sum + r.variantsUpserted, 0),
+    skuCollisionsDetected: results.reduce((sum, r) => sum + r.skuCollisionsDetected, 0),
   });
 }

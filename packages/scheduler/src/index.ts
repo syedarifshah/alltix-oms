@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { withTenant } from "@alltix/db";
 import { InProcessEventBus, type EventBus, captureAlert, sendEmail } from "@alltix/shared";
 import {
@@ -1178,6 +1178,12 @@ export interface CatalogSyncResult {
    *  now that catalog sync discovers per-connection, mirroring
    *  TenantSyncResult's own optional field (see its doc comment). */
   connectionId?: string;
+  /** How many variants this run resolved via the SKU-namespace-collision
+   *  path (resolveShopifyProductIdentity's own doc comment) instead of the
+   *  ordinary merge-by-SKU path -- 0 for the overwhelming common case.
+   *  Surfaced here, not just logged, so a real collision is visible in
+   *  this job's own return value/reporting, not only in server logs. */
+  skuCollisionsDetected: number;
 }
 
 export interface SyncShopifyCatalogParams {
@@ -1252,46 +1258,178 @@ export async function runShopifyCatalogSyncJob(appPool: Pool, adminPool: Pool): 
  * external_id = the variant's InventoryItem gid -- distinct per variant, so
  * two different SKUs never collide the way two empty external_ids would).
  *
- * **A real, deliberately NOT closed gap this pass's own multi-store support
- * surfaces for the first time**: `internal_sku` is still "shopify-<sku>",
- * keyed by tenant + SKU string only, NOT by which store the SKU came from --
- * unchanged from before this pass, on purpose, since namespacing it by
- * connection would change the internal_sku (and therefore the
- * already-allocated inventory mapping) for every existing single-store
- * tenant, the overwhelming common case, to fix a collision that can only
- * happen once a tenant has genuinely connected a SECOND Shopify store. If a
- * tenant's two stores happen to share a literal SKU string for two actually
- * DIFFERENT products, this will incorrectly merge them into one
- * products/inventory row instead of two -- a real bug, not a theoretical
- * one, left open here the same "flag it, don't hide it" way this codebase
- * flags every other unconfirmed/risky shortcut (e.g. Temu's
- * skuStockTargetList, DHL's request shape). A tenant in that situation needs
- * to rename one store's conflicting SKU before connecting a second store to
- * this app, or this needs a real compound-key redesign (a bigger, separate
- * piece of work, not attempted here) -- `channel_listings` rows themselves
- * never collide (external_id is the variant's own globally-unique gid), so
- * this is specifically a `products.internal_sku` risk, not a
- * `channel_listings` one.
+ * **The SKU-namespace-collision gap this pass's own multi-store support
+ * originally surfaced is now closed, see resolveShopifyProductIdentity's own
+ * doc comment for the full mechanism (CLAUDE.md §4.5.1's own flagged gap,
+ * closed via the redesign described there)**: `internal_sku` still defaults
+ * to "shopify-<sku>" for the overwhelming common case (a single-store
+ * tenant, or a second store that deliberately cross-lists the SAME physical
+ * product under a shared SKU) -- unchanged, so nothing about an existing
+ * single-store tenant's already-allocated inventory mapping moves. Only when
+ * a genuine collision is DETECTED (a SKU already tied to a different,
+ * active connection reports a materially different product title) does this
+ * mint a new, connection-namespaced internal_sku instead of silently
+ * merging two different products into one -- see
+ * resolveShopifyProductIdentity's own doc comment for exactly how that
+ * detection works and its own honest limits. `channel_listings` rows
+ * themselves never collided either way (external_id is the variant's own
+ * globally-unique gid) -- this was always specifically a
+ * `products.internal_sku` risk, not a `channel_listings` one.
  *
  * Baseline stock is seeded via InventoryService.recordInventoryEvent with
- * idempotency_key = "catalog-onboarding:<tenantId>:shopify:<sku>" --
- * DELIBERATELY the same key prefix scripts/add-channel-listing.ts's own
- * manual seeding uses, not a separate "catalog-sync:" prefix: idempotency_key
- * is UNIQUE across the whole inventory_events table regardless of which
- * script or job wrote it, so a SKU a human already onboarded by hand stays
- * at whatever quantity they entered -- this job's own attempt to seed a
- * baseline for that same SKU correctly becomes a no-op instead of adding a
- * second, conflicting "initial" receipt on top of real, already-allocated
- * stock. Every subsequent run of this job (for a SKU it or the manual
- * script already baselined) only re-upserts the product/listing rows --
- * cheap and idempotent on their own UNIQUE constraints -- without touching
- * inventory again: this tenant's own ledger (orders, allocations, manual
+ * idempotency_key = "catalog-onboarding:<tenantId>:shopify:<sku>" for the
+ * ordinary (non-collision) case -- DELIBERATELY the same key prefix
+ * scripts/add-channel-listing.ts's own manual seeding uses, not a separate
+ * "catalog-sync:" prefix: idempotency_key is UNIQUE across the whole
+ * inventory_events table regardless of which script or job wrote it, so a
+ * SKU a human already onboarded by hand stays at whatever quantity they
+ * entered -- this job's own attempt to seed a baseline for that same SKU
+ * correctly becomes a no-op instead of adding a second, conflicting
+ * "initial" receipt on top of real, already-allocated stock. Every
+ * subsequent run of this job (for a SKU it or the manual script already
+ * baselined) only re-upserts the product/listing rows -- cheap and
+ * idempotent on their own UNIQUE constraints -- without touching inventory
+ * again: this tenant's own ledger (orders, allocations, manual
  * pushInventory) is the ongoing source of truth after the first baseline,
- * not Shopify's currently-reported quantity. This same tenant+SKU-only key
- * shape carries the identical cross-store collision risk described above --
- * a second store's own catalog sync for a colliding SKU is treated as
- * "already baselined," not a second, genuinely distinct product.
+ * not Shopify's currently-reported quantity. On the collision path, the
+ * idempotency key is namespaced the identical way `internal_sku` itself
+ * is (see resolveShopifyProductIdentity), so a genuinely distinct second
+ * product gets its own real baseline instead of being silently treated as
+ * "already baselined" under the first store's own key.
  */
+
+/** Builds a short, SKU-safe slug from a Shopify store's own domain
+ *  (channel_connections.external_account_id, e.g.
+ *  "my-store.myshopify.com") -- only ever used on the genuine-collision
+ *  path inside resolveShopifyProductIdentity, never for the common case,
+ *  so a tenant who never hits a collision never sees this string anywhere.
+ *  Strips the ".myshopify.com" suffix (redundant once "this is a Shopify
+ *  store" is already implied), lowercases, and collapses every run of
+ *  non-alphanumeric characters to a single "-". Deliberately permissive,
+ *  not a strict domain validator -- a malformed value here should degrade
+ *  to an ugly-but-stable slug, never throw and block a real sync; a blank
+ *  result (a domain that's ALL punctuation, or missing) falls back to the
+ *  literal word "store" rather than an empty string, so the namespaced SKU
+ *  this feeds into is never left with a bare trailing/leading "shopify--sku". */
+export function slugifyShopifyStoreDomain(externalAccountId: string): string {
+  const withoutSuffix = externalAccountId.trim().toLowerCase().replace(/\.myshopify\.com$/, "");
+  const slug = withoutSuffix.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return slug || "store";
+}
+
+/** True when two Shopify product titles should be treated as describing
+ *  "the same product" for resolveShopifyProductIdentity's own
+ *  collision-detection purposes -- exact match after trimming and
+ *  lowercasing, deliberately NOT fuzzy. A near-miss title (a typo fix, a
+ *  seasonal rename) is exactly the ambiguous case this function should
+ *  surface as a possible collision rather than silently paper over by
+ *  guessing "close enough" -- see resolveShopifyProductIdentity's own doc
+ *  comment for how that ambiguity is actually resolved (a title match
+ *  alone isn't sufficient either; a foreign-connection check gates it). */
+export function titlesLikelySameProduct(a: string, b: string): boolean {
+  return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
+export interface ResolvedShopifyProductIdentity {
+  internalSku: string;
+  /** True when this resolution minted a NEW, connection-namespaced SKU
+   *  because of a detected cross-store collision, rather than resolving to
+   *  the ordinary "shopify-<sku>" default -- purely informational, used by
+   *  the caller to log/count the occurrence (CatalogSyncResult's own
+   *  skuCollisionsDetected field) so a real collision is visible, not
+   *  silently invisible the way it was before this function existed. */
+  isNamespacedForCollision: boolean;
+}
+
+/**
+ * Resolves which `products.internal_sku` a given Shopify variant should be
+ * upserted under -- closes CLAUDE.md §4.5.1's own flagged "SKU-namespace
+ * collision" gap: two different connected Shopify stores sharing a literal
+ * SKU string for two actually DIFFERENT products used to silently merge
+ * into one products/inventory row, since `internal_sku` defaulted to
+ * "shopify-<sku>" with no per-store namespacing at all.
+ *
+ * Deliberately does NOT namespace by connection for the overwhelming common
+ * case -- a single-store tenant (the only case that existed before
+ * multi-store support), or a second store that deliberately cross-lists the
+ * SAME physical product under a shared SKU (a real, desirable pattern: one
+ * inventory pool across both storefronts, not two). Namespacing
+ * unconditionally would change `internal_sku` -- and therefore the
+ * already-allocated inventory mapping -- for every existing tenant to guard
+ * against a collision that can only happen once a tenant has genuinely
+ * connected a second store, which is exactly the retrofit this function
+ * avoids.
+ *
+ * **Why title comparison is the detection signal, and its own honest
+ * limit**: there is no way to tell, from the SKU string alone, whether two
+ * stores sharing a SKU means "the same physical product, deliberately
+ * cross-listed" or "two unrelated products that happen to share a SKU
+ * string." Shopify's own product TITLE is the best signal this codebase has
+ * for telling those apart without asking the tenant directly: an exact
+ * match (titlesLikelySameProduct, case/whitespace-insensitive) is treated
+ * as the same product -- merge as before, no namespacing. A real mismatch
+ * is treated as a genuine collision ONLY when that SKU is already tied to a
+ * DIFFERENT, known `channel_connection_id` (a title that merely changed on
+ * the SAME store, or a product with no connection attribution at all --
+ * e.g. one seeded by scripts/add-channel-listing.ts before migration 0043
+ * -- is not evidence of a cross-store collision, and keeps updating in
+ * place exactly like before this function existed). This heuristic can
+ * still be wrong in both directions -- two genuinely different products
+ * that happen to share both a SKU AND an identical title would still
+ * incorrectly merge, and a tenant who intentionally reuses a SKU across
+ * stores for the same product but titles it slightly differently per store
+ * would get unnecessarily namespaced into two products -- a perfect
+ * disambiguation isn't possible from this data alone; this materially
+ * narrows the real, non-theoretical risk CLAUDE.md §4.5.1 flagged, it
+ * doesn't claim to eliminate it outright.
+ *
+ * Deliberately does NOT retroactively rename/split an already-merged
+ * product -- this only changes what happens for a variant not yet resolved
+ * to an existing product under the base SKU. A tenant who already has two
+ * genuinely different products silently merged together (the exact
+ * pre-existing bug this closes going forward) needs to split them by hand;
+ * their `inventory_events`/`order_lines` already reference the shared
+ * `product_id`, and safely un-merging an already-corrupted product is a
+ * materially different, riskier piece of work than preventing a new one --
+ * not attempted here.
+ */
+export async function resolveShopifyProductIdentity(
+  client: PoolClient,
+  tenantId: string,
+  connectionId: string,
+  connectionDomainSlug: string,
+  externalSku: string,
+  variantTitle: string,
+): Promise<ResolvedShopifyProductIdentity> {
+  const baseInternalSku = `shopify-${externalSku}`;
+  const existing = await client.query<{ id: string; name: string }>(
+    `SELECT id, name FROM products WHERE tenant_id = $1 AND internal_sku = $2`,
+    [tenantId, baseInternalSku],
+  );
+  const existingProduct = existing.rows[0];
+  if (!existingProduct || titlesLikelySameProduct(existingProduct.name, variantTitle)) {
+    // No product under this SKU yet (nothing to collide with), or the
+    // title matches -- same product, ordinary merge-by-SKU path.
+    return { internalSku: baseInternalSku, isNamespacedForCollision: false };
+  }
+  // Titles differ. Only a genuine collision if that SKU is ALREADY tied to
+  // a DIFFERENT, known connection -- see this function's own doc comment.
+  const foreignConnection = await client.query(
+    `SELECT 1 FROM channel_listings
+      WHERE tenant_id = $1 AND product_id = $2 AND channel = 'shopify'
+        AND channel_connection_id IS NOT NULL AND channel_connection_id != $3
+      LIMIT 1`,
+    [tenantId, existingProduct.id, connectionId],
+  );
+  if (foreignConnection.rows.length === 0) {
+    return { internalSku: baseInternalSku, isNamespacedForCollision: false };
+  }
+  return {
+    internalSku: `shopify-${connectionDomainSlug}-${externalSku}`,
+    isNamespacedForCollision: true,
+  };
+}
+
 async function syncShopifyCatalogForConnection(
   appPool: Pool,
   inventoryService: InventoryService,
@@ -1335,21 +1473,42 @@ async function syncShopifyCatalogForConnection(
     // failure, same as before -- it's cross-run tracking/alerting
     // specifically that's still an open gap here, deliberately, not fixed
     // by this change.
-    return { tenantId, connectionId, success: false, variantsUpserted: 0, error: message };
+    return { tenantId, connectionId, success: false, variantsUpserted: 0, error: message, skuCollisionsDetected: 0 };
   }
 
+  // Fetched once per connection, not per variant -- only used by
+  // resolveShopifyProductIdentity's own collision-detection path below, so
+  // a tenant who never hits a collision pays no extra per-variant cost for
+  // it beyond this one query. withTenant (not a bare appPool.query) since
+  // channel_connections' own RLS policy requires app.tenant_id to be set.
+  const connectionDomainSlug = await withTenant(appPool, tenantId, async (client) => {
+    const row = await client.query<{ external_account_id: string }>(
+      `SELECT external_account_id FROM channel_connections WHERE id = $1 AND channel = 'shopify'`,
+      [connectionId],
+    );
+    return slugifyShopifyStoreDomain(row.rows[0]?.external_account_id ?? connectionId);
+  });
+
   let variantsUpserted = 0;
+  let skuCollisionsDetected = 0;
   for (const variant of variants) {
     try {
-      const internalSku = `shopify-${variant.externalSku}`;
+      const { productId, locationId, internalSku, isNamespacedForCollision } = await withTenant(appPool, tenantId, async (client) => {
+        const resolved = await resolveShopifyProductIdentity(
+          client,
+          tenantId,
+          connectionId,
+          connectionDomainSlug,
+          variant.externalSku,
+          variant.title,
+        );
 
-      const { productId, locationId } = await withTenant(appPool, tenantId, async (client) => {
         const product = await client.query<{ id: string }>(
           `INSERT INTO products (tenant_id, internal_sku, name)
            VALUES ($1, $2, $3)
            ON CONFLICT (tenant_id, internal_sku) DO UPDATE SET name = EXCLUDED.name
            RETURNING id`,
-          [tenantId, internalSku, variant.title],
+          [tenantId, resolved.internalSku, variant.title],
         );
         const productId = product.rows[0]!.id;
 
@@ -1389,8 +1548,26 @@ async function syncShopifyCatalogForConnection(
               )
             ).rows[0]!.id;
 
-        return { productId, locationId };
+        return { productId, locationId, internalSku: resolved.internalSku, isNamespacedForCollision: resolved.isNamespacedForCollision };
       });
+
+      if (isNamespacedForCollision) {
+        skuCollisionsDetected++;
+        console.warn(
+          `Shopify catalog sync: SKU collision detected for tenant ${tenantId}, connection ${connectionId} -- ` +
+            `sku '${variant.externalSku}' has a different product title than the existing 'shopify-${variant.externalSku}' ` +
+            `product from another connected store, so it was onboarded separately as '${internalSku}' instead of merged. ` +
+            "If this is actually the SAME physical product, rename one store's SKU to match, or merge the product records by hand.",
+        );
+      }
+
+      // Namespaced identically to internalSku itself on the collision path
+      // -- see resolveShopifyProductIdentity's own doc comment and this
+      // function's own doc comment on why the ordinary (non-collision) key
+      // stays byte-for-byte unchanged from before this pass.
+      const idempotencyKey = isNamespacedForCollision
+        ? `catalog-onboarding:${tenantId}:shopify:${connectionDomainSlug}:${variant.externalSku}`
+        : `catalog-onboarding:${tenantId}:shopify:${variant.externalSku}`;
 
       await inventoryService.recordInventoryEvent({
         tenantId,
@@ -1399,7 +1576,7 @@ async function syncShopifyCatalogForConnection(
         eventType: "receipt",
         quantityDelta: variant.totalAvailable,
         referenceType: "manual",
-        idempotencyKey: `catalog-onboarding:${tenantId}:shopify:${variant.externalSku}`,
+        idempotencyKey,
       });
 
       variantsUpserted++;
@@ -1422,6 +1599,7 @@ async function syncShopifyCatalogForConnection(
     success: true,
     variantsUpserted,
     error: null,
+    skuCollisionsDetected,
   };
 }
 

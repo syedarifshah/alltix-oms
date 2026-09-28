@@ -1206,7 +1206,8 @@ eBay/Temu v1" scope decision.
   comment, not solved here; a tenant in that situation needs to avoid the collision at
   the source (rename one store's SKU) until a real compound-key redesign is done as its
   own separate piece of work. `channel_listings` rows themselves never collide
-  (`external_id` is the variant's own globally-unique gid).
+  (`external_id` is the variant's own globally-unique gid). **Update — this gap is
+  now closed, see §4.5.6.**
 - **`orders.channel_connection_id`** (already added generically by migration 0037 for
   TikTok's own pass, no new migration needed here): now also stamped by Shopify's own
   per-connection cron sync path (via `persistPulledOrders`'s existing optional third
@@ -1560,8 +1561,9 @@ eBay/Temu v1" scope decision.
   the route's own conservative guard exactly.
 - **What this does NOT solve, still deliberately out of scope**: the
   SKU-namespace-collision risk §4.5.1 itself already flagged (two stores under one
-  tenant sharing a literal SKU string) — unchanged, a genuinely separate, larger
-  redesign of `products.internal_sku` keying, not attempted here either.
+  tenant sharing a literal SKU string) — unchanged here, a genuinely separate,
+  larger redesign of `products.internal_sku` keying, not attempted in this pass.
+  **Update — this is now closed too, see §4.5.6.**
 - **Tested**: no new dedicated test file, same reasoning §4.5.4's own "Tested"
   paragraph already gives for a route-plus-page-level UI change with no new pure
   decision logic to extract — the catalog-sync stamping fix and the route's own
@@ -1582,6 +1584,106 @@ eBay/Temu v1" scope decision.
   confirmed as the same known resource-contention-under-full-parallel-load pattern
   §16/§19.4 already document, via a clean isolated re-run of each (3/3, 10/10) and
   a subsequent clean full-suite run).
+
+### 4.5.6 SKU-namespace-collision redesign — built, closing §4.5.1's own standing "real, deliberately open gap"
+
+- **Why**: with multi-store listings per product (§4.5.5) merged, the one remaining
+  named Shopify gap was the SKU-namespace-collision risk §4.5.1 itself flagged when
+  true multi-store CONNECT was first built: `products.internal_sku` defaulting to
+  `"shopify-<sku>"`, keyed by tenant + SKU string only, meant two connected Shopify
+  stores that happened to share a literal SKU for two actually DIFFERENT products
+  would silently merge into one `products`/inventory row. Arif's own explicit
+  instruction, given directly rather than via another AskUserQuestion round (the
+  prior round had already named this as one of only two remaining items, and the
+  other — multi-store listings per product — was picked and built first, §4.5.5):
+  **"tackle that next."**
+- **Why this couldn't just namespace every SKU by connection outright**: doing so
+  unconditionally would change `internal_sku` — and therefore the already-allocated
+  inventory mapping — for every existing tenant, including every single-store tenant
+  (the overwhelming common case), to guard against a collision that can only happen
+  once a tenant has genuinely connected a SECOND store. It would also break a real,
+  desirable pattern: a tenant who deliberately cross-lists the SAME physical product
+  on two stores under a shared SKU wants ONE inventory pool across both storefronts,
+  not two. A real fix had to distinguish "same SKU, same product, deliberately
+  cross-listed" from "same SKU, different product, a genuine collision" — not just
+  namespace blindly.
+- **The detection heuristic — Shopify's own product TITLE, with an honestly-stated
+  limit**: there is no way to tell, from the SKU string alone, which of those two
+  cases applies. `resolveShopifyProductIdentity()` (new, exported,
+  `packages/scheduler/src/index.ts`) uses the incoming variant's own title as the
+  disambiguating signal: an exact match (`titlesLikelySameProduct()`, new, exported,
+  case/whitespace-insensitive, deliberately NOT fuzzy — a near-miss title is exactly
+  the ambiguous case that should surface as a possible collision, not be papered
+  over) against the existing product's stored name means "same product," resolving
+  to the ordinary, unchanged `"shopify-<sku>"` — the base SKU already in use for
+  every single-store tenant and every genuine cross-listing today. A real title
+  mismatch is only treated as a genuine collision when that SKU is ALSO already tied
+  to a DIFFERENT, known `channel_connection_id` via an existing `channel_listings`
+  row (a retitle on the SAME store, or a product with no connection attribution at
+  all — e.g. one seeded by `scripts/add-channel-listing.ts` before migration 0043 —
+  is not evidence of a cross-store collision, and keeps updating in place exactly as
+  before this pass). Only on a real, detected collision does this mint a NEW,
+  connection-namespaced SKU (`"shopify-<store-domain-slug>-<sku>"`, via the new,
+  exported `slugifyShopifyStoreDomain()`) instead of merging into the other store's
+  product — deterministic and stable across re-syncs, since the same connection
+  resolving the same colliding SKU always slugifies to the same namespaced value.
+  **Honestly stated, not claimed as a perfect fix**: this heuristic can still be
+  wrong in both directions — two genuinely different products that happen to share
+  both a SKU AND an identical title would still incorrectly merge, and a tenant who
+  intentionally reuses a SKU for the same product but titles it slightly differently
+  per store would get unnecessarily namespaced into two products. This materially
+  narrows the real, non-theoretical risk §4.5.1 flagged; it doesn't claim to
+  eliminate it outright — the same disclosure standard this file already applies to
+  every other imperfect-but-real-improvement shortcut (e.g. Temu's `skuStockTargetList`,
+  DHL's request shape).
+- **Deliberately does NOT retroactively rename/split an already-merged product** —
+  this only changes what happens for a variant not yet resolved to an existing
+  product under the base SKU. A tenant who already has two genuinely different
+  products silently merged together (the exact pre-existing bug this closes going
+  forward) needs to split them by hand; their `inventory_events`/`order_lines`
+  already reference the shared `product_id`, and safely un-merging an
+  already-corrupted product is a materially different, riskier piece of work than
+  preventing a new one — not attempted here.
+- **The inventory-baseline idempotency key follows the same namespacing, for the
+  same reason**: on the ordinary (non-collision) path, `catalog-onboarding:
+  <tenantId>:shopify:<sku>` stays byte-for-byte unchanged — still the identical key
+  prefix `scripts/add-channel-listing.ts`'s own manual seeding uses, so nothing
+  about that established idempotency contract moved. On a detected collision, the
+  key gains the identical connection-domain-slug namespace `internal_sku` itself
+  gets, so the genuinely distinct second product gets its own real baseline receipt
+  instead of being silently treated as "already baselined" under the first store's
+  own key.
+- **`CatalogSyncResult` gained a new `skuCollisionsDetected: number` field** (0 for
+  the overwhelming common case), surfaced through `/api/cron/shopify-catalog-sync`'s
+  own JSON response — a real collision is now visible in this job's own
+  return value/reporting, not only inferable from a `console.warn` line buried in
+  server logs (which is also still emitted, unchanged, for the same event).
+- **No new migration** — this reuses `channel_listings.channel_connection_id`
+  (migration 0043, §4.5.5) exactly as already stamped by both the outbound listings
+  route and catalog sync's own upsert; the foreign-connection check this pass adds
+  is a read against that same column, not a new one.
+- **Tested**: `packages/scheduler/test/shopify-sku-collision.test.ts` (9 tests) —
+  `slugifyShopifyStoreDomain`'s/`titlesLikelySameProduct`'s own pure-function cases
+  (domain-suffix stripping, punctuation collapsing, the "store" fallback for a
+  blank/all-punctuation domain; exact-match-only title comparison), plus
+  `resolveShopifyProductIdentity()` against real seeded Postgres (mirroring
+  `shopify-multi-store.test.ts`'s own two-real-connections seeding shape): no
+  existing product resolves to the base SKU; a matching title resolves to the base
+  SKU even from a different connection (deliberate cross-listing, not namespaced); a
+  mismatched title on a SKU already tied to a different connection resolves to a
+  namespaced SKU with `isNamespacedForCollision: true`; a mismatched title with NO
+  foreign connection attached (either no `channel_listings` row at all, or one tied
+  to the SAME connection doing the resolving) stays on the base SKU, unnamespaced;
+  and the namespaced SKU is proven deterministic across two repeated resolutions of
+  the identical collision. Added to `scripts/run-tests.sh`'s `SAFE_TESTS`. Verified:
+  `npm run db:migrate` clean (no pending migration, as expected), `npm run
+  typecheck --workspaces` clean across all twelve workspaces (after rebuilding
+  `@alltix/scheduler`'s own `dist/` output so `packages/web` could see the new
+  `CatalogSyncResult.skuCollisionsDetected` field, same "packages/web consumes
+  dist, not source" precedent §19.4's own verification note already established),
+  `next build` clean (the updated `/api/cron/shopify-catalog-sync` route compiles),
+  `bash scripts/run-tests.sh` — all 66 test files pass (65 previous + the new
+  `shopify-sku-collision.test.ts`).
 
 ### 4.6 eBay Sell APIs (channel #4 — built once the connector abstraction had proven itself)
 
