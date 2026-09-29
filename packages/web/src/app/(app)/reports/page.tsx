@@ -8,6 +8,7 @@ import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
 import { AnalyticsIcon } from "@/components/icons";
 import { channelChartColor, channelLabel } from "@/lib/channel-badge";
+import { ChannelLogo } from "@/components/channel-logo";
 import { KpiTile } from "@/components/kpi-tile";
 import { DonutChart } from "@/components/charts/donut-chart";
 
@@ -379,7 +380,9 @@ export default async function ReportsPage({ searchParams }: ReportsPageProps): P
                 <tbody>
                   {salesByChannel.map((row) => (
                     <tr key={row.channel}>
-                      <td>{channelLabel(row.channel)}</td>
+                      <td>
+                        <ChannelLogo channel={row.channel} size={14} /> {channelLabel(row.channel)}
+                      </td>
                       <td>{row.order_count}</td>
                       <td>{row.units_sold}</td>
                       <td>{Number(row.revenue).toFixed(2)}</td>

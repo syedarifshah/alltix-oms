@@ -7,6 +7,7 @@ import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
 import { ALL_ORDER_STATUSES, orderStatusBadgeClass } from "@/lib/order-status";
 import { channelBadgeClass, channelLabel } from "@/lib/channel-badge";
+import { ChannelBadge } from "@/components/channel-logo";
 
 export const dynamic = "force-dynamic";
 
@@ -179,7 +180,7 @@ export default async function OrdersPage({ searchParams }: OrdersPageProps): Pro
                       <span className={orderStatusBadgeClass(order.status)}>{order.status}</span>
                     </td>
                     <td>
-                      <span className={channelBadgeClass(order.channel)}>{channelLabel(order.channel)}</span>
+                      <ChannelBadge channel={order.channel} label={channelLabel(order.channel)} className={channelBadgeClass(order.channel)} />
                     </td>
                     <td>
                       <a href={`/orders/${order.id}`}>{order.externalOrderId}</a>

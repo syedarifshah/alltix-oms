@@ -8,6 +8,7 @@ import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
 import { getEnabledChannels } from "@/lib/channel-flags";
 import { channelBadgeClass, channelLabel } from "@/lib/channel-badge";
+import { ChannelBadge } from "@/components/channel-logo";
 
 export const dynamic = "force-dynamic";
 
@@ -461,7 +462,7 @@ export default async function ChannelsPage({
       <div className="panel-card">
         <div className="panel-card-header">
           <h2 className="panel-card-title" style={{ margin: 0 }}>
-            <span className={channelBadgeClass("amazon")}>Amazon</span>
+            <ChannelBadge channel="amazon" label="Amazon" className={channelBadgeClass("amazon")} />
           </h2>
         </div>
         {connection ? (
@@ -503,7 +504,7 @@ export default async function ChannelsPage({
       <div className="panel-card">
         <div className="panel-card-header">
           <h2 className="panel-card-title" style={{ margin: 0 }}>
-            <span className={channelBadgeClass("shopify")}>Shopify</span>
+            <ChannelBadge channel="shopify" label="Shopify" className={channelBadgeClass("shopify")} />
           </h2>
         </div>
         {shopifyConnections.length > 0 ? (
@@ -567,7 +568,7 @@ export default async function ChannelsPage({
       <div className="panel-card">
         <div className="panel-card-header">
           <h2 className="panel-card-title" style={{ margin: 0 }}>
-            <span className={channelBadgeClass("walmart")}>Walmart</span>
+            <ChannelBadge channel="walmart" label="Walmart" className={channelBadgeClass("walmart")} />
           </h2>
         </div>
         {walmartConnection ? (
@@ -613,7 +614,7 @@ export default async function ChannelsPage({
       <div className="panel-card">
         <div className="panel-card-header">
           <h2 className="panel-card-title" style={{ margin: 0 }}>
-            <span className={channelBadgeClass("ebay")}>eBay</span>
+            <ChannelBadge channel="ebay" label="eBay" className={channelBadgeClass("ebay")} />
           </h2>
         </div>
         {ebayConnection ? (
@@ -679,7 +680,7 @@ export default async function ChannelsPage({
       <div className="panel-card">
         <div className="panel-card-header">
           <h2 className="panel-card-title" style={{ margin: 0 }}>
-            <span className={channelBadgeClass("temu")}>Temu</span>
+            <ChannelBadge channel="temu" label="Temu" className={channelBadgeClass("temu")} />
           </h2>
         </div>
         {temuConnection ? (
@@ -726,7 +727,7 @@ export default async function ChannelsPage({
       <div className="panel-card">
         <div className="panel-card-header">
           <h2 className="panel-card-title" style={{ margin: 0 }}>
-            <span className={channelBadgeClass("tiktok")}>TikTok Shop</span>
+            <ChannelBadge channel="tiktok" label="TikTok Shop" className={channelBadgeClass("tiktok")} />
           </h2>
         </div>
         {tiktokConnections.length > 0 ? (

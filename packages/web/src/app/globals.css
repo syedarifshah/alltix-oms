@@ -568,12 +568,27 @@ details summary {
    a channel name is shown (Dashboard, Orders, Channels, Analytics) --
    values chosen to read distinctly from the status badge tones above. --- */
 .channel-badge {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   padding: 2px 9px;
   border-radius: 999px;
   font-size: 0.76rem;
   font-weight: 700;
   white-space: nowrap;
+}
+
+/* --- ChannelLogo (components/channel-logo.tsx): the small brand mark shown
+   directly before a channel's name, wherever one appears -- badges above,
+   the Products outbound-listing table headers, and the Reports channel
+   table. Never stretched/squashed by a flex/table-cell ancestor. --- */
+.channel-logo {
+  flex-shrink: 0;
+  vertical-align: -2px;
+}
+
+.channel-badge-label {
+  line-height: 1;
 }
 
 .channel-badge-amazon {

@@ -8,6 +8,7 @@ import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
 import { MIN_REORDER_THRESHOLD_DAYS, MAX_REORDER_THRESHOLD_DAYS } from "@/lib/reorder-threshold";
 import { channelBadgeClass, channelLabel } from "@/lib/channel-badge";
+import { ChannelBadge } from "@/components/channel-logo";
 import { KpiTile } from "@/components/kpi-tile";
 
 export const dynamic = "force-dynamic";
@@ -272,9 +273,13 @@ export default async function InventoryPage({ searchParams }: InventoryPageProps
                           <span className="muted">none</span>
                         ) : (
                           bufferEntries.map(([channel, qty]) => (
-                            <span key={channel} className={channelBadgeClass(channel)} style={{ marginRight: 4 }}>
-                              {channelLabel(channel)}: {qty}
-                            </span>
+                            <ChannelBadge
+                              key={channel}
+                              channel={channel}
+                              label={`${channelLabel(channel)}: ${qty}`}
+                              className={channelBadgeClass(channel)}
+                              style={{ marginRight: 4 }}
+                            />
                           ))
                         )}
                       </td>

@@ -7,6 +7,7 @@ import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
 import { getEnabledChannels } from "@/lib/channel-flags";
 import { channelBadgeClass, channelChartColor, channelLabel } from "@/lib/channel-badge";
+import { ChannelBadge } from "@/components/channel-logo";
 import { ALL_ORDER_STATUSES } from "@/lib/order-status";
 import { describeAction } from "@/lib/audit-log-format";
 import { KpiTile } from "@/components/kpi-tile";
@@ -310,7 +311,7 @@ export default async function DashboardPage(): Promise<ReactElement> {
                 return (
                   <div key={channel} className="row" style={{ justifyContent: "space-between", borderTop: "1px solid var(--border)", paddingTop: 10 }}>
                     <div className="row" style={{ gap: 8 }}>
-                      <span className={channelBadgeClass(channel)}>{channelLabel(channel)}</span>
+                      <ChannelBadge channel={channel} label={channelLabel(channel)} className={channelBadgeClass(channel)} />
                       {!conn ? (
                         <span className="muted">not connected</span>
                       ) : isThrottled ? (

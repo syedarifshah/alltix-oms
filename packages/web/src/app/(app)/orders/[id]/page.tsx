@@ -14,6 +14,7 @@ import {
 } from "@/lib/order-status";
 import type { OrderStatus } from "@alltix/shared";
 import { channelBadgeClass, channelLabel } from "@/lib/channel-badge";
+import { ChannelBadge } from "@/components/channel-logo";
 
 export const dynamic = "force-dynamic";
 
@@ -333,7 +334,7 @@ export default async function OrderDetailPage({ params, searchParams }: OrderDet
         Order {order.external_order_id} <span className={orderStatusBadgeClass(order.status)}>{order.status}</span>
       </h1>
       <p className="subtitle row" style={{ gap: 8 }}>
-        <span className={channelBadgeClass(order.channel)}>{channelLabel(order.channel)}</span>
+        <ChannelBadge channel={order.channel} label={channelLabel(order.channel)} className={channelBadgeClass(order.channel)} />
         <span>
           placed {order.placed_at ? new Date(order.placed_at).toISOString() : "—"} · last updated{" "}
           {new Date(order.updated_at).toISOString()}

@@ -6,6 +6,7 @@ import { getAppPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
 import { ProductsIcon } from "@/components/icons";
+import { ChannelLogo } from "@/components/channel-logo";
 
 export const dynamic = "force-dynamic";
 
@@ -299,10 +300,18 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
               <tr>
                 <th>SKU</th>
                 <th>Name</th>
-                <th>Shopify</th>
-                <th>Walmart</th>
-                <th>Amazon</th>
-                <th>eBay</th>
+                <th>
+                  <ChannelLogo channel="shopify" size={14} /> Shopify
+                </th>
+                <th>
+                  <ChannelLogo channel="walmart" size={14} /> Walmart
+                </th>
+                <th>
+                  <ChannelLogo channel="amazon" size={14} /> Amazon
+                </th>
+                <th>
+                  <ChannelLogo channel="ebay" size={14} /> eBay
+                </th>
               </tr>
             </thead>
             <tbody>

@@ -8,6 +8,7 @@ import { getAuthContext } from "@/lib/auth-context";
 import { resolveTenantId } from "@/lib/with-tenant-auth";
 import { FulfillmentIcon } from "@/components/icons";
 import { channelBadgeClass, channelLabel } from "@/lib/channel-badge";
+import { ChannelBadge } from "@/components/channel-logo";
 
 export const dynamic = "force-dynamic";
 
@@ -369,7 +370,7 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
                         <a href={`/orders/${o.id}`}>{o.external_order_id}</a>
                       </td>
                       <td>
-                        <span className={channelBadgeClass(o.channel)}>{channelLabel(o.channel)}</span>
+                        <ChannelBadge channel={o.channel} label={channelLabel(o.channel)} className={channelBadgeClass(o.channel)} />
                       </td>
                       <td>{total === 0 ? "no picklist lines" : `${total - pending}/${total} recorded`}</td>
                       <td>
@@ -397,7 +398,7 @@ export default async function PicklistsPage({ searchParams }: PicklistsPageProps
             <div className="panel-card" key={o.id}>
               <div className="row" style={{ marginBottom: 8 }}>
                 <a href={`/orders/${o.id}`}>{o.external_order_id}</a>
-                <span className={channelBadgeClass(o.channel)}>{channelLabel(o.channel)}</span>
+                <ChannelBadge channel={o.channel} label={channelLabel(o.channel)} className={channelBadgeClass(o.channel)} />
               </div>
               <form action={`/api/orders/${o.id}/ship`} method="POST" className="row">
                 <input type="text" name="carrier" placeholder="Carrier (e.g. UPS)" required />

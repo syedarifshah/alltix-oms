@@ -6682,6 +6682,99 @@ files pass, unchanged (expected: a pure CSS/markup-removal pass touches no logic
 any of these tests exercise — confirmed, not assumed). No new test file needed —
 same reasoning §20's own v1 pass gives for the identical situation.
 
+### 20.2 Channel logo icons (v3) — Arif's own request, colors-and-icons-only
+
+**Why**: Arif's own words: "let's work on the frontend color scheme, we need the
+channels logos as well where channels names are mentioned in Alltix OMS" — a
+follow-on to §20/§20.1, adding a small brand mark directly before every channel
+name shown anywhere in the authenticated app (not the marketing site). Same
+governing constraint as §20/§20.1: a display-only pass — no query, form action,
+service-layer call, or route handler changed. Two appearance questions Arif
+answered directly, via AskUserQuestion, before any code was written, per his own
+standing "only ask me questions about how something should look, in plain
+language" instruction: **icon style** — "Official-style brand icons" (real,
+recognizable logo marks in each brand's own colors, not generic placeholder
+icons); **placement** — "Small icon directly before the text" (inline, compact,
+`[icon] Amazon`, not a larger standalone badge).
+
+**Sourcing, not fabricating**: Amazon (`react-icons/fa`'s `FaAmazon` path, filled
+with Amazon's real brand orange `#FF9900` rather than Font Awesome's own
+monochrome default — `simple-icons` itself doesn't carry an Amazon mark at all,
+confirmed absent), Shopify/eBay/TikTok (`simple-icons`' own `siShopify`/`siEbay`/
+`siTiktok` paths and hex values, `#7AB55C`/`#E53238`/`#000000`) all use real,
+accurate SVG path data and brand colors extracted from widely-used open-source
+icon packages (installed into a disposable scratch directory purely to read their
+source, never added as a runtime dependency of this app). **Walmart and Temu have
+no accurately-shaped open-source mark anywhere** — checked and confirmed absent
+across `simple-icons` and every `react-icons` bundle (`fa`/`fa6`/`si`) for
+Walmart, and confirmed no official icon package carries Temu at all. Rather than
+fabricate an inaccurate copy of either brand's real logo shape (which this app
+should not distribute), both render as a plain colored-circle monogram in that
+brand's own real, publicly published color instead — Walmart blue `#0071CE`, Temu
+orange `#FB7701` (RGB 251,119,1, Pantone 151 C, confirmed via WebSearch +
+WebFetch against brandcolorcode.com) — an honest placeholder, not a counterfeit
+logo.
+
+**Built**: `packages/web/src/components/channel-logo.tsx` (new file) — two
+exports. `ChannelLogo({channel, size?})` returns the small inline SVG mark itself
+(a real path for Amazon/Shopify/eBay/TikTok, a `ChannelMonogram` colored-circle
+fallback for Walmart/Temu, `null` for any other/unrecognized channel string) —
+used standalone wherever a channel name appears as plain text, not inside an
+existing badge (Products' table headers, Reports' channel table cell).
+`ChannelBadge({channel, label, className, style?})` composes a `ChannelLogo` with
+the channel's own existing badge pill markup (`channelBadgeClass`/`channelLabel`,
+`lib/channel-badge.ts`, unchanged) — takes the caller's already-computed
+`className`/`label` rather than recomputing them, so a call site with a
+non-default label (Inventory's `"{channelLabel}: {qty}"` per-buffer-entry format)
+or an extra inline style (also Inventory, `marginRight`) still composes cleanly
+with one line swapped, not a rewrite. **Deliberately NOT a new npm dependency** —
+no icon-library package was added to `packages/web/package.json`, matching the
+precedent `components/icons.tsx`'s own header comment already sets for this
+app's nav icons (hand-drawn inline SVG, no icon-package runtime dependency).
+`globals.css` gained three small rules for `.channel-logo`
+(`flex-shrink: 0; vertical-align: -2px` — never stretched/squashed by a flex or
+table-cell ancestor) and `.channel-badge-label` (`line-height: 1`), and
+`.channel-badge` gained `gap: 4px` (was a bare `inline-block` with no gap) so the
+icon and label sit with real, consistent spacing wherever `ChannelBadge` is used.
+
+**Wired into the app** — every existing `channelBadgeClass`/`channelLabel` call
+site across the authenticated app now renders through `ChannelBadge` instead of a
+bare `<span>`: Dashboard's and Orders' (`orders`/`orders/[id]`) own order-channel
+badges, Picklists' two ready-to-pick/ready-to-pack channel badges, Inventory's
+per-channel buffer-entry badges (`key`/`label`/`style` all preserved exactly),
+and Channels' 6 hardcoded per-connector badges (Amazon/Shopify/Walmart/eBay/Temu/
+TikTok Shop — previously literal `<span className={channelBadgeClass("amazon")}>
+Amazon</span>`-style markup with no dynamic channel value to read, now
+`<ChannelBadge channel="amazon" label="Amazon" .../>` with the literal string
+supplied directly). Two places outside any badge also gained a standalone
+`ChannelLogo`, not a full `ChannelBadge` (no pill/background to compose with):
+Products' 4 outbound-listing table headers (`<th><ChannelLogo channel="shopify"
+size={14} /> Shopify</th>`, one per Shopify/Walmart/Amazon/eBay column — Temu/
+TikTok have no column here, since neither has outbound listing creation built,
+§4.7/§4.8), and Reports' sales-by-channel table's own channel cell
+(`<ChannelLogo channel={row.channel} size={14} /> {channelLabel(row.channel)}`).
+
+**Deliberately not touched**: Reports' donut-chart legend (`DonutChart`'s own
+`segments[].label` is a plain string passed into a hand-rolled inline-SVG chart
+component, §20's own "no chart library dependency" design — threading an icon
+into an SVG `<text>` legend is a materially bigger change than this pass's own
+"icon directly before text" scope, and the same channel is already shown with its
+icon one panel over, in the table beside the chart); Locations' `<select>` option
+text (`"FBA (Amazon)"`, `"WFS (Walmart)"`) — a native `<option>` element cannot
+render inline SVG/images at all, a hard platform limitation, not an oversight;
+and the marketing site (`(marketing)/`), same "authenticated app only" scope this
+section's own opening paragraph states, consistent with §20's own marketing-site
+boundary.
+
+**Tested/Verified**: `npm run typecheck --workspaces` clean across all twelve
+workspaces, `next build` clean (every touched page and the new component both
+compile), and `bash scripts/run-tests.sh` (DB-dependent suites need a local
+Postgres this pass's own environment didn't have running — typecheck/build are
+this pass's real verification, same as every other pure-display/no-logic-change
+pass in this file, e.g. §20's own v1/v2 "no new test file needed" precedent). No
+new test file — same reasoning §20/§20.1 both give: a markup/CSS-only change with
+no new pure decision logic, query, or service-layer behavior to extract.
+
 ---
 
 *This document reflects standard, well-documented patterns for multichannel OMS/IMS
