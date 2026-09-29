@@ -13,7 +13,11 @@ import {
   ProductsIcon,
   PeopleIcon,
   PayrollIcon,
+  AdminIcon,
 } from "@/components/icons";
+import { getAppPool } from "@/lib/db";
+import { getAuthContext } from "@/lib/auth-context";
+import { requirePlatformOperator } from "@/lib/platform-operator";
 
 /**
  * Sidebar nav for the whole authenticated app -- replaced the previous
@@ -52,6 +56,28 @@ export async function Nav(): Promise<ReactElement> {
     process.env.ALLTIX_TEST_AUTH_BYPASS === "true" &&
     requestHeaders.has("x-test-clerk-user-id");
 
+  // Platform-operator "Admin" link -- deliberately resolved here, in the
+  // sidebar itself, rather than pushed down into a shared layout-level
+  // guard: every other nav item is a plain, unconditional link, and this is
+  // the one link in this whole nav that must NOT render for an ordinary
+  // signed-in tenant user. lib/platform-operator.ts's own
+  // requirePlatformOperator() already does the real work (parses
+  // PLATFORM_OPERATOR_EMAILS, looks up the signed-in user's own row, checks
+  // their email against the allowlist) -- this just calls it with the same
+  // clerkUserId getAuthContext() already resolves for the test-bypass check
+  // above. A signed-out visitor (no authContext) or the test-auth-bypass
+  // path (no real Clerk session to resolve a DB user from) both simply see
+  // no Admin link, the same "fail closed, render nothing" behavior
+  // requirePlatformOperator() itself already guarantees for a non-operator.
+  let isPlatformOperator = false;
+  if (!isTestBypass) {
+    const authContext = await getAuthContext(requestHeaders);
+    if (authContext) {
+      const operator = await requirePlatformOperator(getAppPool(), authContext.clerkUserId);
+      isPlatformOperator = operator !== null;
+    }
+  }
+
   return (
     <aside className="sidebar">
       <a href="/dashboard" className="sidebar-brand">
@@ -77,6 +103,13 @@ export async function Nav(): Promise<ReactElement> {
         <SidebarLink href="/products" icon={<ProductsIcon />} label="Products" />
         <SidebarLink href="/hr" icon={<PeopleIcon />} label="HR" />
         <SidebarLink href="/hr/payroll" icon={<PayrollIcon />} label="Payroll" />
+
+        {isPlatformOperator && (
+          <>
+            <div className="sidebar-section-label">Platform</div>
+            <SidebarLink href="/admin" icon={<AdminIcon />} label="Admin" />
+          </>
+        )}
       </nav>
     </aside>
   );

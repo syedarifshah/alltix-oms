@@ -67,12 +67,43 @@ interface ActivityPageProps {
  * `entityType` filter along so paging doesn't silently reset it.
  *
  * The join to `users` (for `actor_email`) only works because of this
- * migration's own second RLS policy, `tenant_scoped_read_users` -- see its
+ * migration's own second RLS policy, `tenant_scoped_select_users` -- see its
  * doc comment in the migration for why the table's original policy
- * (self-lookup only) couldn't already do this. A NULL actor_email means an
- * operator-run script (e.g. scripts/set-channel-flags.ts), not a missing
- * join -- see audit-log.ts's own doc comment on why user_id is nullable.
+ * (self-lookup only) couldn't already do this. BUT that policy is itself
+ * tenant-scoped (`tenant_id = app.tenant_id`), and this whole query runs
+ * under THIS tenant's own `app.tenant_id` -- so the join can only ever
+ * resolve a `users` row that belongs to THIS SAME tenant. A NULL
+ * `actor_email` therefore means one of two genuinely different things, not
+ * one: an operator-run script with no signed-in user at all (e.g.
+ * scripts/set-channel-flags.ts -- see audit-log.ts's own doc comment on why
+ * `user_id` is nullable for exactly that case), OR a real signed-in actor
+ * whose own `users` row lives in a DIFFERENT tenant -- concretely, a
+ * platform operator mutating THIS tenant's flags from /admin
+ * (lib/platform-operator.ts), whose own account is in the operator's own
+ * tenant, not this one, so RLS silently filters the join to no match. That
+ * second case was found live, not assumed, running a smoke test of the
+ * /admin channel-flags route against real seeded Postgres. Both of the
+ * /admin mutation routes already write a `changedByOperatorEmail` string
+ * into `details` for exactly this reason (see channel-flags/route.ts's own
+ * doc comment) -- `resolveActorDisplay()` below falls back to that field
+ * when `actor_email` is NULL, so a cross-tenant platform-operator action
+ * still shows a real, traceable email instead of the generic
+ * "system (operator script)" text that's accurate only for the first case.
  */
+function resolveActorDisplay(row: AuditLogRow): string {
+  if (row.actor_email) {
+    return row.actor_email;
+  }
+  const details = row.details;
+  const fallbackEmail =
+    details && typeof details === "object" && !Array.isArray(details)
+      ? (details as Record<string, unknown>).changedByOperatorEmail
+      : undefined;
+  if (typeof fallbackEmail === "string" && fallbackEmail.trim().length > 0) {
+    return `${fallbackEmail} (platform operator)`;
+  }
+  return "system (operator script)";
+}
 export default async function ActivityPage({ searchParams }: ActivityPageProps): Promise<ReactElement> {
   const authContext = await getAuthContext(await headers());
   if (!authContext) {
@@ -181,7 +212,7 @@ export default async function ActivityPage({ searchParams }: ActivityPageProps):
                       {row.entity_type}
                       {row.entity_id ? ` (${row.entity_id})` : ""}
                     </td>
-                    <td>{row.actor_email ?? "system (operator script)"}</td>
+                    <td>{resolveActorDisplay(row)}</td>
                     <td className="muted">{row.details ? JSON.stringify(row.details) : ""}</td>
                   </tr>
                 ))}

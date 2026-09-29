@@ -127,3 +127,16 @@ export const PayrollIcon = (): ReactElement => (
     </>
   </Icon>
 );
+
+/** Only ever rendered for a signed-in platform operator (nav.tsx's own
+ *  conditional Admin link, gated by lib/platform-operator.ts) -- a plain
+ *  shield glyph, distinguishing "platform-operator console" from the
+ *  ordinary gear used for /settings. */
+export const AdminIcon = (): ReactElement => (
+  <Icon>
+    <>
+      <path d="M8 1.6l5.4 2v4.2c0 3.4-2.2 6-5.4 6.6-3.2-.6-5.4-3.2-5.4-6.6V3.6z" />
+      <path d="M5.6 8l1.7 1.7L10.6 6" />
+    </>
+  </Icon>
+);

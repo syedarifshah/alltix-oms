@@ -3201,11 +3201,98 @@ from there.
   db:migrate` clean (no pending migration — no schema change), `npm run
   typecheck --workspaces` clean across all twelve workspaces, `next build`
   clean, `bash scripts/run-tests.sh` — all 64 test files pass.
-- **No operator UI for channel flags** — `tenants.enabled_channels` (§15) has no
-  multi-tenant admin surface, only a CLI script (`npm run platform:set-channel-flags`).
-  Deliberate, not an oversight — see §15's own "No operator UI" paragraph for the
-  reasoning. (§15's *other* known gap — flags not gating already-running scheduler
-  sync — is now closed; see its "Scope" paragraph.)
+- **No operator UI for channel flags — closed, see §12.1.** `tenants.enabled_channels`
+  (§15) and `tenants.enabled_carriers` (§19.8) both had no multi-tenant admin surface,
+  only CLI scripts (`npm run platform:set-channel-flags`/`platform:set-carrier-flags`)
+  — a real `/admin` console now exists for exactly this, gated by a plain
+  `PLATFORM_OPERATOR_EMAILS` allowlist, not a new RBAC/roles system. (§15's *other*
+  known gap — flags not gating already-running scheduler sync — was already closed;
+  see its "Scope" paragraph.)
+
+## 12.1 Platform Operator Admin Console (`/admin`)
+
+**Status: built.** §12's own "No operator UI for channel flags" bullet, and §15's/
+§19.8's own matching "No operator UI" paragraphs, all flagged the same real gap:
+`tenants.enabled_channels`/`tenants.enabled_carriers` could only ever be changed by
+running a CLI script directly against production (`npm run platform:set-channel-flags`/
+`platform:set-carrier-flags`), which both those sections' own reasoning called
+deliberate — there was no multi-tenant admin surface anywhere in this codebase to hang
+a real toggle UI off of, and building one purely for two flag arrays would have been
+scope creep neither §15 nor §19.8 needed at the time. This closes that gap directly, a
+real (if intentionally minimal) `/admin` console — not a new RBAC/roles system, per
+§0's own recurring "don't stand up infra a single-operator platform hasn't earned yet"
+discipline (BullMQ/Redis, a real feature-flag vendor, a real payroll processor's own
+UI, each already made the identical call).
+
+**Authorization — a plain env-var allowlist, deliberately not a new roles/permissions
+system**: `PLATFORM_OPERATOR_EMAILS` (`.env.example`), a comma-separated list checked
+against a signed-in Clerk user's own `users.email` — `lib/platform-operator.ts`'s
+`parseOperatorAllowlist()`/`isPlatformOperatorEmail()` (pure, unit-tested) plus
+`requirePlatformOperator()`/`requirePlatformOperatorFromRequest()` (the real DB-backed
+checks, mirroring `with-tenant-auth.ts`'s own `resolveCurrentUser`/`requireCurrentUser`
+shape). Fails closed at every layer: an unset/blank allowlist means nobody is a
+platform operator, full stop, not "everyone is." A tenant's own real `users` row is
+still what's checked — being a platform operator isn't a separate account type, it's
+an ordinary tenant user whose email happens to be on this list, the same "no second
+identity system" reasoning Clerk's own single sign-in flow already gives this app for
+every other authenticated route.
+
+**Surfaced via the sidebar's own conditional Admin link** (`components/nav.tsx`) —
+rendered only when `requirePlatformOperator()` resolves non-null for the signed-in
+user, in a plain server-side check reusing the same `getAuthContext()`/`getAppPool()`
+call every other nav-level auth check in this file already makes; a non-operator (or a
+signed-out visitor) sees no trace of the link at all, not a disabled one.
+
+**`/admin`** (`app/(app)/admin/page.tsx`): lists every tenant (via `getAdminPool()` —
+a genuinely cross-tenant enumeration, the same justified, narrowly-scoped RLS-bypass
+precedent `packages/scheduler`'s own sync-discovery queries and Shopify's webhook
+tenant-resolution already establish, §4.4/§4.5) with two per-tenant checkbox forms —
+enabled channels and enabled carriers — each POSTing the tenant's full desired list
+wholesale, same "replace the list, not a diff" contract `set-channel-flags.ts`/
+`set-carrier-flags.ts` already established for the CLI scripts this UI now sits
+alongside (not replaces — both scripts remain, for an operator who prefers a shell).
+
+**Mutation routes** — `POST /api/admin/tenants/[id]/channel-flags` and
+`POST /api/admin/tenants/[id]/carrier-flags` — both gated by
+`requirePlatformOperatorFromRequest()`, not `requireCurrentUser`/`withTenantAuth`: this
+is the one place in the app a signed-in user is deliberately allowed to mutate a
+tenant OTHER THAN their own (`[id]` is the target tenant from the URL, not the
+caller's own session). Both use the ordinary `app_user` pool + `withTenant(pool,
+targetTenantId, ...)` — not `getAdminPool()` — since the target tenant id is already
+known from the URL rather than being discovered; only the `/admin` page's own
+cross-tenant LIST needs the admin pool, an ordinary mutation against one known tenant
+doesn't (same reasoning `lib/db.ts`'s own `getAdminPool()` doc comment already gives).
+Both are rate-limited against the OPERATOR's own tenant (§16's own "the acting party's
+own budget, not the affected resource's" precedent) and record a `recordAuditEvent()`
+call in the SAME transaction as the `UPDATE` (§17).
+
+**A real cross-tenant RLS gap found and fixed while building this — `users`' own
+`tenant_scoped_select_users` policy scopes SELECT to the READING context's own
+`app.tenant_id`, not the row's own tenant**: `/settings/activity`'s existing
+`LEFT JOIN users` (§17) can therefore never resolve a cross-tenant platform
+operator's own `users` row — a channel/carrier-flag change made from `/admin` would
+have shown `actor_email` as NULL, indistinguishable from an unattributed operator
+script, even though a real, named human made the change. Both mutation routes now
+also write `details.changedByOperatorEmail` (the operator's own email, captured at
+mutation time) alongside the existing structured details — `/settings/activity`'s
+new `resolveActorDisplay()` falls back to that field when `actor_email` comes back
+NULL, rendering `"<email> (platform operator)"` instead of the generic "system
+(operator script)" text that's only accurate for the other NULL case (no signed-in
+actor at all). Found live, via a real smoke test of the channel-flags route against
+seeded Postgres, not assumed.
+
+**Tests**: `test/platform-operator.test.ts` covers the pure allowlist-parsing/
+matching functions (comma-splitting, trimming, lowercasing, empty-entry dropping,
+case-insensitive matching, fail-closed on an unset/blank allowlist) — same
+"extract the pure decision, test it directly" precedent `channel-flags.test.ts`/
+`carrier-flags.test.ts` both already set. `requirePlatformOperator()`/
+`requirePlatformOperatorFromRequest()` themselves (real DB/request-object calls) are
+not independently DB-layer-tested, same precedent several other `lib/` modules in
+this file already carry for their own DB-touching half — verified instead via
+`tsc -b`/`next build` and a manual smoke test of both mutation routes against real
+seeded Postgres (including the `changedByOperatorEmail` fallback actually resolving
+on `/settings/activity`). Verified: `npm run typecheck --workspaces` clean, `next
+build` clean, `bash scripts/run-tests.sh` passes with the new test file included.
 
 ## 13. Observability (Sentry — §5/§8 Phase 4's "Observability dashboards")
 
@@ -3634,14 +3721,15 @@ unaffected by the flag either way (by design — the flag change takes effect fo
 tenant's *sync*, not by rewriting what their connect page shows for a channel they've
 already connected).
 
-**No operator UI — a CLI script instead, same reasoning as the LaunchDarkly call above**:
-`npm run platform:set-channel-flags` (`scripts/set-channel-flags.ts`) takes
-`TENANT_ID`/`ENABLED_CHANNELS` (comma-separated) and replaces that tenant's list
-wholesale — same "general-purpose, production-safe, env-var-driven" shape
-`scripts/add-channel-listing.ts` already established, not a throwaway-test-data script.
-There is no multi-tenant admin surface anywhere in this codebase yet to hang a real
-toggle UI off of; building one purely for this would be scope creep this feature doesn't
-need.
+**Operator UI — built, see §12.1**: `npm run platform:set-channel-flags`
+(`scripts/set-channel-flags.ts`) still exists and still takes `TENANT_ID`/
+`ENABLED_CHANNELS` (comma-separated), replacing that tenant's list wholesale — same
+"general-purpose, production-safe, env-var-driven" shape `scripts/add-channel-listing.ts`
+already established, not a throwaway-test-data script — but it's no longer the only
+way to change this: `/admin` (§12.1) now gives a real platform operator a per-tenant
+checkbox form for the same flags, gated by a plain `PLATFORM_OPERATOR_EMAILS`
+allowlist rather than a new roles system. The CLI script remains for an operator who
+prefers a shell; neither replaces the other.
 
 **Tests**: `packages/web/test/channel-flags.test.ts` covers the one pure function here
 (`filterKnownChannels` — same "extract the pure decision, test it directly" precedent
@@ -6003,15 +6091,17 @@ carrier keeps using it exactly as before; the flag change takes effect at
 `ship-via-carrier`'s own gate on the next real ship attempt, not by rewriting what
 the picklist page shows.
 
-**No operator UI — a CLI script instead, same reasoning as §15's own LaunchDarkly
-call**: `npm run platform:set-carrier-flags` (`scripts/set-carrier-flags.ts`) takes
-`TENANT_ID`/`ENABLED_CARRIERS` (comma-separated) and replaces that tenant's list
-wholesale — a near-literal mirror of `scripts/set-channel-flags.ts`, right down to
-its own `recordAuditEvent` call (`action: "settings.carrier_flags_changed"`,
-`userId: null` — an operator running this script from a shell has no Clerk session
-to attribute the change to, same NULL-means-no-human-actor semantics §17 already
-establishes). There is no multi-tenant admin surface anywhere in this codebase yet
-to hang a real toggle UI off of, same as channels.
+**Operator UI — built, see §12.1**: `npm run platform:set-carrier-flags`
+(`scripts/set-carrier-flags.ts`) still exists and still takes `TENANT_ID`/
+`ENABLED_CARRIERS` (comma-separated), replacing that tenant's list wholesale — a
+near-literal mirror of `scripts/set-channel-flags.ts`, right down to its own
+`recordAuditEvent` call (`action: "settings.carrier_flags_changed"`, `userId: null`
+— an operator running this script from a shell has no Clerk session to attribute the
+change to, same NULL-means-no-human-actor semantics §17 already establishes) — but,
+same as channels, it's no longer the only way to change this: `/admin` (§12.1) now
+gives a real platform operator a per-tenant checkbox form for these flags too, one
+console covering both channels and carriers. The CLI script remains for an operator
+who prefers a shell; neither replaces the other.
 
 **Tests**: `packages/web/test/carrier-flags.test.ts` covers the one pure function
 here (`filterKnownCarriers` — same "extract the pure decision, test it directly"
