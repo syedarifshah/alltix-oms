@@ -633,10 +633,10 @@ export default async function ChannelsPage({
                 : "never synced yet"}
             </div>
             <div className="alert alert-info" style={{ marginTop: 8, marginBottom: 0 }}>
-              UNVERIFIED against real eBay infrastructure, more so even than Walmart&apos;s own connection above --
-              this environment&apos;s network policy blocks eBay&apos;s API hosts outright, so nothing here has
-              round-tripped against eBay at all, sandbox or production. Order sync failures are no longer silent,
-              though — see below if this connection has started failing.
+              Verified live against real eBay Production infrastructure on 2026-09-29 — the OAuth token
+              exchange succeeded and this app&apos;s own Account API call (fetching business policies, just
+              below) genuinely reached eBay&apos;s servers and got a real response back. Order sync failures
+              are no longer silent either — see below if this connection has started failing.
             </div>
             <SyncFailureBanner
               status={ebayConnection.status}
