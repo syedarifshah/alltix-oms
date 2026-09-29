@@ -2042,6 +2042,95 @@ eBay/Temu v1" scope decision.
     (`packages/channel-connectors/test/ebay-connector.test.ts`) alongside this live
     verification, not in place of it.
 
+### 4.6.1 eBay Marketplace Account Deletion/Closure Notifications — built, a discovered prerequisite for Production OAuth
+
+- **Why**: Arif's explicit "okay let's start eBay's Production OAuth setup back up"
+  (resuming a task deferred earlier in the same session). Live research into what
+  actually happens when requesting/activating a Production keyset (not something Arif
+  asked about directly — proactively researched before guiding him through a setup
+  that would dead-end) surfaced a real, confirmed, currently-blocking eBay requirement:
+  a Production keyset with any OAuth scope that can touch personal data stays
+  **"Your key set is currently invalid"** until the developer either subscribes to
+  eBay's Marketplace Account Deletion notification workflow (if the app retains eBay
+  user data) or formally opts out (if it doesn't). This codebase genuinely retains eBay
+  buyer data per order (`orders.customer`/`orders.shipping_address`, pulled via
+  `EbayConnector.pullOrders()`, §2.3/§4.6) — opting out would be a false declaration to
+  eBay, so subscribing is the only honest path, not a preference. This section is
+  therefore a discovered prerequisite for §4.6's own Production OAuth setup, not a
+  standalone feature request.
+- **Research trail — confirmed via WebSearch + WebFetch against eBay's own official
+  developer.ebay.com guide** (`developer.ebay.com/develop/guides/sell/marketplace-user-account-deletion`,
+  surfaced via search after a direct fetch attempt hit this session's provenance
+  restriction): a **GET verification challenge** (`?challenge_code=<value>`, response
+  must be `{"challengeResponse": sha256hex(challengeCode + verificationToken + endpoint)}`
+  — confirmed literal field concatenation order, no separator between values, and
+  Content-Type `application/json` with no byte-order-mark) sent right after the
+  endpoint URL is saved or re-saved in the Developer Portal (and by the portal's own
+  "Send Test Notification" button); a **POST notification** payload shape
+  (`{metadata: {topic: "MARKETPLACE_ACCOUNT_DELETION", schemaVersion, deprecated},
+  notification: {notificationId, eventDate, publishDate, publishAttemptCount, data:
+  {username, userId, eiasToken}}}`); acceptable acknowledgment status codes 200/201/
+  202/204. Developer Portal setup itself is manual, not an API call this codebase
+  makes (same "setup is manual" shape Sapient's own tracking webhook already carries,
+  §19.9): Application Keys page → "Notifications" link next to the Production App ID →
+  select "Marketplace Account Deletion" → alert email → Notification Endpoint URL →
+  a chosen Verification token (32-80 chars, alphanumeric/underscore/hyphen only) →
+  Save, which triggers eBay's own GET verification.
+- **Schema** (migration `0046_ebay_account_deletion_requests.sql`): `ebay_account_deletion_requests`
+  — tenant-less, mirroring `demo_requests`' own shape exactly (migration 0017): RLS
+  enabled + forced, `INSERT`-only policy/grant for `app_user`, no `SELECT` grant at
+  all. Tenant-less on purpose, not an oversight — a notification names an eBay
+  MARKETPLACE user (buyer/seller account on eBay's own side), which this schema has
+  no reliable way to resolve to one specific tenant's own order rows at ingestion time
+  (no eBay username/userId/eiasToken is stored anywhere on `orders`/`order_lines`
+  today, only the raw shipping address/customer JSONB pulled from eBay's own order
+  payload). Reading a received request back out and acting on it is therefore a
+  deliberately manual operator task, done directly against `DATABASE_URL`'s owner role
+  (bypasses RLS), not an automated pipeline — see the paragraph below for why.
+- **Built** (`packages/web/src/app/api/webhooks/ebay/marketplace-account-deletion/route.ts`):
+  `GET` computes and returns the confirmed SHA-256 challenge response from
+  `EBAY_MARKETPLACE_DELETION_VERIFICATION_TOKEN`/`EBAY_MARKETPLACE_DELETION_ENDPOINT_URL`
+  (`.env.example`), failing loudly with a 500 if either is unset — same "missing env
+  var" discipline `readEbayOAuthAppConfig()` already establishes for the OAuth flow
+  itself, rather than silently returning a challenge response eBay will simply reject.
+  `POST` parses the confirmed payload shape defensively, inserts a row (raw payload
+  always preserved in `raw_payload` even when `username`/`userId`/`eiasToken` are all
+  unrecognized), and calls `captureAlert()` (`@alltix/shared`, §13) so a real deletion
+  request is visible once Sentry is configured — always acknowledges with a 2xx status
+  regardless of parse completeness or a DB failure, the same "never retry-bait an
+  endpoint that can't resolve the payload" discipline `/api/webhooks/sapient` already
+  establishes for a different carrier notification (§19.9), since eBay has no
+  documented way to fix a payload this route can't parse and retrying changes nothing.
+- **Deliberately not built this pass**: automated cross-tenant PII erasure — resolving
+  a notified eBay username/userId/eiasToken to specific `orders`/`order_lines` rows
+  across tenants and defining what "deletion" means against an already-shipped,
+  already-audited order is real, separate, materially larger scope than the mandatory
+  unblocking piece (the GET challenge-response, without which eBay won't activate the
+  subscription at all) — this pass scopes to that plus an honest, minimal
+  record-and-alert mechanism, mirroring this codebase's own established "wire the
+  mandatory piece now, be honest about what's deferred" discipline (e.g. §19.9's own
+  Sapient webhook, §14.1's Check payroll).
+- **Tested/Verified**: `npm run typecheck --workspaces` and `next build` both clean;
+  no dedicated test file — same reasoning `recordAuditEvent`/`sapient-webhook.ts`'s
+  own "no pure decision logic to extract beyond what's already covered" precedent
+  gives (§17/§19.9) for a thin route with a single, directly-verifiable hash
+  computation and a straightforward INSERT — the SHA-256 challenge construction
+  itself has no ambiguity to unit-test beyond re-implementing the same three-argument
+  `createHash("sha256").update(...).update(...).update(...)` call the route itself
+  makes. `npm run db:migrate` not run this pass — no local Postgres in this session's
+  container, same limitation confirmed (not a regression) during §20.2's own
+  verification.
+- **Still open, Arif's own next step, not more of this codebase's own code**:
+  generating the real verification-token value and pasting it into both eBay's portal
+  and `EBAY_MARKETPLACE_DELETION_VERIFICATION_TOKEN`, setting
+  `EBAY_MARKETPLACE_DELETION_ENDPOINT_URL` to this route's real deployed URL, and then
+  completing the actual eBay Developer Portal setup (Production keyset → RuName/
+  redirect URL registration → this notification subscription → collecting App ID/Cert
+  ID/RuName into `EBAY_OAUTH_CLIENT_ID`/`EBAY_OAUTH_CLIENT_SECRET`/
+  `EBAY_OAUTH_REDIRECT_URI`) — this codebase has no browser/computer-use access to
+  Arif's own eBay account, so every one of those steps is a plain-language walkthrough
+  for him to execute himself, not something this session can do directly.
+
 ### 4.7 Temu Open Platform (channel #5 — Arif's explicit pick, "add temu")
 
 - **Why now, and what scope**: Arif's own explicit request ("add temu and HR & Payroll"),
