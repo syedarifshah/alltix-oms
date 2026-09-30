@@ -29,24 +29,49 @@ import type { CSSProperties, ReactElement } from "react";
  * data below was extracted from those packages in a throwaway scratch
  * install, never imported into this app's own dependency tree.
  *
- * Sized/styled per Arif's own second pass (v4): a uniform default size of
- * 20px everywhere (up from 14px/12px) and a real CSS 3D tilt/perspective
- * effect, not a flat icon -- the actual transform/shadow/hover-flatten
- * styling lives on the shared `.channel-logo` class in globals.css, not
- * here, so every call site (badges, table headers) picks it up identically
- * with no per-site markup change. Every call site in this app either takes
- * this default or passes the same 20 explicitly -- "uniform everywhere,"
- * not scaled per context, was Arif's own explicit choice.
+ * Sized/styled per Arif's own third pass (v5): a uniform default size of
+ * 44px everywhere (up from 20px, and 14px/12px before that) and a
+ * deeper/glossier CSS 3D effect -- a stronger perspective tilt, a heavier
+ * layered drop shadow, and a diagonal shine overlay that shares the icon's
+ * own rotation so it reads as one tilted glossy surface, not a flat icon
+ * with a decal on top. The actual transform/shadow/shine/hover-flatten
+ * styling lives on the shared `.channel-logo-frame`/`.channel-logo`/
+ * `.channel-logo-shine` classes in globals.css, not here, so every call
+ * site (badges, table headers) picks it up identically with no per-site
+ * markup change beyond the `size` prop. Every call site in this app either
+ * takes this default or passes the same 44 explicitly -- "uniform
+ * everywhere," not scaled per context, was Arif's own explicit choice
+ * again this pass, same as the v4 pass before it.
+ *
+ * The icon itself is built by `renderIcon()` (the exact same per-channel
+ * SVG markup this component always had) and then wrapped once, uniformly,
+ * in a `.channel-logo-frame` + `.channel-logo-shine` pair -- rather than
+ * applying the tilt to each case's own <svg> directly -- so the shine
+ * overlay shares exactly the icon's bounding box and rotation for every
+ * channel, walmart/temu's monogram included, with no per-case duplication.
  */
 export function ChannelLogo({
   channel,
-  size = 20,
+  size = 44,
 }: {
   channel: string;
   size?: number;
 }): ReactElement | null {
-  const key = channel.trim().toLowerCase();
+  const icon = renderIcon(channel.trim().toLowerCase(), size);
+  if (!icon) return null;
 
+  return (
+    <span
+      className="channel-logo-frame"
+      style={{ width: size, height: size }}
+    >
+      {icon}
+      <span className="channel-logo-shine" aria-hidden="true" />
+    </span>
+  );
+}
+
+function renderIcon(key: string, size: number): ReactElement | null {
   switch (key) {
     case "amazon":
       return (
@@ -179,7 +204,7 @@ export function ChannelBadge({
 }): ReactElement {
   return (
     <span className={className} style={style}>
-      <ChannelLogo channel={channel} size={20} />
+      <ChannelLogo channel={channel} size={44} />
       <span className="channel-badge-label">{label}</span>
     </span>
   );

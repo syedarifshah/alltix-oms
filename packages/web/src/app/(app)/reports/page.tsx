@@ -381,7 +381,7 @@ export default async function ReportsPage({ searchParams }: ReportsPageProps): P
                   {salesByChannel.map((row) => (
                     <tr key={row.channel}>
                       <td>
-                        <ChannelLogo channel={row.channel} size={20} /> {channelLabel(row.channel)}
+                        <ChannelLogo channel={row.channel} size={44} /> {channelLabel(row.channel)}
                       </td>
                       <td>{row.order_count}</td>
                       <td>{row.units_sold}</td>
