@@ -1,6 +1,7 @@
 import type { ReactElement } from "react";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
+import { getBillingSummary, type BillingSummary } from "@alltix/billing-service";
 import { getAppPool, getAdminPool } from "@/lib/db";
 import { getAuthContext } from "@/lib/auth-context";
 import { requirePlatformOperator } from "@/lib/platform-operator";
@@ -9,6 +10,15 @@ import { ALL_CARRIERS, type Carrier } from "@/lib/carrier-flags";
 import { channelLabel } from "@/lib/channel-badge";
 
 export const dynamic = "force-dynamic";
+
+/** Same "active-ish" status classification `/settings/billing` itself uses
+ *  (CLAUDE.md §8's "Real usage-based billing" subsection) -- kept as an
+ *  independent copy rather than imported, same "two independent copies of a
+ *  small shared idea" precedent channel-flags.ts/carrier-flags.ts's own
+ *  ALL_CHANNELS/ALL_CARRIERS lists already establish for this codebase, since
+ *  @alltix/billing-service has no shared-constant export for this and adding
+ *  one purely to de-duplicate a 3-item Set isn't worth a new export surface. */
+const ACTIVE_ISH_STATUSES = new Set(["active", "trialing", "past_due"]);
 
 const CARRIER_LABELS: Record<Carrier, string> = {
   royal_mail: "Royal Mail",
@@ -109,6 +119,37 @@ export default async function AdminPage({ searchParams }: AdminPageProps): Promi
   );
   const tenants = result.rows;
 
+  // Billing/subscription details per tenant (getBillingSummary(), the same
+  // function /settings/billing already uses) -- deliberately N+1 queries (one
+  // getBillingSummary() call per tenant, via the ordinary app_user pool +
+  // withTenant(), not a second adminPool cross-tenant query) rather than
+  // extending the admin page's own cross-tenant SELECT above to also read
+  // stripe_customer_id/subscription_current_period_end/tenant_usage/products
+  // directly. Reasoning: this page's own doc comment already draws that exact
+  // line for the mutation routes below ("an update against one already-known
+  // tenant id is an ordinary withTenant() call, not a second cross-tenant
+  // read") -- getBillingSummary() is the same shape, just a read instead of a
+  // write, and reusing it here means this page can never drift out of sync
+  // with /settings/billing's own definition of what a tenant's billing
+  // summary means. At today's real tenant count this is a handful of extra
+  // queries, not a scaling concern; worth revisiting (a batched cross-tenant
+  // query variant) only if/when this platform has enough tenants for that to
+  // matter, same "don't build for scale nobody's earned yet" discipline this
+  // file already applies elsewhere. Each call is individually guarded -- a
+  // billing-read failure for one tenant (e.g. a row this function can't yet
+  // handle) shows as "unavailable" on that one card rather than taking down
+  // the whole console.
+  const appPool = getAppPool();
+  const billingSummaries = await Promise.all(
+    tenants.map(async (tenant): Promise<BillingSummary | null> => {
+      try {
+        return await getBillingSummary(appPool, tenant.id);
+      } catch {
+        return null;
+      }
+    }),
+  );
+
   return (
     <main className="page">
       <h1>Platform admin</h1>
@@ -129,13 +170,15 @@ export default async function AdminPage({ searchParams }: AdminPageProps): Promi
           <p className="empty">No tenants exist yet.</p>
         </div>
       ) : (
-        tenants.map((tenant) => <TenantCard key={tenant.id} tenant={tenant} />)
+        tenants.map((tenant, index) => (
+          <TenantCard key={tenant.id} tenant={tenant} billing={billingSummaries[index] ?? null} />
+        ))
       )}
     </main>
   );
 }
 
-function TenantCard({ tenant }: { tenant: TenantRow }): ReactElement {
+function TenantCard({ tenant, billing }: { tenant: TenantRow; billing: BillingSummary | null }): ReactElement {
   const enabledChannels = new Set(tenant.enabled_channels);
   const enabledCarriers = new Set(tenant.enabled_carriers);
 
@@ -163,6 +206,8 @@ function TenantCard({ tenant }: { tenant: TenantRow }): ReactElement {
           {tenant.error_carrier_connections !== "0" ? `, ${tenant.error_carrier_connections} error` : ""}
         </span>
       </div>
+
+      <BillingPanel billing={billing} />
 
       <div className="row" style={{ gap: 32, alignItems: "flex-start", flexWrap: "wrap" }}>
         <form
@@ -202,6 +247,64 @@ function TenantCard({ tenant }: { tenant: TenantRow }): ReactElement {
             Save carriers
           </button>
         </form>
+      </div>
+    </div>
+  );
+}
+
+/** Read-only billing/subscription summary for one tenant, reusing
+ *  getBillingSummary() (the same function /settings/billing itself calls --
+ *  see AdminPage's own doc comment above for why this is called per-tenant
+ *  here rather than folded into the admin page's own cross-tenant SELECT).
+ *  `billing === null` covers both "the read failed" and the not-yet-real
+ *  "no tenant row" case -- shown identically as "unavailable" since a
+ *  platform operator has no action to take either way from this card; the
+ *  real fix (if the read is genuinely failing) is server-side, not something
+ *  this page can offer a button for. */
+function BillingPanel({ billing }: { billing: BillingSummary | null }): ReactElement {
+  if (!billing) {
+    return (
+      <div className="panel-card" style={{ marginBottom: 16, background: "var(--neutral-bg)" }}>
+        <div className="panel-card-subtitle">Billing</div>
+        <p className="muted" style={{ margin: 0 }}>
+          Billing summary unavailable.
+        </p>
+      </div>
+    );
+  }
+
+  const isActiveIsh = billing.subscriptionStatus !== null && ACTIVE_ISH_STATUSES.has(billing.subscriptionStatus);
+  const orderUsageRatio = billing.orderLimit > 0 ? billing.ordersThisMonth / billing.orderLimit : 0;
+  const overOrderLimit = billing.ordersThisMonth > billing.orderLimit;
+
+  return (
+    <div className="panel-card" style={{ marginBottom: 16, background: "var(--neutral-bg)" }}>
+      <div className="panel-card-subtitle" style={{ marginBottom: 8 }}>
+        Billing
+      </div>
+      <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+        <span className={isActiveIsh ? "badge badge-success" : "badge"}>{billing.subscriptionStatus ?? "none"}</span>
+        <span className="muted">{billing.hasStripeCustomer ? "Stripe customer on file" : "no Stripe customer yet"}</span>
+        {billing.currentPeriodEnd && (
+          <span className="muted">period ends {new Date(billing.currentPeriodEnd).toISOString().slice(0, 10)}</span>
+        )}
+        <span className="muted">{billing.skuCount} SKUs</span>
+      </div>
+      <div className="row" style={{ gap: 8, marginTop: 8, alignItems: "center" }}>
+        <span>
+          {billing.ordersThisMonth} / {billing.orderLimit} orders this month
+        </span>
+        {overOrderLimit && <span className="badge badge-warning">over limit</span>}
+        {billing.usageBasedBillingConfigured && <span className="muted">(metered overage configured)</span>}
+      </div>
+      <div style={{ background: "var(--surface)", borderRadius: 4, height: 6, marginTop: 6, overflow: "hidden" }}>
+        <div
+          style={{
+            width: `${Math.min(orderUsageRatio, 1) * 100}%`,
+            background: overOrderLimit ? "var(--danger)" : "var(--accent)",
+            height: "100%",
+          }}
+        />
       </div>
     </div>
   );
