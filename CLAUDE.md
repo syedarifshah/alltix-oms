@@ -4441,6 +4441,44 @@ guarantee (§6, §11 item 6). A future new tenant-scoped table's migration shoul
 guarded-cast form directly from this section or from 0018/0035, not from an older
 migration that might itself predate 0018.
 
+**Round 3 (migration 0047) — `payroll_connections`, missed by both prior sweeps**:
+found via a fresh, direct audit of every migration file for a bare
+`current_setting('app.tenant_id'` cast with no `NULLIF` guard (the same "grep for the
+pattern, then read each unmatched file" technique §16's/§17's own coverage sweeps
+already used for rate-limiting and audit-log gaps), prompted by there being no
+externally-blocked business/vendor task left to work on and this bug class's own
+closing line above ("a future new tenant-scoped table's migration should crib the
+guarded-cast form...") being exactly the kind of claim that needed re-checking, not
+taken on faith. Migration `0038_payroll_connections.sql` (§14.1) shipped with the
+identical unguarded cast 0018 and 0035 each already fixed once — round 2's own
+sweep never caught it because 0038 postdates 0018 and didn't exist yet when 0035's
+own audit ran; no migration since ever flagged it because every one of them (0039
+onward) already used the guarded form correctly, so nothing downstream had reason to
+notice the one that didn't. Concretely the same crash both prior rounds' own comments
+describe: `payroll_connections` is queried by `/settings/payroll` (every visit) and
+by `packages/payroll-service`'s own `connectPayrollProcessor()`/
+`createCheckCompanyForTenant()` calls, both ordinary `withTenant()`-scoped requests —
+on a pooled connection previously poisoned to `''` by an earlier `withTenant()`
+transaction (or handed to `withClerkUser()`, which never sets it), the bare cast
+throws `invalid input syntax for type uuid: ""`, a real intermittent 500 on
+`/settings/payroll`, not a permission-denied. Fixed identically to rounds 1/2:
+`NULLIF(current_setting('app.tenant_id', true), '')` before the `::uuid` cast
+(`DROP POLICY` + `CREATE POLICY`, expand-only per §9, no app code change). A
+dedicated regression test, `packages/db/test/payroll-connections-rls.test.ts`
+(wired into `packages/db/package.json`'s own `test` script and
+`scripts/run-tests.sh`'s `SAFE_TESTS`), reproduces the real trigger on a `max: 1`
+pool — a `withTenant()` call first poisons the connection to `''`, then a
+`withClerkUser()` call against `payroll_connections` hits it — proven, via a manual
+revert-then-retest cycle, to genuinely fail against the unguarded policy
+(`invalid input syntax for type uuid: ""`, `22P02`) and pass against the guarded
+one, not merely pass either way. A second test confirms the fix doesn't weaken
+cross-tenant isolation for real rows. Verified: `npm run db:migrate` (migration
+0047 applied cleanly), `npm run build --workspaces --if-present` and `npm run
+typecheck --workspaces` both clean across every workspace, `bash
+scripts/run-tests.sh` — all 70 test files pass. Every migration from 0039 onward
+was independently re-confirmed to already use the guarded form — 0038 was the only
+remaining gap.
+
 ## 19. Carrier Integration Layer (§0's new locked decision — Royal Mail carrier #1, Evri carrier #2, FedEx carrier #3, Parcelforce carrier #4, UPS carrier #5, DHL carrier #6, DPD carrier #7)
 
 **Why a new layer, not an extension of §4's Channel Connector Layer**: a channel

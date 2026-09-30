@@ -62,6 +62,7 @@ SAFE_TESTS=(
   "packages/carrier-connectors/test/surcharges.test.ts"
   "packages/db/test/channel-connections-rls.test.ts"
   "packages/db/test/hr-rls.test.ts"
+  "packages/db/test/payroll-connections-rls.test.ts"
   "packages/db/test/inventory-event-partitioning.test.ts"
   "packages/rules-engine/test/evaluate-golden.test.ts"
   "packages/rules-engine/test/resolve-actions-priority.test.ts"
