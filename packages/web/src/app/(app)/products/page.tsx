@@ -301,16 +301,16 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps):
                 <th>SKU</th>
                 <th>Name</th>
                 <th>
-                  <ChannelLogo channel="shopify" size={14} /> Shopify
+                  <ChannelLogo channel="shopify" size={20} /> Shopify
                 </th>
                 <th>
-                  <ChannelLogo channel="walmart" size={14} /> Walmart
+                  <ChannelLogo channel="walmart" size={20} /> Walmart
                 </th>
                 <th>
-                  <ChannelLogo channel="amazon" size={14} /> Amazon
+                  <ChannelLogo channel="amazon" size={20} /> Amazon
                 </th>
                 <th>
-                  <ChannelLogo channel="ebay" size={14} /> eBay
+                  <ChannelLogo channel="ebay" size={20} /> eBay
                 </th>
               </tr>
             </thead>

@@ -28,10 +28,19 @@ import type { CSSProperties, ReactElement } from "react";
  * header comment already establishes for this app's nav icons; the path
  * data below was extracted from those packages in a throwaway scratch
  * install, never imported into this app's own dependency tree.
+ *
+ * Sized/styled per Arif's own second pass (v4): a uniform default size of
+ * 20px everywhere (up from 14px/12px) and a real CSS 3D tilt/perspective
+ * effect, not a flat icon -- the actual transform/shadow/hover-flatten
+ * styling lives on the shared `.channel-logo` class in globals.css, not
+ * here, so every call site (badges, table headers) picks it up identically
+ * with no per-site markup change. Every call site in this app either takes
+ * this default or passes the same 20 explicitly -- "uniform everywhere,"
+ * not scaled per context, was Arif's own explicit choice.
  */
 export function ChannelLogo({
   channel,
-  size = 14,
+  size = 20,
 }: {
   channel: string;
   size?: number;
@@ -170,7 +179,7 @@ export function ChannelBadge({
 }): ReactElement {
   return (
     <span className={className} style={style}>
-      <ChannelLogo channel={channel} size={12} />
+      <ChannelLogo channel={channel} size={20} />
       <span className="channel-badge-label">{label}</span>
     </span>
   );

@@ -570,8 +570,8 @@ details summary {
 .channel-badge {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 2px 9px;
+  gap: 7px;
+  padding: 4px 11px;
   border-radius: 999px;
   font-size: 0.76rem;
   font-weight: 700;
@@ -581,10 +581,36 @@ details summary {
 /* --- ChannelLogo (components/channel-logo.tsx): the small brand mark shown
    directly before a channel's name, wherever one appears -- badges above,
    the Products outbound-listing table headers, and the Reports channel
-   table. Never stretched/squashed by a flex/table-cell ancestor. --- */
+   table. Sized 20px by default (up from 14px/12px, Arif's own "modest bump"
+   pick) and given a real CSS 3D tilt/perspective (Arif's own "true 3D
+   tilt/perspective" pick over a flat-shadow or glossy-badge treatment):
+   a static perspective+rotation tilt plus a drop shadow for depth, which
+   animates flat -- the "pop" -- on hover/focus. `perspective()` is applied
+   as part of the same `transform` list directly on the icon itself rather
+   than via a separate wrapping element/parent `perspective`, so every
+   existing call site gets the effect with no markup change. Pure CSS
+   transform/filter, not layout-affecting, so it's safe inside a table
+   header, a flex badge pill, or plain inline text alike. Never
+   stretched/squashed by a flex/table-cell ancestor. --- */
 .channel-logo {
   flex-shrink: 0;
-  vertical-align: -2px;
+  vertical-align: -5px;
+  transform: perspective(120px) rotateY(-22deg) rotateX(12deg) rotateZ(-4deg);
+  filter: drop-shadow(2px 4px 3px rgba(0, 0, 0, 0.35));
+  transition: transform 0.2s ease, filter 0.2s ease;
+  will-change: transform;
+}
+
+.channel-logo:hover,
+.channel-logo:focus-visible {
+  transform: perspective(120px) rotateY(0deg) rotateX(0deg) rotateZ(0deg);
+  filter: drop-shadow(1px 2px 2px rgba(0, 0, 0, 0.2));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .channel-logo {
+    transition: none;
+  }
 }
 
 .channel-badge-label {
